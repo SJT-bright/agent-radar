@@ -42,7 +42,11 @@ final class PreviewDelegate: NSObject, NSApplicationDelegate {
         }
         rootItem.title = "验收"; rootItem.submenu = testMenu; menuBar.addItem(rootItem); NSApp.mainMenu = menuBar
         window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
-        recovery()
+        if ProcessInfo.processInfo.environment["AGENT_RADAR_PREVIEW_COMPLETION"] == "1" {
+            present(ContinuationNotice(title: "Codex · 完成待验收", conversation: "准备 GitHub 项目发布文案",
+                                       message: "这个项目已完结，请验收", isCompletion: true,
+                                       sessionID: "preview:codex", recoveryKey: "complete:preview", canRetry: true))
+        } else { recovery() }
     }
     func present(_ notice: ContinuationNotice) {
         toast.show(notice, anchor: anchor, cancel: {}, permission: {}, retry: { [weak self] sid, key in
@@ -56,6 +60,10 @@ final class PreviewDelegate: NSObject, NSApplicationDelegate {
                 var done = notice; done.canRetry = false; done.message = "隔离预览已完成；真实 AI 未被操作"
                 self.present(done)
             }
+        }, open: { [weak self] sid in
+            self?.status.stringValue = "已请求打开原对话：\(sid)；没有连接真实 AI"
+            self?.log("open callback \(sid)")
+            return true
         }, cancelRecovery: { [weak self] sid, key in
             self?.status.stringValue = "精确取消：\(sid) / \(key)"
             self?.log("cancel scoped \(sid) \(key)")

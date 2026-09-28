@@ -496,6 +496,15 @@ final class MonitorStore: ObservableObject {
         }
     }
 
+    @discardableResult func openNoticeSession(sessionID: String) -> Bool {
+        guard let session = sessions.first(where: { $0.id == sessionID }) else {
+            showMessage("原会话暂未读取到，请在对应应用中打开")
+            return false
+        }
+        openSession(session)
+        return true
+    }
+
     func isRemoved(_ session: SessionRecord) -> Bool {
         let key = RemovedSession.key(for: session)
         return removedSessions.contains { $0.id == key }

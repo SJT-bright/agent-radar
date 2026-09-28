@@ -13,6 +13,7 @@ final class ContinuationToast {
         let cancel: () -> Void
         let permission: () -> Void
         let retry: (String, String) -> Void
+        let open: (String) -> Bool
         let cancelRecovery: ((String, String) -> Void)?
         var key: String { (notice.sessionID ?? notice.conversation) + ":" + (notice.recoveryKey ?? notice.title) }
     }
@@ -40,8 +41,10 @@ final class ContinuationToast {
 
     func show(_ notice: ContinuationNotice, anchor: NSRect, cancel: @escaping () -> Void,
               permission: @escaping () -> Void, retry: @escaping (String, String) -> Void = { _, _ in },
+              open: @escaping (String) -> Bool = { _ in false },
               cancelRecovery: ((String, String) -> Void)? = nil) {
-        let entry = Entry(notice: notice, anchor: anchor, cancel: cancel, permission: permission, retry: retry, cancelRecovery: cancelRecovery)
+        let entry = Entry(notice: notice, anchor: anchor, cancel: cancel, permission: permission, retry: retry,
+                          open: open, cancelRecovery: cancelRecovery)
         if notice.isCompletion && acknowledgedCompletions.contains(entry.key) { return }
         if !notice.isRecovering && !notice.cancellable { retryInFlight.remove(entry.key) }
         if current?.key == entry.key {
@@ -86,6 +89,16 @@ final class ContinuationToast {
                                              if self?.current?.key == entry.key { self?.close() }
                                          }, close: { [weak self] in self?.close() },
                                          dismissAll: { [weak self] in self?.closeAll() }, permission: entry.permission,
+                                         open: { [weak self] in
+                                             guard let self = self, self.current?.key == entry.key,
+                                                   let session = entry.notice.sessionID else { return }
+                                             if entry.open(session) {
+                                                 self.close()
+                                             } else {
+                                                 self.current?.notice.message = "原会话暂未读取到，请在对应应用中打开"
+                                                 self.render()
+                                             }
+                                         },
                                          retry: { [weak self] in
                                              guard let self = self, self.current?.key == entry.key,
                                                    entry.notice.canRetry, !entry.notice.isRecovering,
@@ -97,7 +110,7 @@ final class ContinuationToast {
         panel.contentView = NSHostingView(rootView: view)
         let anchor = entry.anchor
         let visible = NSScreen.screens.map(\.visibleFrame).first(where: { $0.intersects(anchor) }) ?? NSScreen.main!.visibleFrame
-        let size = NSSize(width: 264, height: 174)
+        let size = ContinuationToastView.size(for: entry.notice, hasPending: !pending.isEmpty)
         let x = anchor.minX >= visible.minX + size.width + 18 ? anchor.minX - size.width - 12 : min(visible.maxX - size.width, anchor.maxX + 12)
         panel.setFrame(NSRect(x: max(visible.minX, x), y: max(visible.minY, min(anchor.maxY - size.height, visible.maxY - size.height)), width: size.width, height: size.height), display: true)
         panel.orderFrontRegardless()
@@ -153,6 +166,10 @@ private struct ToastCapsuleButton: View {
 }
 
 private struct ContinuationToastView: View {
+    static func size(for notice: ContinuationNotice, hasPending: Bool) -> NSSize {
+        notice.isCompletion && !hasPending && !notice.needsPermission && !notice.cancellable
+            ? NSSize(width: 250, height: 142) : NSSize(width: 264, height: 174)
+    }
     let notice: ContinuationNotice
     let pendingCount: Int
     let hasPending: Bool
@@ -161,14 +178,24 @@ private struct ContinuationToastView: View {
     let close: () -> Void
     let dismissAll: () -> Void
     let permission: () -> Void
+    let open: () -> Void
     let retry: () -> Void
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
+        VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 7) {
                 RecoveryIcon(enabled: notice.canRetry && !requested, recovering: notice.isRecovering || requested,
                              reason: notice.message, completion: notice.isCompletion, retry: retry)
                 Text(notice.title).fontWeight(.semibold).lineLimit(1)
                 Spacer(minLength: 0)
+                Button(action: open) {
+                    Image(systemName: "arrow.up.right.square")
+                        .font(.system(size: 15, weight: .semibold))
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(RadarButtonStyle(cornerRadius: 8))
+                .disabled(notice.sessionID == nil)
+                .help("打开这条提醒对应的原对话")
+                .accessibilityLabel("打开原对话")
             }.font(.system(size: 12))
             Text(notice.conversation).font(.system(size: 12, weight: .medium)).lineLimit(2)
             Text(notice.message).font(.system(size: 11)).lineLimit(3).fixedSize(horizontal: false, vertical: true)
@@ -187,7 +214,8 @@ private struct ContinuationToastView: View {
                 }
                 if !notice.cancellable { ToastCapsuleButton(title: "知道了", action: close, prominent: true) }
             }
-        }.padding(12).frame(width: 264, height: 174, alignment: .topLeading)
+        }.padding(10).frame(width: Self.size(for: notice, hasPending: hasPending).width,
+                            height: Self.size(for: notice, hasPending: hasPending).height, alignment: .topLeading)
             .foregroundStyle(.white).preferredColorScheme(.dark)
             .background { ZStack { FrostedBackdrop(strength: 0.9); Color.black.opacity(0.44) } }
             .clipShape(RoundedRectangle(cornerRadius: 18))

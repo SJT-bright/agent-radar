@@ -94,6 +94,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                     permission: { [weak self] in self?.store.requestPermission() },
                                     retry: { [weak self] sessionID, key in
                                         self?.store.retryContinuation(sessionID: sessionID, key: key)
+                                    }, open: { [weak self] sessionID in
+                                        self?.store.openNoticeSession(sessionID: sessionID) ?? false
                                     }, cancelRecovery: { [weak self] sessionID, key in
                                         self?.store.cancelContinuation(sessionID: sessionID, key: key)
                                     })
