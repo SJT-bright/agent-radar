@@ -1,0 +1,16 @@
+build/
+__pycache__/
+*.pyc
+.DS_Store
+artifacts/
+.mimosa/
+.v2c/
+.video_agent/
+ai监管/
+vendor/watchdog/.venv-mac
+docs/modes-20260924/evidence/
+*.log
+*.sqlite
+*.sqlite3
+.env
+.env.*

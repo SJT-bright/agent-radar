@@ -1,0 +1,19 @@
+# AI Watchdog 依赖（macOS 版）
+# 安装：python3 -m venv .venv-mac && .venv-mac/bin/python -m pip install -r requirements-mac.txt
+#
+# 全部是本地库，不联网、不调用任何大模型。
+# OCR 用的是系统自带的 Vision 框架，不需要额外安装识别引擎。
+
+pyobjc-core>=11.0                          # Python ↔ Objective-C 桥
+pyobjc-framework-Cocoa>=11.0               # NSWorkspace / NSPasteboard / NSImage
+pyobjc-framework-Quartz>=11.0              # CGWindowList 抓窗、CGEvent 注入、会话锁屏态
+pyobjc-framework-Vision>=11.0              # Vision 文字识别（zh-Hans + en-US）
+pyobjc-framework-ApplicationServices>=11.0 # 辅助功能 AXUIElement 读控件树 / 赋值 / AXPress
+
+Pillow>=10.0                               # 图像中转（CGImage ↔ PIL，不依赖 numpy）
+PyYAML>=6.0                                # 配置与目标清单
+rich>=13.0                                 # 看板渲染
+psutil>=5.9                                # 进程信息
+
+# 注：不需要 numpy / opencv / paddleocr / easyocr —— 本机实测 Vision 直接给出
+#     带坐标和置信度的文本行，装那些只会让 venv 变大、授权身份变复杂。

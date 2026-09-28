@@ -1,0 +1,27 @@
+"""Exercise the real input-idle implementation with deterministic native responses."""
+import ctypes
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+from aiwatch.mac import winops
+count = 0
+def check(value):
+    global count
+    assert value
+    count += 1
+function = Mock(return_value=5.5)
+library = SimpleNamespace(CGEventSourceSecondsSinceLastEventType=function)
+with patch.object(winops, '_CG', None), patch.object(winops, '_CG_TRIED', False), patch.object(winops.ctypes, 'CDLL', return_value=library):
+    check(winops.idle_seconds() == 5.5)
+    check(function.argtypes == [ctypes.c_int32, ctypes.c_uint32])
+    check(function.call_args.args == (int(winops.Quartz.kCGEventSourceStateHIDSystemState), 0xFFFFFFFF))
+with patch.object(winops, '_coregraphics', return_value=None):
+    check(winops.idle_seconds() == 0 and winops.user_active(2))
+for value in (float('nan'), float('inf'), -1):
+    with patch.object(winops, '_coregraphics', return_value=SimpleNamespace(CGEventSourceSecondsSinceLastEventType=lambda *_: value)):
+        check(winops.idle_seconds() == 0 and winops.user_active(2))
+with patch.object(winops, '_coregraphics', side_effect=RuntimeError('unavailable')):
+    check(winops.idle_seconds() == 0)
+for value, expected in ((0, True), (1.999, True), (2, False), (2.001, False)):
+    with patch.object(winops, 'idle_seconds', return_value=value):
+        check(winops.user_active(2) == expected)
+print(f'Hardware idle: {count} checks passed')
