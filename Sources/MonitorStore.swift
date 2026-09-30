@@ -36,6 +36,7 @@ final class MonitorStore: ObservableObject {
     private var messageGeneration = UUID()
     @Published var paused = false
     @Published var autoContinueEnabled: Bool
+    @Published var autoQueueInsertionEnabled: Bool
     @Published private(set) var keepAwakeEnabled: Bool
     @Published private(set) var keepAwakeStatus = KeepAwakeStatus()
     private let keepAwake = KeepAwakeController()
@@ -46,7 +47,8 @@ final class MonitorStore: ObservableObject {
     static let appSupervisionDefaultsKey = "supervisedAppIDs.v1"
     @Published var recoverySummary = "自动继续正在检查"
     var onRecoveryNotice: ((ContinuationNotice) -> Void)?
-    private let continuation = ContinuationController()
+    private let continuation: ContinuationController
+    private let queueInsertion = QueueInsertionController()
     @Published var expanded = false
     // Native menu tracking extends the floating panel’s hover region.
     var settingsMenuTracking = false
@@ -94,12 +96,15 @@ final class MonitorStore: ObservableObject {
     private var collectorGeneration = 0
     private var decoderGeneration = 0 // accessed only on decoderQueue
 
-    init(defaults: UserDefaults = .standard, writeHealthDiagnostics: Bool = true) {
+    init(defaults: UserDefaults = .standard, writeHealthDiagnostics: Bool = true,
+         continuation: ContinuationController? = nil) {
         removalDefaults = defaults
         self.writeHealthDiagnostics = writeHealthDiagnostics
+        self.continuation = continuation ?? ContinuationController(countDefaults: defaults)
         removedSessions = defaults.data(forKey: "removedSessions.v1")
             .flatMap { try? JSONDecoder().decode([RemovedSession].self, from: $0) } ?? []
         autoContinueEnabled = defaults.bool(forKey: "autoContinueOptIn.v2")
+        autoQueueInsertionEnabled = defaults.object(forKey: "autoQueueInsertion.v1") as? Bool ?? true
         keepAwakeEnabled = defaults.bool(forKey: "keepAwakeEnabled.v1")
         promptRules = PromptRules.load(from: defaults)
         supervisedSessionIDs = Set((defaults.stringArray(forKey: Self.supervisionDefaultsKey) ?? []).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
@@ -112,8 +117,8 @@ final class MonitorStore: ObservableObject {
         labels = defaults.dictionary(forKey: "projectLabels") as? [String: String] ?? [:]
         extraBundleIDs = defaults.stringArray(forKey: "extraBundleIDs") ?? []
         if #available(macOS 13.0, *) { loginEnabled = SMAppService.mainApp.status == .enabled }
-        continuation.rulesProvider = { [weak self] in self?.promptRules ?? PromptRules() }
-        continuation.setSupervisedIDs(supervisedSessionIDs)
+        self.continuation.rulesProvider = { [weak self] in self?.promptRules ?? PromptRules() }
+        self.continuation.setSupervisedIDs(supervisedSessionIDs)
         keepAwake.onStatusChange = { [weak self] status in
             self?.keepAwakeStatus = status
             self?.writeDiagnostic()
@@ -122,6 +127,8 @@ final class MonitorStore: ObservableObject {
 
     func start() {
         keepAwake.setEnabled(keepAwakeEnabled)
+        queueInsertion.onResult = { [weak self] in self?.showMessage($0) }
+        queueInsertion.start(enabled: autoQueueInsertionEnabled)
         continuation.onSummary = { [weak self] in self?.recoverySummary = $0 }
         continuation.onNotice = { [weak self] in self?.onRecoveryNotice?($0) }
         continuation.start(enabled: autoContinueEnabled && !permissionRepairActive)
@@ -142,6 +149,7 @@ final class MonitorStore: ObservableObject {
 
     func stop() {
         keepAwake.stop()
+        queueInsertion.stop()
         continuation.stop()
         permissionQueryGeneration += 1
         permissionHealthBridge.cancel()
@@ -154,6 +162,7 @@ final class MonitorStore: ObservableObject {
 
     func togglePause() {
         paused.toggle()
+        queueInsertion.configure(enabled: autoQueueInsertionEnabled, paused: paused)
         pausedAt = paused ? Date() : nil
         continuation.configure(enabled: autoContinueEnabled && !permissionRepairActive, paused: paused)
         if paused {
@@ -686,6 +695,14 @@ final class MonitorStore: ObservableObject {
         setAutoContinue(!autoContinueEnabled)
     }
 
+    func toggleAutoQueueInsertion() {
+        autoQueueInsertionEnabled.toggle()
+        removalDefaults.set(autoQueueInsertionEnabled, forKey: "autoQueueInsertion.v1")
+        queueInsertion.configure(enabled: autoQueueInsertionEnabled, paused: paused)
+        showMessage(autoQueueInsertionEnabled ? "新排队消息自动插队已开启" : "新排队消息自动插队已关闭")
+        writeDiagnostic()
+    }
+
     func setAutoContinue(_ enabled: Bool) {
         guard autoContinueEnabled != enabled else { return }
         autoContinueEnabled = enabled
@@ -694,14 +711,17 @@ final class MonitorStore: ObservableObject {
         writeDiagnostic()
     }
 
-    /// 个性化提示词：全局规则（中断/限流）立即生效并落盘。
-    /// 提示词由控制器经 rulesProvider 实时读取；仅当运行模式变化才重置
-    /// 观察与队列，保存任何会话的跟催词不再波及其它会话排队中的恢复。
+    /// 执行规则变更必须取消旧排队，避免已关闭的限流恢复或旧提示词继续发送。
+    /// 旧版会话跟催词不参与执行，单独修改它们不影响其他会话的恢复。
     func applyRules(_ rules: PromptRules) {
         let previous = promptRules
         promptRules = rules.normalized()
         promptRules.save(to: removalDefaults)
-        if previous.completionMode != promptRules.completionMode {
+        var previousExecution = previous
+        var currentExecution = promptRules
+        previousExecution.followUps = [:]
+        currentExecution.followUps = [:]
+        if previousExecution != currentExecution {
             continuation.configure(enabled: autoContinueEnabled && !permissionRepairActive, paused: paused)
         }
         writeDiagnostic()
@@ -750,18 +770,26 @@ final class MonitorStore: ObservableObject {
     }
 
     func setSupervision(_ enabled: Bool, for session: SessionRecord) {
-        if enabled {
-            // A stale card cannot mark a different or unreadable conversation.
-            let matches = sessions.filter { $0.id == session.id }
-            guard matches.count == 1, let current = matches.first,
-                  current.isReadable, !isRemoved(current) else { return }
-        }
+        guard enabled else { removeSupervision(sessionID: session.id); return }
+        // A stale card cannot mark a different or unreadable conversation.
+        let matches = sessions.filter { $0.id == session.id }
+        guard matches.count == 1, let current = matches.first,
+              current.isReadable, !isRemoved(current) else { return }
         var updated = supervisedSessionIDs
-        if enabled { updated.insert(session.id) } else { updated.remove(session.id) }
+        updated.insert(session.id)
         guard updated != supervisedSessionIDs else { return }
         supervisedSessionIDs = updated
         removalDefaults.set(updated.sorted(), forKey: Self.supervisionDefaultsKey)
         // This is a per-session change, not a global mode reset.
+        refreshSupervision()
+        writeDiagnostic()
+    }
+
+    /// 取消持久化选择不依赖当前采集结果；会话消失或不可读时仍可撤销。
+    func removeSupervision(sessionID: String) {
+        guard supervisedSessionIDs.contains(sessionID) else { return }
+        supervisedSessionIDs.remove(sessionID)
+        removalDefaults.set(supervisedSessionIDs.sorted(), forKey: Self.supervisionDefaultsKey)
         refreshSupervision()
         writeDiagnostic()
     }
@@ -958,6 +986,7 @@ final class MonitorStore: ObservableObject {
                                   "removed_sessions": removedSessions.count,
                                   "frost_level": frostLevel.label,
                                   "auto_continue_enabled": autoContinueEnabled,
+                                  "auto_queue_insertion_enabled": autoQueueInsertionEnabled,
                                   "collector_restarts": collectorRestarts,
                                   "follow_up_armed": promptRules.followUps.count,
                                   "supervised_sessions": supervisedSessionIDs.count,

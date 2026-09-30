@@ -8,6 +8,7 @@ mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources/collector" "$PRO
   -target arm64-apple-macosx13.0 -framework AppKit -framework SwiftUI -framework ApplicationServices -framework ServiceManagement \
   "$PROJECT_DIR"/Sources/*.swift -o "$APP_DIR/Contents/MacOS/AgentRadar"
 cp "$PROJECT_DIR/scripts/Info.plist" "$APP_DIR/Contents/Info.plist"
+cp "$PROJECT_DIR/Assets/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 cp "$PROJECT_DIR"/collector/*.py "$APP_DIR/Contents/Resources/collector/"
 /usr/bin/python3 "$PROJECT_DIR/scripts/bundle_watchdog.py" "$APP_DIR/Contents/Resources"
 mkdir -p "$APP_DIR/Contents/Resources/icons"

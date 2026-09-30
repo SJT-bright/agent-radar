@@ -203,10 +203,11 @@ struct RadarView: View {
     @ViewBuilder private var controls: some View {
         Button(store.paused ? "继续监控" : "暂停监控") { store.togglePause() }
         Button(store.autoContinueEnabled ? "自动继续意外中断 ✓" : "开启自动继续意外中断") { store.toggleAutoContinue() }
+        Button("新消息自动插队" + (store.autoQueueInsertionEnabled ? " ✓" : "")) { store.toggleAutoQueueInsertion() }
         Button("查询 AI 监督状态") { store.showContinuationDiagnostics() }
         Text(store.promptRules.completionMode == "rage" ? "当前：狂暴模式" : "当前：协作模式")
             .foregroundColor(store.promptRules.completionMode == "rage" ? Self.rageModeColor : Self.collaborationModeColor)
-        Button("运行模式与提示词…") { store.showPromptSettings() }
+        Button("设置…") { store.showPromptSettings() }
         Button("预览中断提醒") { store.previewContinuationNotice() }
         Button("夜间常亮（防休眠）" + (store.keepAwakeEnabled ? " ✓" : "")) { store.toggleKeepAwake() }
             .help(store.keepAwakeStatus.detail)
@@ -305,10 +306,11 @@ private struct HoverSettingsMenu: NSViewRepresentable {
         }
         action(store.paused ? "继续监控" : "暂停监控") { store.togglePause() }
         action(store.autoContinueEnabled ? "自动继续意外中断 ✓" : "开启自动继续意外中断") { store.toggleAutoContinue() }
+        action("新消息自动插队" + (store.autoQueueInsertionEnabled ? " ✓" : "")) { store.toggleAutoQueueInsertion() }
         action("查询 AI 监督状态") { store.showContinuationDiagnostics() }
         information(store.promptRules.completionMode == "rage" ? "当前：狂暴模式" : "当前：协作模式",
                     color: NSColor(store.promptRules.completionMode == "rage" ? RadarView.rageModeColor : RadarView.collaborationModeColor))
-        action("运行模式与提示词…") { store.showPromptSettings() }
+        action("设置…") { store.showPromptSettings() }
         action("预览中断提醒") { store.previewContinuationNotice() }
         action("夜间常亮（防休眠）" + (store.keepAwakeEnabled ? " ✓" : "")) { store.toggleKeepAwake() }
         if store.keepAwakeEnabled && !store.keepAwakeStatus.fullyActive { information(store.keepAwakeStatus.summary) }

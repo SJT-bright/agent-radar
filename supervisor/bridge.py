@@ -253,7 +253,8 @@ def perform(request, backend, journal):
     if not snapshot.get('send_enabled'):
         raise Blocked('send_unavailable')
     backend.send()  # At most one press. No blind Enter or retry after ambiguity.
-    return {'code': 'sent_pending_confirmation', 'attempted': True}
+    return {'code': 'sent_queued_promoted' if getattr(backend, 'queue_promoted', False)
+            else 'sent_pending_confirmation', 'attempted': True}
 
 
 def grok_title_variants(title):
@@ -320,9 +321,11 @@ def zcode_target(request, root=None):
             db.execute('PRAGMA query_only=ON')
             rows = db.execute('''SELECT workspace_key, workspace_path, task_id, title
                                  FROM tasks WHERE deleted = 0 AND archived = 0''').fetchall()
-        matches = [(key, project, task, title) for key, project, task, title in rows
-                   if 'zcode:' + hashlib.sha256(str(key).encode()).hexdigest()[:12] + ':' + str(task)
-                   == request.get('id')]
+            matches = [(key, project, task, title) for key, project, task, title in rows
+                       if 'zcode:' + hashlib.sha256(str(key).encode()).hexdigest()[:12] + ':' + str(task)
+                       == request.get('id')]
+            global_count = db.execute('SELECT COUNT(*) FROM tasks WHERE title=?',
+                                      (matches[0][3],)).fetchone()[0] if len(matches) == 1 else 0
         if len(matches) != 1:
             raise Blocked('target_unverified')
         _, project, _, title = matches[0]
@@ -339,7 +342,11 @@ def zcode_target(request, root=None):
         if (not name or sum(Path(other_project).name == name and other_project != project
                             for _, other_project, _, _ in rows) != 0):
             raise Blocked('target_unverified')
-        return title, name, project
+        # Search results may expose the project only in a composite label;
+        # accept exact title-only matching only when no indexed task, even
+        # archived or deleted, shares the title.
+        globally_unique_title = global_count == 1
+        return title, name, project, globally_unique_title
     except (OSError, sqlite3.Error, TypeError, ValueError):
         raise Blocked('target_unverified')
 
@@ -387,6 +394,7 @@ class MacBackend:
         self.title = request.get('navigation_title') or request['title']
         self.window = self.root = self.box = self.send_button = None
         self.did_write = False
+        self.queue_promoted = False
         self.stage = 'preflight'
         self.grok_identity = grok_target(request) if request['app_id'] == 'grok' else None
         self.zcode_identity = zcode_target(request) if request['app_id'] == 'zcode' else None
@@ -657,10 +665,7 @@ class MacBackend:
             for node, role in nodes:
                 if role != 'AXMenuItem':
                     continue
-                descendants = ax.children(node)
-                descendants += [child for parent in descendants for child in ax.children(parent)]
-                labels = [self.label(child) for child in descendants if ax.role(child) == 'AXStaticText']
-                if self.title in labels and self.zcode_identity[1] in labels:
+                if self.zcode_search_match(node):
                     matches.append(node)
             if len(matches) == 1:
                 break
@@ -671,6 +676,18 @@ class MacBackend:
         if not ax.press(matches[0]):
             raise Blocked('target_unverified')
         return self.navigation_nodes(1.5)
+
+    def zcode_search_match(self, node):
+        ax = self.ax
+        descendants = ax.children(node)
+        descendants += [child for parent in descendants for child in ax.children(parent)]
+        labels = [self.label(child) for child in descendants if ax.role(child) == 'AXStaticText']
+        # Current ZCode exposes the title as child text but folds the project
+        # into the menu item's composite label. A globally unique indexed
+        # title can select a unique result; route() then checks both header
+        # and project button before the composer is touched.
+        return self.title in labels and (self.zcode_identity[1] in labels or
+                                         self.zcode_identity[3])
 
     def navigation_nodes(self, timeout):
         # Fast apps need no fixed sleep. Slow navigation retains the existing
@@ -818,9 +835,38 @@ class MacBackend:
                     pb.writeObjects_(saved)
 
     def send(self):
+        before = self.insert_buttons()
         self.stage = 'send'
         if self.winops.frontmost_pid() != self.window.pid or not self.ax.press(self.send_button):
             raise Blocked('send_unconfirmed')
+        # A newly queued copy of our message may appear after the send click.
+        # Only a unique newly exposed control in the same verified conversation
+        # can be promoted; an old queue control is never touched.
+        if before:
+            return
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            if self.winops.frontmost_pid() != self.window.pid:
+                return
+            try:
+                nodes = self.nodes()
+                if not self.current_identity(nodes):
+                    return
+                buttons = self.insert_buttons(nodes)
+                if len(buttons) == 1:
+                    self.stage = 'insert_queue'
+                    self.queue_promoted = bool(self.ax.press(buttons[0]))
+                    return
+                if len(buttons) > 1:
+                    return
+            except Blocked:
+                return
+            time.sleep(0.05)
+
+    def insert_buttons(self, nodes=None):
+        nodes = self.nodes() if nodes is None else nodes
+        return [node for node, role in nodes if role == 'AXButton' and
+                self.label(node) == '插队' and self.ax.enabled(node)]
 
 
 def main():

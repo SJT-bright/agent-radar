@@ -452,11 +452,11 @@ final class ContinuationController {
             guard let self = self, self.generation == token, self.active?.key == event.key else { return }
             self.executing = false
             if code == "permission_required" { self.helperPermission = false }
-            if attempted || code == "already_attempted" || code == "sent_pending_confirmation" {
+            if attempted || code == "already_attempted" || code == "sent_pending_confirmation" || code == "sent_queued_promoted" {
                 self.attemptedKeys.insert(event.key)
                 self.policy.recordAttempt(current, now: self.clock())
             }
-            if code == "sent_pending_confirmation" {
+            if code == "sent_pending_confirmation" || code == "sent_queued_promoted" {
                 if self.isAutomaticRageSend(event) {
                     self.recordSuccessfulRageSend(for: current.id)
                 }
@@ -464,7 +464,9 @@ final class ContinuationController {
                 self.confirmations[event.key] = (event, self.clock() + 30, false)
                 self.active = nil
                 let elapsed = max(0, Int(self.clock() - event.detectedAt))
-                self.notice(event, "已点击发送（发现后 \(elapsed) 秒），正在确认原会话的新轮次…")
+                self.notice(event, code == "sent_queued_promoted"
+                    ? "已点击发送和插队（发现后 \(elapsed) 秒），正在确认原会话的新轮次…"
+                    : "已点击发送（发现后 \(elapsed) 秒），正在确认原会话的新轮次…")
             } else if !attempted && code == "cooldown" && event.automationMode != "rage" {
                 self.finish(event, Self.explain(code))
             } else if !attempted && ["user_active", "locked", "permission_required", "focus_changed", "another_recovery", "cooldown"].contains(code) {

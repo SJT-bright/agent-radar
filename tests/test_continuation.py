@@ -76,10 +76,10 @@ class ContinuationTests(unittest.TestCase):
             db.commit()
             request = dict(id='zcode:' + hashlib.sha256(b'key').hexdigest()[:12] + ':id',
                            project='/w/Project', title='Unique task')
-            self.assertEqual(zcode_target(request, db_path), ('Unique task', 'Project', '/w/Project'))
+            self.assertEqual(zcode_target(request, db_path), ('Unique task', 'Project', '/w/Project', True))
             db.execute('INSERT INTO tasks VALUES (?,?,?,?,0,0)', ('another', '/x/Other', 'id2', 'Unique task'))
             db.commit()
-            self.assertEqual(zcode_target(request, db_path), ('Unique task', 'Project', '/w/Project'))
+            self.assertEqual(zcode_target(request, db_path), ('Unique task', 'Project', '/w/Project', False))
             db.execute('INSERT INTO tasks VALUES (?,?,?,?,0,0)', ('third', '/w/Project', 'id3', 'Unique task'))
             db.commit()
             with self.assertRaisesRegex(Blocked, 'target_unverified'):
@@ -210,6 +210,17 @@ class ContinuationTests(unittest.TestCase):
             self.assertEqual(self.run_request()['code'], 'sent_pending_confirmation')
             self.assertEqual(self.backend.value, MESSAGE)
             self.assertEqual((self.backend.writes, self.backend.sends), (1, 1))
+
+    def test_new_queue_promotion_is_a_successful_single_send(self):
+        original_send = self.backend.send
+        def promoted_send():
+            original_send()
+            self.backend.queue_promoted = True
+        self.backend.send = promoted_send
+        self.assertEqual(self.run_request(), {'code': 'sent_queued_promoted', 'attempted': True})
+        self.assertEqual(self.backend.sends, 1)
+        with self.assertRaisesRegex(Blocked, 'already_attempted'):
+            self.run_request()
 
     def test_overwrite_does_not_relax_identity_busy_or_readability(self):
         self.request['overwrite_draft'] = True
@@ -532,6 +543,8 @@ class AXSelectionTests(unittest.TestCase):
     def backend(self, app='autoclaw'):
         class AX:
             @staticmethod
+            def role(n): return n.get('role', '')
+            @staticmethod
             def rect_of(n): return n.get('rect')
             @staticmethod
             def element_name(n): return n.get('label', '')
@@ -566,6 +579,51 @@ class AXSelectionTests(unittest.TestCase):
         with patch('supervisor.bridge.time.sleep') as sleep:
             self.assertIs(b.navigation_nodes(0.6), nodes)
         sleep.assert_not_called()
+
+    def test_zcode_search_accepts_unique_indexed_title_with_project_in_composite_label(self):
+        b = self.backend('zcode')
+        result = {'label': b.title + ' task summary Project 刚刚',
+                  'children': [{'label': b.title, 'role': 'AXStaticText'}]}
+        b.zcode_identity = (b.title, 'Project', '/w/Project', True)
+        self.assertTrue(b.zcode_search_match(result))
+        b.zcode_identity = (b.title, 'Project', '/w/Project', False)
+        self.assertFalse(b.zcode_search_match(result))
+        result['children'].append({'label': 'Project', 'role': 'AXStaticText'})
+        self.assertTrue(b.zcode_search_match(result))
+        result['children'][0]['label'] = 'Other task'
+        self.assertFalse(b.zcode_search_match(result))
+
+    def test_send_promotes_only_one_new_queue_control(self):
+        b = self.backend('zcode')
+        presses = []
+        b.send_button = {'label': '发送'}
+        b.ax.press = lambda node: presses.append(node['label']) or True
+        b.current_identity = lambda _: True
+        b.queue_promoted = False
+        before = [(b.send_button, 'AXButton')]
+        after = [({'label': '插队', 'enabled': True}, 'AXButton')]
+        calls = [before, after]
+        b.nodes = lambda: calls.pop(0)
+        b.send()
+        self.assertEqual(presses, ['发送', '插队'])
+        self.assertTrue(b.queue_promoted)
+
+    def test_send_leaves_existing_or_ambiguous_queue_untouched(self):
+        for before, after in [
+            ([({'label': '插队'}, 'AXButton')], [({'label': '插队'}, 'AXButton')]),
+            ([], [({'label': '插队'}, 'AXButton'), ({'label': '插队'}, 'AXButton')]),
+        ]:
+            b = self.backend('zcode')
+            presses = []
+            b.send_button = {'label': '发送'}
+            b.ax.press = lambda node: presses.append(node['label']) or True
+            b.current_identity = lambda _: True
+            b.queue_promoted = False
+            calls = [before, after]
+            b.nodes = lambda: calls.pop(0)
+            b.send()
+            self.assertEqual(presses, ['发送'])
+            self.assertFalse(b.queue_promoted)
 
     def test_navigation_waits_for_exact_identity_and_retains_deadline(self):
         b = self.backend()

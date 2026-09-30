@@ -47,9 +47,9 @@ struct NativeMonitorChecks {
         assert(monitor.safeDeepLink("workbuddy://chat/foo%2Fbar", appID: "workbuddy") == nil)
         assert(monitor.safeDeepLink("workbuddy://chat/..", appID: "workbuddy") == nil)
         assert(monitor.safeDeepLink("zcode://workspace/open?path=%2FUsers%2Fexample%2FDownloads", appID: "zcode") != nil)
-        let zcodeWorkspace = "zcode://workspace/open?path=%2FUsers%2Fexample%2FProjects%2FDemo"
+        let zcodeWorkspace = "zcode://workspace/open?path=%2FUsers%2Fexample%2F%E4%B8%AD%E6%96%87%E9%A1%B9%E7%9B%AE"
         assert(monitor.safeDeepLink(zcodeWorkspace, appID: "zcode") != nil)
-        assert(monitor.safeDeepLink(zcodeWorkspace, appID: "zcode").flatMap { URLComponents(string: $0.absoluteString)?.queryItems?.first?.value } == "/Users/example/Projects/Demo")
+        assert(monitor.safeDeepLink(zcodeWorkspace, appID: "zcode").flatMap { URLComponents(string: $0.absoluteString)?.queryItems?.first?.value } == "/Users/example/中文项目")
         assert(monitor.safeDeepLink("zcode://workspace/open?path=Users%2Fx", appID: "zcode") == nil)
         assert(monitor.safeDeepLink("zcode://workspace/open?session=%2FUsers%2Fx", appID: "zcode") == nil)
         assert(monitor.safeDeepLink("zcode://workspace/open?path=%2Fa%2F..%2Fb", appID: "zcode") == nil)
