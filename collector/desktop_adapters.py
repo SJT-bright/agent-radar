@@ -109,6 +109,7 @@ class DesktopCollector:
         self._process_cache_at = -float("inf")
         self._file_cache = {}
         self._zcode_log_cache = {}
+        self._zcode_active_ids_cache: list[str] = []
         self.last_errors: list[str] = []
         self._failed_apps = set()
         self._last_results = {}
@@ -137,7 +138,7 @@ class DesktopCollector:
                 # plain connect can never create a database file. query_only=ON
                 # keeps every session below strictly read-only.
                 path.stat()
-                connection = sqlite3.connect(str(path), timeout=0.15)
+                connection = sqlite3.connect(str(path), timeout=0.5)
                 connection.execute("PRAGMA query_only = ON")
                 connection.row_factory = sqlite3.Row
                 return [dict(row) for row in connection.execute(query, (*parameters, SESSION_LIMIT))]
@@ -147,8 +148,10 @@ class DesktopCollector:
                 last_error = error
                 # A busy writer briefly locks the index; one bounded retry keeps
                 # the panel from flapping to unknown for a whole cycle.
+                lower = str(error).lower()
                 transient = (isinstance(error, sqlite3.OperationalError) and
-                             ("locked" in str(error).lower() or "busy" in str(error).lower()))
+                             ("locked" in lower or "busy" in lower or
+                              "unable to open database file" in lower or "cantopen" in lower))
                 if attempt == 0 and transient:
                     time.sleep(0.25)
                     continue
@@ -401,7 +404,7 @@ class DesktopCollector:
         connection = None
         result = {}
         try:
-            connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.15)
+            connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.5)
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA query_only = ON")
             # Keep identity, lifecycle and activity reads on one SQLite snapshot.
@@ -447,7 +450,8 @@ class DesktopCollector:
                       "轮次数据库读取失败（" + type(error).__name__ + "）")
             self._zcode_turn_error = "ZCode：" + detail + "，当前状态待确认"
             self.last_errors.append(self._zcode_turn_error)
-            return {}
+            # 已算出的行保留真实状态：仅无轮次数据的行在行级被降级 unknown。
+            return result
         finally:
             if connection is not None:
                 connection.close()
@@ -463,7 +467,7 @@ class DesktopCollector:
             return []
         connection = None
         try:
-            connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.15)
+            connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.5)
             connection.execute("PRAGMA query_only = ON")
             deadline = time.monotonic() + 1.0
             connection.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
@@ -487,9 +491,12 @@ class DesktopCollector:
                         activity = max(activity, _epoch(stamp))
                 if _recent(activity, now, ACTIVE_MAX_AGE):
                     active.append(sid)
+            self._zcode_active_ids_cache = active
             return active
         except (OSError, sqlite3.Error, ValueError):
-            return []  # The main lifecycle reader reports database errors.
+            # 静默返回空会让运行中的任务从 40 行窗口里整只消失；
+            # 退回上一轮的提权名单，行最多短暂陈旧而不是缺行。
+            return self._zcode_active_ids_cache
         finally:
             if connection is not None:
                 connection.close()
@@ -721,6 +728,7 @@ class DesktopCollector:
                             last_activity_at=lifecycle["activity"],
                             updated_at=max(updated_at, lifecycle["activity"]))
                 if phase == "running":
+                    item.pop("ended_at", None)  # 新一轮开始：上一轮的结束时间不得残留为负时长来源。
                     live = app_is_live and _recent(lifecycle["activity"], now, ACTIVE_MAX_AGE)
                     status = "running" if live else "unknown"
                     evidence = ("轮次尚未结束，模型或工具生命周期事件仍新鲜" if live else
@@ -751,10 +759,17 @@ class DesktopCollector:
                 item["started_at"] = rollout["turn_start"]
                 item["timing_basis"] = "turn"
                 item["timing_reason"] = "按本轮首次模型请求时间计算（会话日志）"
+                if item.get("ended_at") is not None and item["ended_at"] <= rollout["turn_start"]:
+                    # 日志已开启更新一轮：上一轮结束时间不得残留为本轮时长来源。
+                    item.pop("ended_at", None)
+                    if turn_live:
+                        running_evidence = "会话日志显示本轮模型请求进行中，索引状态滞后"
+                        item.update(status="running", evidence=running_evidence,
+                                    status_reason=running_evidence)
                 if rollout["last_started"] > 0 or rollout["last_completed"] > 0:
                     item["last_activity_at"] = max(rollout["last_started"], rollout["last_completed"])
                     item["updated_at"] = max(updated_at, item["last_activity_at"])
-            if self._zcode_turn_error:
+            if self._zcode_turn_error and not lifecycle:
                 item.update(status="unknown", evidence=self._zcode_turn_error,
                             status_reason=self._zcode_turn_error)
             if identity_mismatch:

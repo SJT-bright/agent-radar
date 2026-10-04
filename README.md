@@ -1,6 +1,12 @@
 # 任务雷达（Agent Radar）
 
-原生 macOS AI 任务悬浮窗。当前公开源码对应 **1.8.1（build 55）**。它从本机可读取的会话状态和窗口信息中显示当前对话、运行时间、完成与中断状态，不需要 AI API Key。
+原生 macOS AI 任务悬浮窗。当前公开源码对应 **1.8.8（build 62）**。它从本机可读取的会话状态和窗口信息中显示当前对话、运行时间、完成与中断状态，不需要 AI API Key。
+
+## 下载
+
+[下载最新版 macOS 应用](https://github.com/SJT-bright/agent-radar/releases/latest)。将 ZIP 中的「任务雷达.app」放入 Applications，启动后按浮窗指引完成辅助功能授权，再点击「查询」复查。应用包面向 Apple Silicon、macOS 13+，使用本地代码签名，未做 Apple 公证。
+
+1.8.8 修复 ZCode 搜索点击与粘贴被误认成真人操作、反复暂缓恢复的问题：模拟事件改投会话入口，硬件键鼠计时继续用于真人避让。保留准确搜索定位、胶囊布局、Grok/Qoder/AutoClaw 兼容及现有用户设置。正式安装脚本的真实搜索和输入框核验通过；实际新轮次自动发送仍需独立观察。[更新记录](CHANGELOG.md)
 
 ## 功能
 
@@ -21,13 +27,13 @@ cd vendor/watchdog
 /usr/bin/python3 -m venv .venv-mac
 .venv-mac/bin/python -m pip install -r requirements-mac.txt
 cd ../..
-./scripts/test.sh
 AGENT_RADAR_ALLOW_ADHOC=1 ./scripts/build.sh
+./scripts/test.sh
 ```
 
 开发用 ad-hoc 构建产物在 `build/任务雷达.app`。正式使用建议保留稳定的代码签名身份；辅助功能授权需针对实际运行的应用完成并复查。构建成功和自动化测试通过不代表所有目标应用的真实自动发送都已验证。
 
-本项目不包含本机聊天数据库、账户凭据、运行回执或安装包。`Sources/` 为 Swift 应用，`collector/` 为只读会话适配器，`supervisor/` 为续接桥，`tests/` 为自动化检查。
+源码仓库不包含本机聊天数据库、账户凭据或运行回执；应用安装包在 Releases 单独提供。`Sources/` 为 Swift 应用，`collector/` 为只读会话适配器，`supervisor/` 为续接桥，`tests/` 为自动化检查。
 
 ## 许可
 

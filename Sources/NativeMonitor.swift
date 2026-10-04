@@ -10,6 +10,9 @@ enum SessionActivationResult { case unavailable, application, workspaceLink, con
 final class NativeMonitor {
     private var discoveredBundles = Set(UserDefaults.standard.stringArray(forKey: "autoDiscoveredAIBundles.v1") ?? [])
     private var discoveryCursor = 0
+    // 上一轮每个应用（按 pid）的真实窗口行：本轮预算耗尽时原样复用，
+    // 避免每次都生成新占位 ID 使监督/置顶等以会话 ID 为键的状态翻转。
+    private var lastWindowRows: [Int32: [SessionRecord]] = [:]
     private struct Definition {
         let id: String
         let name: String
@@ -154,7 +157,8 @@ final class NativeMonitor {
             let windowDeadline = probing ? deadline.end : deadline.end - (probes.isEmpty ? 0 : 0.6)
             guard ProcessInfo.processInfo.systemUptime < windowDeadline else {
                 if (!browser || manuallyAdded) && !probing {
-                    sessions.append(placeholder(app, evidence: "已发现应用；本轮读取时间已用尽，会话状态待确认"))
+                    sessions.append(contentsOf: Self.carriedRows(previous: lastWindowRows[app.pid], app: app,
+                                                                 note: "本轮读取时间已用尽；显示上一轮窗口读取结果"))
                 }
                 continue
             }
@@ -205,9 +209,16 @@ final class NativeMonitor {
             }
             if browser && observed > 0 && !manuallyAdded { apps.append(app) }
             if !browser && !probing && observed == 0 {
-                sessions.append(placeholder(app, evidence: "已发现应用；窗口读取达到时间限制，会话状态待确认"))
+                sessions.append(contentsOf: Self.carriedRows(previous: lastWindowRows[app.pid], app: app,
+                                                             note: "窗口读取达到时间限制；显示上一轮窗口读取结果"))
             }
         }
+        var grouped: [Int32: [SessionRecord]] = [:]
+        for row in sessions {
+            guard row.source == "window", row.id.hasPrefix("window:"), let pid = row.pid else { continue }
+            grouped[pid, default: []].append(row)
+        }
+        lastWindowRows = grouped
         return NativeScan(sessions: sessions, apps: apps, accessibility: trusted)
     }
 
@@ -407,10 +418,25 @@ final class NativeMonitor {
     }
 
     private func placeholder(_ app: AppRecord, evidence: String) -> SessionRecord {
+        Self.placeholderRecord(app, evidence: evidence)
+    }
+
+    static func placeholderRecord(_ app: AppRecord, evidence: String) -> SessionRecord {
         SessionRecord(id: "app:\(app.id):\(app.pid)", app_id: app.id, app_name: app.name,
                       title: "\(app.name) · 会话待识别", project: "", status: "unknown",
                       evidence: evidence, updated_at: Date().timeIntervalSince1970,
                       source: "window", target: "", pid: app.pid, window_id: nil)
+    }
+
+    /// 预算耗尽时复用上一轮该应用的真实窗口行（附说明）；无历史才退回占位。
+    /// 返回的是副本，追加说明不污染下一轮复用的原始行。
+    static func carriedRows(previous: [SessionRecord]?, app: AppRecord, note: String) -> [SessionRecord] {
+        guard let previous = previous, !previous.isEmpty else {
+            return [placeholderRecord(app, evidence: "已发现应用；" + note + "，会话状态待确认")]
+        }
+        var rows = previous
+        for index in rows.indices { rows[index].evidence += "；" + note }
+        return rows
     }
 
     private func readStatus(_ window: AXUIElement, appID: String, budget: Budget) -> (status: String, evidence: String, title: String?) {

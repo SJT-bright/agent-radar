@@ -91,6 +91,26 @@ struct NativeMonitorChecks {
             completions += 1
         }
         assert(completions == 1)
-        print("NativeMonitor: 70 discovery, evidence, deep-link, and CLI-container checks passed")
+        // 预算耗尽应用复用上一轮真实窗口行：ID 稳定、说明只追加在副本上、
+        // 无历史时退回占位。这防止占位 ID 翻转摇动以会话 ID 为键的监督状态。
+        func check(_ ok: Bool, _ name: String) { precondition(ok, name) }
+        do {
+            let app = AppRecord(id: "workbuddy", name: "WorkBuddy", bundleID: "com.workbuddy", pid: 42, path: "/Applications/WorkBuddy.app")
+            let previous = [SessionRecord(id: "window:workbuddy:42:3", app_id: "workbuddy", app_name: "WorkBuddy",
+                title: "进行中的对话", project: "", status: "running", evidence: "窗口状态可读",
+                updated_at: 1, source: "window", target: "", pid: 42, window_id: 3)]
+            let carried = NativeMonitor.carriedRows(previous: previous, app: app,
+                                                    note: "本轮读取时间已用尽；显示上一轮窗口读取结果")
+            check(carried.count == 1 && carried[0].id == previous[0].id, "carried rows keep stable session id")
+            check(carried[0].status == "running" && carried[0].evidence.contains("上一轮"), "carried rows reuse real status with note")
+            check(previous[0].evidence == "窗口状态可读", "carried note does not pollute stored rows")
+            let fallback = NativeMonitor.carriedRows(previous: nil, app: app,
+                                                     note: "窗口读取达到时间限制；显示上一轮窗口读取结果")
+            check(fallback.count == 1 && fallback[0].id == "app:workbuddy:42" && fallback[0].title.contains("会话待识别"),
+                  "no history falls back to placeholder")
+            let empty = NativeMonitor.carriedRows(previous: [], app: app, note: "x")
+            check(empty.count == 1 && empty[0].id == "app:workbuddy:42", "empty history falls back to placeholder")
+        }
+        print("NativeMonitor: 75 discovery, evidence, deep-link, carry-over, and CLI-container checks passed")
     }
 }

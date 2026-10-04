@@ -212,7 +212,12 @@ private struct ContinuationToastView: View {
                     // 排队多条时一键清除，免去逐条点「知道了」。
                     ToastCapsuleButton(title: "全部知道了", action: dismissAll)
                 }
-                if !notice.cancellable { ToastCapsuleButton(title: "知道了", action: close, prominent: true) }
+                if !notice.cancellable {
+                    ToastCapsuleButton(title: "知道了", action: close, prominent: true)
+                } else if !hasPending {
+                    // 不想打断自动恢复的用户也需要一个不打扰的关闭出口。
+                    ToastCapsuleButton(title: "知道了", action: close)
+                }
             }
         }.padding(10).frame(width: Self.size(for: notice, hasPending: hasPending).width,
                             height: Self.size(for: notice, hasPending: hasPending).height, alignment: .topLeading)

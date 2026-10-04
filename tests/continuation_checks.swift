@@ -50,6 +50,8 @@ import Foundation
         check(transition("completed", mode: "rage") { $0.app_id = "cline" }.first?.canContinue == false, "unsupported cannot optimize")
         check(transition("completed", mode: "rage") { $0.app_id = "qoder-cn" }.first?.canContinue == true, "Qoder CN can continue a verified completed round")
         check(transition("interrupted", mode: "rage") { $0.app_id = "qoder-cn" }.first?.canContinue == true, "Qoder CN can recover a verified interruption")
+        check(transition("completed", mode: "rage") { $0.app_id = "qoder" }.first?.canContinue == true, "Qoder can continue a verified completed round")
+        check(transition("interrupted", mode: "rage") { $0.app_id = "qoder" }.first?.canContinue == true, "Qoder can recover a verified interruption")
         check(transition("completed") { $0.source = "window" }.isEmpty, "window source cannot arm")
         check(transition("completed") { $0.user_stopped = true }.isEmpty, "user stopped cannot arm")
         // 手动停止不算中断：不产生提醒事件；展示为中性「已手动停止」。

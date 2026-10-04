@@ -7,7 +7,8 @@ struct PromptSettingsDraft: Equatable {
     var rateLimitWaitMinutes: Int
     var rateLimitText: String
     var ragePrompt: String
-    var grokRagePrompt: String
+    var appRagePrompts: [String: String]
+    var appResumeTexts: [String: String]
     var rageAlternateEvery: Int
     var rageAlternatePrompt: String
 
@@ -17,20 +18,36 @@ struct PromptSettingsDraft: Equatable {
         rateLimitWaitMinutes = rules.rateLimitWaitMinutes
         rateLimitText = rules.rateLimitText
         ragePrompt = rules.ragePrompt
-        grokRagePrompt = rules.ragePrompt(forApp: "grok")
+        // 原样复制 override 字典：草稿只承载显式自定义，留空表示用通用。
+        appRagePrompts = rules.appRagePrompts
+        appResumeTexts = rules.appResumeTexts
         rageAlternateEvery = rules.rageAlternateEvery
         rageAlternatePrompt = rules.rageAlternatePrompt
     }
 
     func hasChanges(comparedTo rules: PromptRules) -> Bool {
-        // 比较编辑值而非清理后的值，让空白、超长等尚未保存的修改仍可撤销。
-        // init 使用 Grok 的实际默认文字，不把隐式默认与等价显式值视为修改。
-        self != Self(rules: rules)
+        // 标量字段比较编辑值（空白/控制字符等未保存修改保持可见）；
+        // 字典键只比较本窗口显示/编辑过的应用——别的应用新出现的 override
+        // 不会被保存抹掉，也就不该把未编辑的草稿标脏。
+        if interruptText != rules.interruptText || rateLimitWakeEnabled != rules.rateLimitWakeEnabled ||
+            rateLimitWaitMinutes != rules.rateLimitWaitMinutes || rateLimitText != rules.rateLimitText ||
+            ragePrompt != rules.ragePrompt || rageAlternateEvery != rules.rageAlternateEvery ||
+            rageAlternatePrompt != rules.rageAlternatePrompt {
+            return true
+        }
+        // 空白 override 等同于「无 override，回到通用」，不参与标脏判定。
+        for (appID, text) in appRagePrompts
+            where !text.trimmingCharacters(in: .whitespaces).isEmpty &&
+                  text != rules.ragePrompt(forApp: appID) { return true }
+        for (appID, text) in appResumeTexts
+            where !text.trimmingCharacters(in: .whitespaces).isEmpty &&
+                  text != (rules.appResumeTexts[appID] ?? "") { return true }
+        return false
     }
 
     var hasOverlengthPrompt: Bool {
-        [interruptText, rateLimitText, ragePrompt, grokRagePrompt, rageAlternatePrompt]
-            .contains { $0.unicodeScalars.count > PromptRules.maxLength }
+        ([interruptText, rateLimitText, ragePrompt, rageAlternatePrompt] + appRagePrompts.values
+            + appResumeTexts.values).contains { $0.unicodeScalars.count > PromptRules.maxLength }
     }
 
     func applying(to current: PromptRules) -> PromptRules {
@@ -40,8 +57,14 @@ struct PromptSettingsDraft: Equatable {
         result.rateLimitWaitMinutes = rateLimitWaitMinutes
         result.rateLimitText = rateLimitText
         result.ragePrompt = ragePrompt
-        if current.appRagePrompts["grok"] != nil || grokRagePrompt != current.ragePrompt(forApp: "grok") {
-            result.appRagePrompts["grok"] = grokRagePrompt
+        // 合并语义：草稿只承载用户在该窗口碰过的应用；未涉及的键原样保留，
+        // 窗口打开期间其它应用新出现的 override 不会被保存抹掉。
+        // 显式留空值由 normalized() 过滤，等于「移除专属、回到通用」。
+        for (appID, text) in appRagePrompts {
+            result.appRagePrompts[appID] = text
+        }
+        for (appID, text) in appResumeTexts {
+            result.appResumeTexts[appID] = text
         }
         result.rageAlternateEvery = rageAlternateEvery
         result.rageAlternatePrompt = rageAlternatePrompt
@@ -49,13 +72,19 @@ struct PromptSettingsDraft: Equatable {
     }
 
     var validationMessages: [String] {
-        let prompts: [(label: String, text: String, usesDefaultWhenEmpty: Bool)] = [
+        var prompts: [(label: String, text: String, usesDefaultWhenEmpty: Bool)] = [
             ("中断提示词", interruptText, false),
             ("限流提示词", rateLimitText, false),
             ("普通提示词", ragePrompt, true),
-            ("Grok 普通提示词", grokRagePrompt, true),
             ("特别提示词", rageAlternatePrompt, true)
         ]
+        for (appID, text) in appRagePrompts.sorted(by: { $0.key < $1.key }) {
+            // 专属续接为空会回退通用提示词，与普通提示词同语义，需提示用户。
+            prompts.append(("\(PromptRules.appDisplayNames[appID] ?? appID) 专属提示词", text, true))
+        }
+        for (appID, text) in appResumeTexts.sorted(by: { $0.key < $1.key }) {
+            prompts.append(("\(PromptRules.appDisplayNames[appID] ?? appID) 恢复提示词", text, false))
+        }
         var messages: [String] = []
         for prompt in prompts {
             if prompt.text.unicodeScalars.count > PromptRules.maxLength {

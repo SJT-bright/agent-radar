@@ -192,6 +192,34 @@ class ExtendedAdapterTests(unittest.TestCase):
         self.assertEqual(self.reader.collect(), [])
         self.assertEqual(list(self.home.iterdir()), [])
 
+    def test_grok_new_round_does_not_inherit_previous_user_stop(self):
+        self.grok([{'ts': NOW - 120, 'type': 'turn_started'},
+                   {'ts': NOW - 100, 'type': 'turn_ended', 'outcome': 'canceled'},
+                   {'ts': NOW - 10, 'type': 'turn_started'},
+                   {'ts': NOW - 1, 'type': 'turn_ended', 'outcome': 'completed'}])
+        row = self.reader.collect()[0]
+        self.assertEqual(row['status'], 'completed')
+        self.assertEqual(row['started_at'], NOW - 10)
+        self.assertNotIn('user_stopped', row)
+
+    def test_qoder_new_live_turn_does_not_inherit_previous_cancel(self):
+        root = self.qoder()
+        with sqlite3.connect(root / 'main.sqlite') as c:
+            c.execute('INSERT INTO chat_session_messages VALUES(?,?,?,?,?,?,?)',
+                      (SID, 'old', 'canceled', (NOW - 200) * 1000, (NOW - 150) * 1000,
+                       json.dumps({'role': 'assistant', 'turnStartedAt': NOW - 200, 'completedAt': NOW - 150}), 2))
+        row = self.reader.collect()[0]
+        self.assertEqual(row['status'], 'running')
+        self.assertNotIn('user_stopped', row)
+
+    def test_grok_invalid_index_records_do_not_displace_real_sessions(self):
+        root, _ = self.grok([{'ts': NOW - 10, 'type': 'turn_started'}])
+        path = root / 'sessions_index.json'
+        sessions = json.loads(path.read_text())
+        sessions += [{'id': str(i), 'projectId': 'project', 'updatedAt': NOW + 1} for i in range(45)]
+        path.write_text(json.dumps(sessions))
+        self.assertEqual([r['id'] for r in self.reader.collect()], ['grok:' + SID])
+
 
 if __name__ == '__main__':
     unittest.main()

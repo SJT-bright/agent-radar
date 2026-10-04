@@ -154,9 +154,14 @@ private final class SupervisionHarness {
             }
             let texts = h.sender.requests.compactMap { $0["text"] as? String }
             check(texts.count == 6, "each verified terminal round sends once")
-            check(texts == [h.rules.value.ragePrompt, h.rules.value.ragePrompt, h.rules.value.rageAlternatePrompt,
-                            h.rules.value.ragePrompt, h.rules.value.ragePrompt, h.rules.value.rageAlternatePrompt],
-                  "completion and interruption share every-third-send special cadence: \(texts)")
+            // 中断恢复使用按软件恢复提示词（默认 resumeText），不占用续接轮换；
+            // 特别提示词节奏只由完成续接推进。
+            let resume = ContinuationPolicy.resumeText(forApp: "workbuddy",
+                                                       overrides: h.rules.value.appResumeTexts,
+                                                       global: h.rules.value.resumePrompt)
+            check(texts == [h.rules.value.ragePrompt, resume, h.rules.value.rageAlternatePrompt,
+                            resume, h.rules.value.ragePrompt, h.rules.value.rageAlternatePrompt],
+                  "interruptions send per-app resume text; completions keep cadence: \(texts)")
             check(h.judge.requests.isEmpty, "mixed cadence never requests answer judgement")
         }
         do {
@@ -171,12 +176,29 @@ private final class SupervisionHarness {
         do {
             let h = harness(marked: ["workbuddy:c"])
             h.rules.value.rageAlternateEvery = 2
-            h.sender.responses = [("target_unverified", false), ("sent_pending_confirmation", true),
+            // Keep one completed round fresh while its two pre-input failures
+            // retry. Only the successful third operation advances cadence.
+            h.sender.responses = [("target_unverified", false), ("target_unverified", false),
                                   ("sent_pending_confirmation", true)]
-            for index in 0..<3 { h.finish("c", start: 9990 + Double(index) * 10); h.advance() }
+            h.finish("c"); h.advance(); h.advance(); h.advance()
             check(h.sender.requests.compactMap { $0["text"] as? String } ==
-                  [h.rules.value.ragePrompt, h.rules.value.ragePrompt, h.rules.value.rageAlternatePrompt],
-                  "failed click does not advance cadence")
+                  [h.rules.value.ragePrompt, h.rules.value.ragePrompt, h.rules.value.ragePrompt],
+                  "failed route attempts do not advance cadence")
+            h.finish("c", start: 10020); h.advance()
+            check(h.sender.requests.last?["text"] as? String == h.rules.value.rageAlternatePrompt,
+                  "next successful round follows the configured cadence")
+        }
+        for code in ["search_result_missing", "header_unverified", "sidebar_target_missing", "tree_incomplete"] {
+            let h = harness()
+            h.sender.responses = [(code, false), ("sent_pending_confirmation", true)]
+            h.finish(); h.advance(); h.advance()
+            check(h.sender.requests.count == 2, "pre-input transient \(code) retries the same fresh round")
+        }
+        for code in ["session_title_ambiguous", "project_name_ambiguous", "search_result_ambiguous", "search_input_changed"] {
+            let h = harness()
+            h.sender.responses = [(code, false)]
+            h.finish(); h.advance(); h.advance()
+            check(h.sender.requests.count == 1, "ambiguous or changed target \(code) cannot retry")
         }
         do {
             let shared = freshDefaults()
@@ -262,12 +284,24 @@ private final class SupervisionHarness {
             check(h.controller.pendingSessionIDs.count == 3, "only current receipts remain pending")
             check(h.sender.requests.allSatisfy { $0["project"] as? String != nil },
                   "every send carries project provenance")
+            // 中断轮使用按软件恢复提示词；所有成功自动发送参与次数周期。
+            // 完成轮按该会话累计发送次数选择普通或特别提示词。
+            let resume = ContinuationPolicy.resumeText(forApp: "workbuddy",
+                                                       overrides: h.rules.value.appResumeTexts,
+                                                       global: h.rules.value.resumePrompt)
             for id in ids {
                 let texts = h.sender.requests.filter { $0["id"] as? String == "workbuddy:" + id }
                     .compactMap { $0["text"] as? String }
-                check(texts.count == 720 && texts.enumerated().allSatisfy { index, text in
-                    text == (index % 3 == 2 ? h.rules.value.rageAlternatePrompt : h.rules.value.ragePrompt)
-                }, "each session keeps its own cadence over twelve simulated hours")
+                check(texts.count == 720, "twelve hours send every round for each session")
+                for (index, text) in texts.enumerated() {
+                    let interruptedRound = index % 7 == 0
+                    if interruptedRound {
+                        check(text == resume, "interrupt round uses per-app resume text at \(index)")
+                    } else {
+                        let expected = index % 3 == 2 ? h.rules.value.rageAlternatePrompt : h.rules.value.ragePrompt
+                        check(text == expected, "completion round cadence at \(index): got \(text)")
+                    }
+                }
             }
         }
         print("Selected supervision controller: \(checks) checks passed")

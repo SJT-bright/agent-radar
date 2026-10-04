@@ -29,7 +29,11 @@ AX_LIST_BUDGET_S = 3.0  # 一次 list_windows 花在 AX 上的总预算，超了
 
 Rect = Tuple[int, int, int, int]
 
-_ANY_INPUT_EVENT = 0xFFFFFFFF  # kCGAnyInputEventType
+# kCGAnyInputEventType also changes for non-input WindowServer events (including
+# starting the Python/AppKit helper). Only explicit human input types may yield
+# desktop control. Our private events must be posted at the session entry;
+# posting even private-source events at the HID entry resets these clocks.
+_INPUT_EVENT_TYPES = (1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 22, 25, 26, 27)
 _CG: Optional[ctypes.CDLL] = None
 _CG_TRIED = False
 
@@ -487,17 +491,20 @@ def scale_at(rect: Optional[Sequence[int]] = None) -> float:
 def idle_seconds() -> float:
     """硬件键鼠事件距今秒数；读取失败或异常值按 0 秒处理。
 
-    CGEventSourceStateID 是 int32，不是 CGEventSourceRef。HID system state
-    用于硬件输入时钟；combined session state 还包含合成事件源。这个判断
-    不代表所有远程/合成操作都空闲，调用方仍必须核验前台与目标身份。
+    只检查按键、修饰键、鼠标移动/按下/抬起/拖动和滚轮。所有事件的计时
+    还会被 Python/AppKit 启动及窗口系统事件重置，不能用来判断用户在操作。
+    私有注入投递到 session 入口，避免重置 HID 计时；若投到 HID 入口仍会
+    污染该计时。前台和目标身份仍另行核验，不跳过注入后的真人输入保护。
     """
     try:
         lib = _coregraphics()
         if lib is None:
             return 0.0
-        elapsed = float(lib.CGEventSourceSecondsSinceLastEventType(
-            int(Quartz.kCGEventSourceStateHIDSystemState), _ANY_INPUT_EVENT))
-        return elapsed if math.isfinite(elapsed) and elapsed >= 0 else 0.0
+        elapsed = [float(lib.CGEventSourceSecondsSinceLastEventType(
+            int(Quartz.kCGEventSourceStateHIDSystemState), kind)) for kind in _INPUT_EVENT_TYPES]
+        if any(not math.isfinite(value) or value < 0 for value in elapsed):
+            return 0.0
+        return min(elapsed)
     except Exception:
         return 0.0
 

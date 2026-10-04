@@ -57,9 +57,14 @@ class DesktopAdapterTests(unittest.TestCase):
                 context_exceeded INTEGER, error_type TEXT, error_code TEXT)""")
             connection.executemany("INSERT INTO session VALUES (?,?)", [(sid, directory) for sid in {r[0] for r in rows}])
             connection.executemany("INSERT INTO turn_usage VALUES (?,?,?,?,?,?,?,?,?)", rows)
-            for table, events in (("model_usage", model_events), ("tool_usage", tool_events)):
-                connection.execute("CREATE TABLE " + table + " (session_id TEXT, turn_id TEXT, started_at INTEGER, completed_at INTEGER)")
-                connection.executemany("INSERT INTO " + table + " VALUES (?,?,?,?)", events)
+            for events, ddl, insert in ((model_events,
+                                         "CREATE TABLE model_usage (session_id TEXT, turn_id TEXT, started_at INTEGER, completed_at INTEGER)",
+                                         "INSERT INTO model_usage VALUES (?,?,?,?)"),
+                                        (tool_events,
+                                         "CREATE TABLE tool_usage (session_id TEXT, turn_id TEXT, started_at INTEGER, completed_at INTEGER)",
+                                         "INSERT INTO tool_usage VALUES (?,?,?,?)")):
+                connection.execute(ddl)
+                connection.executemany(insert, events)
 
     def test_working_requires_live_process_and_fresh_evidence(self):
         self.workbuddy([("active", "working", NOW - 1, None),

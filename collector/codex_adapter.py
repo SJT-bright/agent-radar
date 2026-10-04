@@ -53,9 +53,16 @@ def _read_json(path: Path) -> dict:
 
 @contextmanager
 def _readonly(path: Path):
-    # URI mode also prevents a missing or concurrently removed database from
-    # being silently created; query_only is a second read-only boundary.
-    con = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.12)
+    """普通连接 + query_only：严格只读，且允许热读 WAL。
+
+    mode=ro 在写入方持有 WAL/shm 时无法建立读连接（CANTOPEN，实测整周期
+    不可见）；普通连接可以附离 -shm 并读 WAL，query_only 保持只读边界。
+    调用方必须先确认文件存在，避免普通连接静默新建空库。
+    """
+    if not path.is_file():
+        # 普通连接会静默新建空库；缺失文件保持与 mode=ro 相同的错误契约。
+        raise sqlite3.OperationalError("unable to open database file")
+    con = sqlite3.connect(str(path), timeout=0.5)
     try:
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA query_only = ON")
@@ -354,38 +361,100 @@ class SessionCollector:
         for attempt in range(2):
             try:
                 with _readonly(database) as con:
-                    columns = {row[1] for row in con.execute("PRAGMA table_info(threads)")}
-                    if "id" not in columns:
-                        return False
-                    requested = [c for c in ("id", "name", "title", "cwd", "rollout_path", "updated_at",
-                                             "agent_path", "agent_nickname") if c in columns]
-                    # Delegated agents share their parent's desktop task. Filter before
-                    # LIMIT so background workers cannot evict visible conversations.
-                    main_tasks = (" AND (agent_path IS NULL OR agent_path='' OR agent_path='/root')"
-                                  if "agent_path" in columns else "")
-                    rows = con.execute("SELECT " + ",".join(requested) +
-                                       " FROM threads WHERE archived=0" + main_tasks +
-                                       " ORDER BY updated_at DESC LIMIT ?",
-                                       (MAX_SESSIONS,)).fetchall()
-                    self.codex_rows = [dict(row) for row in rows]
-                    return True
-            except (OSError, sqlite3.Error) as error:
-                # A busy Codex writer locks its state database briefly; one
-                # bounded retry avoids a whole cycle of degraded unknowns.
-                transient = (isinstance(error, sqlite3.OperationalError) and
-                             ("locked" in str(error).lower() or "busy" in str(error).lower()))
+                    return self._load_threads(con)
+            except sqlite3.OperationalError as error:
+                lower = str(error).lower()
+                transient = ("locked" in lower or "busy" in lower or
+                             "unable to open database file" in lower or "cantopen" in lower)
                 if attempt == 0 and transient:
-                    time.sleep(0.2)
+                    # 忙写入方/WAL 残留：一次有界重试，避免整周期降级 unknown。
+                    time.sleep(0.25)
                     continue
+                self._last_db_error = type(error).__name__
+                return False
+            except (OSError, sqlite3.Error):
+                self._last_db_error = type(error).__name__
                 return False
         return False
+
+    def _load_threads(self, con) -> bool:
+        """One bounded read into codex_rows; transient locks re-raise for retry."""
+        try:
+            columns = {row[1] for row in con.execute("PRAGMA table_info(threads)")}
+            if "id" not in columns:
+                # 结构级差异（如 Codex 迁移数据位置）不是瞬态错误，
+                # 必须在 health 里与「暂时不可读」区分开。
+                self._last_db_error = "缺少 threads 表结构"
+                return False
+            requested = [c for c in ("id", "name", "title", "cwd", "rollout_path", "updated_at",
+                                     "agent_path", "agent_nickname") if c in columns]
+            # Delegated agents share their parent's desktop task. Filter before
+            # LIMIT so background workers cannot evict visible conversations.
+            main_tasks = (" AND (agent_path IS NULL OR agent_path='' OR agent_path='/root')"
+                          if "agent_path" in columns else "")
+            rows = con.execute("SELECT " + ",".join(requested) +
+                               " FROM threads WHERE archived=0" + main_tasks +
+                               " ORDER BY updated_at DESC LIMIT ?",
+                               (MAX_SESSIONS,)).fetchall()
+            self.codex_rows = [dict(row) for row in rows]
+            return True
+        except (OSError, sqlite3.Error) as error:
+            lower = str(error).lower()
+            if isinstance(error, sqlite3.OperationalError) and (
+                    "locked" in lower or "busy" in lower or
+                    "unable to open database file" in lower or "cantopen" in lower):
+                raise  # 瞬态锁竞争交给外层的第二次有界尝试。
+            self._last_db_error = type(error).__name__
+            return False
+
+    def _codex_rollout_fallback(self, root) -> list[dict]:
+        """Enumerate self-describing rollouts while state databases are unusable.
+
+        Codex 迁移期间 threads 表可能暂时缺失或整体移走。rollout 首行
+        session_meta 自描述（id/cwd/thread_source）：只取 thread_source=user
+        的用户对话（subagent/guardian_review 是内部代理），id 去重、按 mtime
+        取最近 7 天、上限 120 个。标题不在 rollout 内，用中性标签占位，
+        真实时间线仍由 thread_turns 与尾部事件给出。
+        """
+        try:
+            candidates = []
+            # sessions/YYYY/MM/DD/<rollout>.jsonl：年/月/日三层目录。
+            for path in (root / "sessions").glob("*/*/*/*.jsonl"):
+                try:
+                    if time.time() - path.stat().st_mtime <= 7 * 86400:
+                        candidates.append(path)
+                except OSError:
+                    continue
+        except OSError:
+            return []
+        candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+        rows, seen = [], set()
+        for path in candidates[:120]:
+            try:
+                with path.open("rb") as fh:
+                    head = json.loads(fh.readline(65536))
+            except (OSError, ValueError):
+                continue
+            payload = head.get("payload") if isinstance(head, dict) else None
+            if not isinstance(payload, dict) or payload.get("thread_source") != "user":
+                continue
+            thread = payload.get("id")
+            if not isinstance(thread, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", thread) or thread in seen:
+                continue
+            seen.add(thread)
+            cwd = payload.get("cwd")
+            rows.append({
+                "id": thread, "name": "Codex 会话 " + thread[:8], "title": None,
+                "cwd": cwd if isinstance(cwd, str) else "",
+                "rollout_path": str(path), "updated_at": int(path.stat().st_mtime),
+            })
+        return rows
 
     def _codex(self, processes: dict[int, dict]) -> list[dict]:
         root = self.codex_home
         databases = _codex_state_databases(root)
-        if not databases:
-            return []
         available = True
+        self._last_db_error = None
         opened = False
         # Use the newest database that still exposes the projected threads
         # table; a just-migrated or partial state file must not hide sessions.
@@ -395,8 +464,15 @@ class SessionCollector:
                 opened = True
                 break
         if not opened:
-            available = False
-            self.last_errors.append("Codex 会话数据库暂时不可读")
+            # 结构迁移期（threads 表缺失/整体移走）枚举 rollout 兜底；
+            # 兜底也为空才降级为上一轮缓存并报错。
+            fallback_rows = self._codex_rollout_fallback(root)
+            if fallback_rows:
+                self.codex_rows = fallback_rows
+            else:
+                available = False
+                cause = getattr(self, "_last_db_error", None)
+                self.last_errors.append("Codex 会话数据库暂时不可读" + ("（" + cause + "）" if cause else ""))
         owners = _codex_owners(processes, root)
         histories: dict[str, dict] = {}
         try:
@@ -423,7 +499,12 @@ class SessionCollector:
             pid = owners.get(thread)
             state, evidence = _codex_status(histories.get(thread, {}), tail, pid)
             if not available:
-                state, evidence = "unknown", "会话数据库暂时不可读；显示上次采集的会话信息"
+                # 有存活进程且日志尾有明确生命周期的行不整体降级：
+                # completed/interrupted 是显式终态证据；running 无法确认活性才降级。
+                if state == "running":
+                    state, evidence = "unknown", "会话数据库暂时不可读；运行状态待确认"
+                elif state not in {"completed", "interrupted"}:
+                    state, evidence = "unknown", "会话数据库暂时不可读；显示上次采集的会话信息"
             title = row.get("name") or row.get("title")
             if not title:
                 title = row.get("agent_path") or row.get("agent_nickname") or "未命名任务"

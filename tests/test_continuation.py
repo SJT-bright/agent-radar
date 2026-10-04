@@ -2,7 +2,7 @@ import json
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from pathlib import Path
 from types import SimpleNamespace
 from supervisor.bridge import Blocked, Journal, MESSAGE, MacBackend, perform, validate_snapshot, grok_target, zcode_target, qoder_target, qoder_chat_url
@@ -54,6 +54,11 @@ class ContinuationTests(unittest.TestCase):
             request = dict(id='qoder-cn:' + sid, navigation_key=sid,
                            title='任务标题', navigation_title='任务标题', project='/work/项目')
             self.assertEqual(qoder_target(request, db_path), (sid, '任务标题', '项目', '/work/项目'))
+            standard = dict(request, id='qoder:' + sid, app_id='qoder')
+            self.assertEqual(qoder_target(standard, db_path), (sid, '任务标题', '项目', '/work/项目'))
+            self.assertTrue(qoder_chat_url(sid, 'qoder').startswith('qoder-app://'))
+            with self.assertRaisesRegex(Blocked, 'target_unverified'):
+                qoder_target(dict(standard, app_id='qoder-cn'), db_path)
             self.assertIn('/chat/' + sid + '?surface=conversation', qoder_chat_url(sid))
             for change in ({'id': 'qoder-cn:other'}, {'navigation_key': 'other'},
                            {'title': '别的标题'}, {'navigation_title': '别的标题'},
@@ -82,12 +87,30 @@ class ContinuationTests(unittest.TestCase):
             self.assertEqual(zcode_target(request, db_path), ('Unique task', 'Project', '/w/Project', False))
             db.execute('INSERT INTO tasks VALUES (?,?,?,?,0,0)', ('third', '/w/Project', 'id3', 'Unique task'))
             db.commit()
-            with self.assertRaisesRegex(Blocked, 'target_unverified'):
+            with self.assertRaisesRegex(Blocked, 'session_title_ambiguous'):
                 zcode_target(request, db_path)
             db.close()
         finally:
             db_path.unlink(missing_ok=True)
             db_path.parent.rmdir()
+
+    def test_qoder_named_workspace_is_resolved_by_exact_session_id(self):
+        import sqlite3
+        sid = '9a249604-577a-448a-8c1c-1414e4fd29f7'
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'main.sqlite'
+            with sqlite3.connect(path) as db:
+                db.execute('CREATE TABLE chat_sessions (session_id,title,cwd,archived,deleted_at,session_kind,owner_session_id,workspace_id)')
+                db.execute('CREATE TABLE workspaces (workspace_id,name,archived,deleted_at)')
+                db.execute("INSERT INTO chat_sessions VALUES (?,?,?,0,NULL,'standard',NULL,'workspace')", (sid, '任务', '/work/directory'))
+                db.execute("INSERT INTO workspaces VALUES ('workspace','工作区别名',0,NULL)")
+            request = dict(app_id='qoder-cn', id='qoder-cn:'+sid, navigation_key=sid,
+                           title='任务', navigation_title='任务', project='/work/directory')
+            self.assertEqual(qoder_target(request, path)[2], '工作区别名')
+            with sqlite3.connect(path) as db:
+                db.execute("UPDATE workspaces SET workspace_id='another'")
+            with self.assertRaisesRegex(Blocked, 'target_unverified'):
+                qoder_target(request, path)
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -319,11 +342,18 @@ class RageBridgeTests(unittest.TestCase):
     run_request = ContinuationTests.run_request
     run_code = ContinuationTests.run_code
     def test_rage_fixed_interruption_and_double_click(self):
+        # 无自定义文本时回落固定 MESSAGE；显式 text 走已校验的按软件提示词。
         self.request.update(automation_mode='rage', started_at=100, kind='interrupt', text='错误的可配置文本')
         self.assertEqual(self.run_request()['code'], 'sent_pending_confirmation')
-        self.assertEqual(self.backend.written, [MESSAGE])
+        self.assertEqual(self.backend.written, ['错误的可配置文本'])
         self.assertEqual(self.run_code()['code'], 'already_attempted')
         self.assertEqual(self.backend.sends, 1)
+
+    def test_rage_interrupt_without_text_falls_back_to_message(self):
+        self.request.update(automation_mode='rage', started_at=100, kind='interrupt')
+        self.request.pop('text', None)
+        self.assertEqual(self.run_request()['code'], 'sent_pending_confirmation')
+        self.assertEqual(self.backend.written, [MESSAGE])
 
     def test_rage_over_hourly_limit_and_old_round_after_compaction(self):
         self.request.update(automation_mode='rage', kind='followup')
@@ -562,6 +592,8 @@ class AXSelectionTests(unittest.TestCase):
             def get(n, k): return (n.get('err', 0), n.get(k))
             @staticmethod
             def trusted(): return True
+            @staticmethod
+            def action_names(n): return n.get('actions', ['AXPress'])
         b = object.__new__(MacBackend)
         b.ax = AX
         b.window = SimpleNamespace(rect=(0, 0, 1000, 800), pid=123)
@@ -580,6 +612,18 @@ class AXSelectionTests(unittest.TestCase):
             self.assertIs(b.navigation_nodes(0.6), nodes)
         sleep.assert_not_called()
 
+    def test_inspect_is_readonly_and_excludes_draft_text(self):
+        b = self.backend()
+        b.bind_window = lambda: None
+        b.guard = b.route = b.write = b.send = lambda *_: self.fail('inspect cannot act on the desktop')
+        b.snapshot = lambda: dict(identity=True, input_count=1, busy=False, value='private draft',
+                                 send_exists=True, send_enabled=True)
+        result = b.inspect()
+        self.assertEqual(result['code'], 'ready')
+        self.assertFalse(result['attempted'])
+        self.assertFalse(result['empty_composer'])
+        self.assertNotIn('private', str(result))
+
     def test_zcode_search_accepts_unique_indexed_title_with_project_in_composite_label(self):
         b = self.backend('zcode')
         result = {'label': b.title + ' task summary Project 刚刚',
@@ -592,6 +636,131 @@ class AXSelectionTests(unittest.TestCase):
         self.assertTrue(b.zcode_search_match(result))
         result['children'][0]['label'] = 'Other task'
         self.assertFalse(b.zcode_search_match(result))
+
+    def test_zcode_search_reads_nested_title_and_english_input(self):
+        b = self.backend('zcode')
+        b.zcode_identity = (b.title, 'Project', '/w/Project', True)
+        leaf = {'role': 'AXStaticText', 'label': b.title}
+        for _ in range(5):
+            leaf = {'children': [leaf]}
+        self.assertTrue(b.zcode_search_match(leaf))
+        boxes = [({'placeholder': 'Search actions, tasks, or files'}, 'AXComboBox')]
+        self.assertEqual(b.search_boxes(boxes), [boxes[0][0]])
+        boxes[0][0]['placeholder'] = '提出后续修改要求'
+        self.assertEqual(b.search_boxes(boxes), [])
+
+    def test_zcode_repeated_message_hits_choose_top_result_and_route(self):
+        b = self.backend('zcode')
+        b.zcode_identity = (b.title, 'Project', '/w/Project', True)
+        box = {'placeholder': '搜索操作、任务或文件', 'AXValue': b.title}
+        def hit(y):
+            return {'role': 'AXMenuItem', 'rect': (100, y, 700, y + 52), 'children': [
+                {'children': [{'role': 'AXStaticText', 'label': b.title}]},
+                {'role': 'AXStaticText', 'label': 'Message hit'},
+                {'role': 'AXStaticText', 'label': 'Project'}]}
+        top, lower = hit(220), hit(272)
+        nodes = [(box, 'AXComboBox'), (lower, 'AXMenuItem'), (top, 'AXMenuItem')]
+        b.nodes = lambda: nodes
+        b.guard = lambda: None
+        b.write_search_query = Mock()
+        b.ax = SimpleNamespace(**{name: getattr(b.ax, name) for name in
+                                 ('placeholder', 'get_attr', 'enabled', 'action_names', 'rect_of',
+                                  'children', 'role', 'element_name')}, press=Mock(return_value=True))
+        final = [object()]
+        b.navigation_nodes = Mock(return_value=final)
+        self.assertIs(b.route_zcode_search(nodes), final)
+        b.ax.press.assert_called_once_with(top)
+        b.write_search_query.assert_called_once_with(box)
+        b.zcode_identity = (b.title, 'Project', '/w/Project', False)
+        with self.assertRaisesRegex(Blocked, 'search_result_ambiguous'):
+            b.zcode_search_result(nodes)
+
+    def test_zcode_search_rejects_title_only_in_another_task_message(self):
+        b = self.backend('zcode')
+        b.zcode_identity = (b.title, 'Project', '/w/Project', True)
+        result = {'children': [
+            {'children': [{'role': 'AXStaticText', 'label': 'Other task'}]},
+            {'children': [{'role': 'AXStaticText', 'label': b.title}]},
+            {'role': 'AXStaticText', 'label': 'Project'}]}
+        self.assertFalse(b.zcode_search_match(result))
+
+    def test_zcode_search_excludes_hidden_and_disabled_hits(self):
+        b = self.backend('zcode')
+        b.zcode_identity = (b.title, 'Project', '/w/Project', True)
+        title = [{'role': 'AXStaticText', 'label': b.title}]
+        hidden = {'rect': (100, 160, 700, 161), 'children': title}
+        disabled = {'rect': (100, 180, 700, 232), 'enabled': False, 'children': title}
+        outside = {'rect': (100, -20, 700, 32), 'children': title}
+        inactive = {'rect': (100, 240, 700, 292), 'actions': [], 'children': title}
+        self.assertIsNone(b.zcode_search_result([(n, 'AXMenuItem') for n in
+                                                (hidden, disabled, outside, inactive)]))
+
+    def test_zcode_collapsed_sidebar_still_requires_adjacent_project_and_header(self):
+        b = self.backend('zcode')
+        b.zcode_identity = (b.title, 'Project', '/w/Project', True)
+        heading = ({'rect': (90, 60, 260, 81), 'AXValue': 1, 'label': b.title}, 'AXHeading')
+        project = ({'rect': (55, 57, 83, 85), 'label': 'Project'}, 'AXButton')
+        self.assertTrue(b.current_identity([heading, project]))
+        self.assertFalse(b.current_identity([heading]))
+        project[0]['rect'] = (55, 300, 83, 328)
+        self.assertFalse(b.current_identity([heading, project]))
+        project[0]['rect'] = (55, 57, 83, 85)
+        self.assertFalse(b.current_identity([heading, heading, project]))
+        clipped = ({'rect': (90, 90, 260, 91), 'AXValue': 1, 'label': b.title}, 'AXHeading')
+        self.assertTrue(b.current_identity([heading, project, clipped]))
+        box = ({'rect': (60, 650, 800, 710), 'placeholder': '提出后续修改要求', 'AXValue': ''}, 'AXGroup')
+        box[0]['description'] = 'text entry area'
+        preview = ({'rect': (850, 650, 980, 710), 'placeholder': '网站搜索', 'AXValue': ''}, 'AXTextField')
+        b.nodes = lambda: [heading, project, box, preview]
+        self.assertEqual(b.snapshot()['input_count'], 1)
+        self.assertIs(b.box, box[0])
+
+    def test_autoclaw_current_age_labels_keep_exact_title(self):
+        b = self.backend()
+        for suffix in ('2天', '1周', '2周', '1个月', '3个月', '1年', '99年', '正在回复...'):
+            self.assertTrue(b.sidebar_match(b.title + ' ' + suffix), suffix)
+        for suffix in ('2天备份', '1周 新对话', '2月', '正在回复副本'):
+            self.assertFalse(b.sidebar_match(b.title + ' ' + suffix), suffix)
+        self.assertFalse(b.sidebar_match('正确会话的备份 2天'))
+
+    def test_autoclaw_expands_only_unique_navigation_controls(self):
+        b = self.backend()
+        b.guard = lambda **_: None
+        presses = []
+        b.ax.press = lambda node: presses.append(node['label']) or True
+        expand = ({'label': '展开侧边栏', 'rect': (20, 60, 50, 90)}, 'AXButton')
+        more = ({'label': '展示更多', 'rect': (20, 300, 150, 330)}, 'AXButton')
+        target = ({'label': b.title + ' 2天', 'rect': (20, 400, 150, 430)}, 'AXButton')
+        b.navigation_nodes = lambda _: [more] if len(presses) == 1 else [target]
+        self.assertEqual(b.expand_autoclaw_sidebar([expand]), [target])
+        self.assertEqual(presses, ['展开侧边栏', '展示更多'])
+        presses.clear()
+        self.assertEqual(b.expand_autoclaw_sidebar([more, more]), [more, more])
+        self.assertEqual(presses, [])
+
+    def test_search_paste_never_calls_composer_or_send_and_restores_clipboard(self):
+        b = self.backend('zcode')
+        b.guard = lambda **_: None
+        box = {'rect': (200, 200, 500, 230), 'AXFocused': True,
+               'placeholder': '搜索操作、任务或文件', 'AXValue': ''}
+        b.nodes = lambda: [(box, 'AXComboBox')]
+        actions = []
+        b.inject = SimpleNamespace(click_at=lambda *_: actions.append('focus-search'),
+            hotkey=lambda key: (actions.append(key), box.update(AXValue=b.title) if key == 9 else None))
+        saved_item = SimpleNamespace(types=lambda: ['custom'], dataForType_=lambda _: b'original')
+        clone = SimpleNamespace(setData_forType_=lambda *_: None)
+        board = SimpleNamespace(pasteboardItems=lambda: [saved_item], clearContents=lambda: actions.append('clear'),
+            setString_forType_=lambda value, _: actions.append(('query', value)), changeCount=lambda: 1,
+            writeObjects_=lambda items: actions.append(('restore', items == [clone])))
+        b.AppKit = SimpleNamespace(NSPasteboard=SimpleNamespace(generalPasteboard=lambda: board),
+            NSPasteboardItem=SimpleNamespace(alloc=lambda: SimpleNamespace(init=lambda: clone)),
+            NSPasteboardTypeString='text')
+        b.snapshot = b.send = b.write = lambda *_: self.fail('search must never touch the composer/send')
+        b.write_search_query(box)
+        self.assertEqual(actions, ['focus-search', 0, 'clear', ('query', b.title), 9, 'clear', ('restore', True)])
+        box['AXFocused'] = False
+        with self.assertRaisesRegex(Blocked, 'search_unavailable'):
+            b.write_search_query(box)
 
     def test_send_promotes_only_one_new_queue_control(self):
         b = self.backend('zcode')
@@ -687,7 +856,8 @@ class AXSelectionTests(unittest.TestCase):
     def test_placeholder_needs_declared_exact_match_and_send_is_unique(self):
         b = self.backend()
         header = ({'rect': (310, 70, 450, 100), 'AXValue': 1, 'label': '正确会话'}, 'AXHeading')
-        box = ({'rect': (310, 650, 880, 710), 'AXValue': '输入消息', 'placeholder': '输入消息'}, 'AXTextArea')
+        box = ({'rect': (310, 650, 880, 710), 'AXValue': '输入“@”使用技能',
+                'placeholder': '输入“@”使用技能', 'AXDescription': '输入“@”使用技能'}, 'AXTextArea')
         send = ({'rect': (850, 730, 880, 760), 'label': '发送消息', 'enabled': False}, 'AXButton')
         nodes = [header, box, send]
         b.nodes = lambda: nodes
@@ -696,7 +866,7 @@ class AXSelectionTests(unittest.TestCase):
         self.assertTrue(snapshot['send_exists'])
         self.assertFalse(snapshot['send_enabled'])
         box[0].pop('placeholder')
-        self.assertEqual(b.snapshot()['value'], '输入消息')
+        self.assertEqual(b.snapshot()['value'], '输入“@”使用技能')
         nodes.append(send)
         self.assertFalse(b.snapshot()['send_exists'])
 
@@ -740,8 +910,25 @@ class AXSelectionTests(unittest.TestCase):
     def test_readback_ignores_editor_boundary_sentinel(self):
         b = self.backend()
         b.current_identity = lambda _: True
-        b.nodes = lambda: [({'rect': (310, 650, 880, 710), 'AXValue': '\ufeff' + MESSAGE + '\ufeff'}, 'AXTextArea')]
+        b.nodes = lambda: [({'rect': (310, 650, 880, 710), 'AXDescription': '发送给 AutoClaw',
+                            'AXValue': '\ufeff' + MESSAGE + '\ufeff'}, 'AXTextArea')]
         self.assertEqual(b.snapshot()['value'], MESSAGE)
+
+    def test_autoclaw_goal_review_fields_never_become_the_chat_composer(self):
+        b = self.backend()
+        b.current_identity = lambda _: True
+        main = ({'rect': (310, 650, 880, 710), 'AXDescription': '填写你的目标，AutoClaw会持续工作至完成目标...',
+                 'AXValue': '', 'placeholder': '填写你的目标，AutoClaw会持续工作至完成目标...'}, 'AXTextArea')
+        reviews = [({'rect': (310, 450 + i * 15, 880, 480 + i * 15),
+                     'AXDescription': '描述一条完成标准', 'AXValue': 'user goal'}, 'AXTextArea') for i in range(12)]
+        b.nodes = lambda: reviews + [main]
+        snapshot = b.snapshot()
+        self.assertEqual(snapshot['input_count'], 1)
+        self.assertEqual(snapshot['value'], '')
+        self.assertIs(b.box, main[0])
+        main[0]['enabled'] = False
+        self.assertEqual(b.snapshot()['input_count'], 0)
+        self.assertIsNone(b.box)
 
     def test_permission_and_real_quartz_console_key_fail_closed(self):
         b = self.backend()
@@ -807,6 +994,79 @@ class AXSelectionTests(unittest.TestCase):
         self.assertFalse(b.sidebar_match('未读 — 后台回合已完成 继续优化全量去更新 副本'))
         self.assertFalse(b.sidebar_match('未读 — 后台回合已完成 继续优化全量去更新 33分钟前 备份'))
         self.assertFalse(b.current_identity([header, project, project]))
+
+    def test_grok_current_running_badge_and_collapsed_sidebar(self):
+        b = self.backend('grok')
+        b.grok_identity = (b.title, '工程', '/tmp/project')
+        for age in ('11分钟前', '2周前', '1个月前'):
+            self.assertTrue(b.sidebar_match(b.title + ' ' + age + ' 进行中…'))
+        self.assertFalse(b.sidebar_match(b.title + ' 11分钟前 进行中… 副本'))
+        header = ({'rect': (70, 60, 300, 80), 'AXValue': 1, 'label': b.title}, 'AXHeading')
+        clipped = ({'rect': (70, 90, 300, 91), 'AXValue': 1, 'label': b.title}, 'AXHeading')
+        project = ({'rect': (70, 650, 300, 680), 'label': '工程'}, 'AXPopUpButton')
+        self.assertTrue(b.current_identity([header, clipped, project]))
+        project[0]['rect'] = (70, 60, 300, 80)
+        self.assertFalse(b.current_identity([header, project]))
+
+    def test_grok_expands_only_exact_unique_collapsed_project(self):
+        b = self.backend('grok')
+        b.grok_identity = (b.title, '工程', '/tmp/project')
+        b.guard = lambda **_: None
+        project = {'label': '工程', 'rect': (20, 100, 150, 130), 'AXExpanded': False}
+        calls = []
+        b.ax.press = lambda node: calls.append(node) or True
+        target = [({'label': b.title + ' 11分钟前 进行中…', 'rect': (20, 140, 170, 170)}, 'AXButton')]
+        b.navigation_nodes = lambda _: target
+        self.assertIs(b.expand_grok_project([(project, 'AXButton')]), target)
+        self.assertEqual(calls, [project])
+        calls.clear()
+        b.expand_grok_project([(project, 'AXButton'), (project, 'AXButton')])
+        self.assertEqual(calls, [])
+        project['AXExpanded'] = True
+        b.expand_grok_project([(project, 'AXButton')])
+        self.assertEqual(calls, [])
+
+    def test_qoder_editions_bind_url_and_only_real_composer(self):
+        sid = '9a249604-577a-448a-8c1c-1414e4fd29f7'
+        for app in ('qoder', 'qoder-cn'):
+            b = self.backend(app)
+            b.qoder_identity = (sid, b.title, '工程', '/tmp/工程')
+            url = ({'AXURL': qoder_chat_url(sid, app)}, 'AXWebArea')
+            header = ({'rect': (70, 70, 300, 95), 'label': b.title, 'AXValue': 1}, 'AXHeading')
+            context = ({'label': '当前任务上下文', 'children': [{'label': '工程', 'role': 'AXGroup'}]}, 'AXGroup')
+            box = ({'rect': (60, 650, 800, 710), 'AXDescription': '发送任务消息', 'AXValue': ''}, 'AXTextArea')
+            preview = ({'rect': (800, 650, 980, 710), 'AXDescription': '网站留言', 'AXValue': ''}, 'AXTextArea')
+            b.nodes = lambda: [url, header, context, box, preview]
+            snapshot = b.snapshot()
+            self.assertTrue(snapshot['identity'])
+            self.assertEqual(snapshot['input_count'], 1)
+            other = 'qoder-cn' if app == 'qoder' else 'qoder'
+            url[0]['AXURL'] = qoder_chat_url(sid, other)
+            self.assertFalse(b.snapshot()['identity'])
+
+    def test_real_user_input_still_interrupts_after_our_write(self):
+        b = self.backend('grok')
+        b.Quartz = SimpleNamespace(kCGSessionOnConsoleKey='onConsole', CGSessionCopyCurrentDictionary=lambda: {'onConsole': True})
+        b.winops.user_active = lambda _: True
+        with self.assertRaisesRegex(Blocked, 'user_active'):
+            b.guard(after_write=True)
+
+    def test_qoder_expands_only_bound_workspace_until_uuid_link_appears(self):
+        b = self.backend('qoder')
+        sid = '9a249604-577a-448a-8c1c-1414e4fd29f7'
+        b.qoder_identity = (sid, b.title, '别名', '/tmp/directory')
+        b.guard = lambda **_: None
+        calls = []
+        b.ax.press = lambda node: calls.append(node['label']) or True
+        expand = ({'label': '展开工作目录 别名'}, 'AXButton')
+        more = ({'label': '展示 别名 的更多任务'}, 'AXButton')
+        link = ({'AXURL': qoder_chat_url(sid, 'qoder')}, 'AXLink')
+        b.navigation_nodes = lambda _: [more] if len(calls) == 1 else [link]
+        self.assertEqual(b.expand_qoder_workspace([expand]), [link])
+        self.assertEqual(calls, ['展开工作目录 别名', '展示 别名 的更多任务'])
+        calls.clear()
+        b.expand_qoder_workspace([expand, expand])
+        self.assertEqual(calls, [])
 
     def test_grok_broken_ui_refuses_composer(self):
         b = self.backend('grok')

@@ -26,6 +26,13 @@ private final class FastCompletedJudge: ContinuationSending {
     static func main() {
         var checks = 0
         func check(_ value: Bool, _ name: String) { precondition(value, name); checks += 1 }
+        var suites: [String] = []
+        func freshDefaults() -> UserDefaults {
+            let name = "agentradar.fast-interruption." + UUID().uuidString
+            suites.append(name)
+            return UserDefaults(suiteName: name)!
+        }
+        defer { for suite in suites { UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite) } }
         // Each scenario has an actual Controller send receipt, then a newer
         // terminal turn with no intervening running observation.
         for scenario in ["503", "user-stopped", "explicit-stop", "unknown-reason", "auth", "permission", "context",
@@ -33,7 +40,7 @@ private final class FastCompletedJudge: ContinuationSending {
                          "stale-before", "stale-queued", "disabled", "paused"] {
             var now = 10_000.0
             let bridge = FastFailureBridge(clock: { now })
-            let defaults = UserDefaults(suiteName: "agentradar.fast-interruption.\(UUID().uuidString)")!
+            let defaults = freshDefaults()
             let controller = ContinuationController(bridge: bridge, judgeBridge: FastCompletedJudge(), clock: { now }, countDefaults: defaults)
             var rules = PromptRules(); rules.completionMode = "rage"; rules.ragePrompt = "优化项目并验证"
             rules.interruptText = "不应被使用的自定义文本"
@@ -92,13 +99,73 @@ private final class FastCompletedJudge: ContinuationSending {
             if scenario == "503" {
                 check(bridge.requests.count == 2, "one optimization and exactly one interrupted recovery")
                 let recovery = bridge.requests[1]
-                check(recovery["text"] as? String == rules.ragePrompt, "fast failure uses next ordinary cadence prompt")
+                check(recovery["text"] as? String == "刚才中断了，请继续", "fast failure keeps parsed per-app resume text")
                 check(recovery["kind"] as? String == "interrupt" && recovery["automation_mode"] as? String == "rage", "fast failure preserves rage interrupt protocol")
                 check(recovery["key"] as? String == ContinuationPolicy.key(row) && recovery["key"] as? String != previousKey, "recovery targets only the newer exact round")
                 check((bridge.times.last ?? .infinity) - interruptedAt <= 10, "interruption recovery dispatches within ten seconds")
             } else {
                 check(bridge.requests.count == 1, scenario + " must not resume")
             }
+        }
+        // 路由瞬态失败（如 Grok 标题自动改名、索引撕裂读）有限次重试而非终局。
+        do {
+            var now = 50_000.0
+            final class FlakyRouteBridge: ContinuationSending {
+                var isRunning = false
+                var requests: [[String: Any]] = []
+                var times: [Double] = []
+                let clock: () -> Double
+                var failuresLeft: Int
+                init(clock: @escaping () -> Double, failures: Int) { self.clock = clock; self.failuresLeft = failures }
+                func cancel() {}
+                func run(_ request: [String: Any], completion: @escaping (String, Bool, Double?) -> Void) {
+                    requests.append(request); times.append(clock())
+                    if failuresLeft > 0 { failuresLeft -= 1; completion("target_unverified", false, nil); return }
+                    completion("sent_pending_confirmation", true, nil)
+                }
+            }
+            let bridge = FlakyRouteBridge(clock: { now }, failures: 2)
+            let controller = ContinuationController(bridge: bridge, judgeBridge: FastCompletedJudge(), clock: { now }, countDefaults: freshDefaults())
+            var rules = PromptRules(); rules.completionMode = "rage"
+            controller.rulesProvider = { rules }
+            controller.configure(enabled: true, paused: false)
+            controller.setSupervisedIDs(["grok:flaky"])
+            var row = SessionRecord(id: "grok:flaky", app_id: "grok", app_name: "Grok",
+                title: "Flaky route recovery", project: "/f", status: "running", evidence: "明确轮次事件",
+                updated_at: now, source: "local-session", target: "", started_at: now - 5, timing_basis: "turn")
+            controller.observe([row], fresh: true)
+            row.status = "interrupted"; row.status_reason = "服务端返回错误（HTTP 502）"
+            let interruptedAt = now
+            controller.observe([row], fresh: true)
+            check(controller.pendingSessionIDs.contains(row.id), "flaky route queued")
+            for _ in 0..<30 {
+                now += 5
+                controller.observe([row], fresh: true)
+                controller.tick()
+            }
+            check(bridge.requests.count == 3 && bridge.times.last! - interruptedAt <= 60,
+                  "target_unverified recovery still fires within one minute")
+            check(bridge.failuresLeft == 0, "route retries consumed transient failures")
+
+            let stubborn = FlakyRouteBridge(clock: { now }, failures: 99)
+            let controller2 = ContinuationController(bridge: stubborn, judgeBridge: FastCompletedJudge(), clock: { now }, countDefaults: freshDefaults())
+            controller2.rulesProvider = { rules }
+            controller2.configure(enabled: true, paused: false)
+            controller2.setSupervisedIDs(["grok:stubborn"])
+            var row2 = row; row2.id = "grok:stubborn"; row2.title = "Stubborn target"; row2.started_at = now
+            row2.status = "running"
+            controller2.observe([row2], fresh: true)
+            row2.status = "interrupted"; row2.status_reason = "服务端返回错误（HTTP 503）"
+            let detected = now
+            controller2.observe([row2], fresh: true)
+            for _ in 0..<30 {
+                now += 5
+                controller2.observe([row2], fresh: true)
+                controller2.tick()
+            }
+            check(stubborn.requests.count == 4, "persistent route failure stops after three retries")
+            check(controller2.pendingSessionIDs.isEmpty, "persistent route failure ends honestly")
+            _ = detected
         }
         print("Fast interruption controller: \(checks) checks passed")
     }

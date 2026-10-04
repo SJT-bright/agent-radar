@@ -125,9 +125,10 @@ class ClineCollector:
                 registry_end = _timestamp(session['ended_at'])
                 if session['status'] in ('failed', 'error', 'cancelled', 'canceled') and registry_end > ended:
                     status = 'interrupted'
-                    reason = 'Cline 会话索引标记失败或取消；没有提供更具体的本轮终止原因'
-                    started, ended = (started if not terminal else 0), registry_end
                     user_stopped = session['status'] in ('cancelled', 'canceled')
+                    reason = ('Cline 会话索引记录本轮由用户主动取消' if user_stopped else
+                              'Cline 会话索引标记失败；没有提供更具体的本轮终止原因')
+                    started, ended = (started if not terminal else 0), registry_end
                 elif not terminal:
                     worker = processes.get(session['pid'], '')
                     alive = APP_PATH in worker

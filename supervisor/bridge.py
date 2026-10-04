@@ -24,11 +24,23 @@ CONTROL_CHARS = re.compile(r'[\x00-\x08\x0b-\x1f\x7f]')
 BUNDLES = {'autoclaw': 'com.zhipuai.autoclaw', 'codex': 'com.openai.codex',
            'workbuddy': 'com.tencent.workbuddy.mac', 'workbuddy-ai': 'com.workbuddy.workbuddy-ai',
            'zcode': 'dev.zcode.app', 'grok': 'com.grokapp.desktop',
-           'qoder-cn': 'com.qodercn.app'}
+           'qoder-cn': 'com.qodercn.app', 'qoder': 'com.qoder.app'}
 SEND_NAMES = {'发送', '发送消息', '发送提示', 'send', 'send message', 'send prompt', 'submit', '提交'}
 STOP_NAMES = {'停止', '停止生成', '停止回复', 'stop', 'stop generating', 'stop response', '停止任务'}
 GROK_SIDEBAR_PREFIX = '未读 — 后台回合已完成 '
-GROK_SIDEBAR_AGE = re.compile(r'\s+(?:刚刚|现在|\d+\s*(?:秒钟|秒|分钟|小时|天)前|昨天|前天|\d{1,2}:\d{2}|\d{1,2}月\d{1,2}日)$')
+GROK_SIDEBAR_AGE = re.compile(r'\s+(?:刚刚|现在|\d+\s*(?:秒钟|秒|分钟|小时|天|周|个月|年)前|昨天|前天|\d{1,2}:\d{2}|\d{1,2}月\d{1,2}日)(?: 进行中…)?$')
+QODER_IDS = ('qoder', 'qoder-cn')
+CHAT_COMPOSER_HINTS = {'grok': {'消息输入框', '随心输入'},
+                       'qoder': {'发送任务消息'}, 'qoder-cn': {'发送任务消息'}}
+ZCODE_SEARCH_PLACEHOLDERS = {'搜索操作、任务或文件', 'Search actions, tasks, or files'}
+ZCODE_COMPOSER_HINTS = {'提出后续修改要求', '继续输入以排队后续修改',
+                        'Ask for follow-up changes', 'Keep typing to queue follow-up changes'}
+AUTOCLAW_SIDEBAR_AGE = re.compile(
+    r'(?:有未查看回复|正在回复\.{3}|\d{1,2}:\d{2}|昨天|前天|\d{1,2}月\d{1,2}日|'
+    r'\d+\s*(?:天|周|个月|年))')
+AUTOCLAW_COMPOSER_HINTS = {'填写你的目标，AutoClaw会持续工作至完成目标...',
+                          '发送给 AutoClaw', '输入“@”使用技能',
+                          '请输入你想让 AutoClaw 对文件做什么'}
 
 
 class Blocked(Exception):
@@ -195,8 +207,8 @@ def resolve_text(request):
     None when the request must not send anything (fail closed): a non-string
     `text`, text over MAX_TEXT, or text containing control characters.
     """
-    if request.get('automation_mode') == 'rage' and request.get('kind') != 'followup':
-        return MESSAGE
+    # 狂暴中断恢复同样接受已校验的自定义文本（按软件提示词）；
+    # 缺失、空白或非法仍按下方规则回落 MESSAGE / fail closed。
     text = request.get('text')
     if text is None:
         return MESSAGE
@@ -280,12 +292,21 @@ def grok_target(request, root=None):
     root = root or Path.home() / 'Library/Application Support/com.grokapp.grok-app'
     def read(name, limit):
         path = root / name
-        if path.stat().st_size > limit:
-            raise Blocked('target_unverified')
-        value = json.loads(path.read_text())
-        if not isinstance(value, list):
-            raise Blocked('target_unverified')
-        return [r for r in value if isinstance(r, dict)]
+        for attempt in range(2):
+            if path.stat().st_size > limit:
+                raise Blocked('target_unverified')
+            try:
+                value = json.loads(path.read_text())
+            except ValueError:
+                # Grok 重写索引的半截内容：0.15 秒后重读一次再判定。
+                if attempt == 0:
+                    time.sleep(0.15)
+                    continue
+                raise Blocked('target_unverified')
+            if not isinstance(value, list):
+                raise Blocked('target_unverified')
+            return [r for r in value if isinstance(r, dict)]
+        raise Blocked('target_unverified')
     try:
         sessions = read('sessions_index.json', 4 * 1024 * 1024)
         projects = read('projects.json', 2 * 1024 * 1024)
@@ -337,11 +358,11 @@ def zcode_target(request, root=None):
         # select one indexed task; the project display name must also be unique.
         if sum(other_project == project and other_title == title
                for _, other_project, _, other_title in rows) != 1:
-            raise Blocked('target_unverified')
+            raise Blocked('session_title_ambiguous')
         name = Path(project).name
         if (not name or sum(Path(other_project).name == name and other_project != project
                             for _, other_project, _, _ in rows) != 0):
-            raise Blocked('target_unverified')
+            raise Blocked('project_name_ambiguous')
         # Search results may expose the project only in a composite label;
         # accept exact title-only matching only when no indexed task, even
         # archived or deleted, shares the title.
@@ -352,19 +373,33 @@ def zcode_target(request, root=None):
 
 
 def qoder_target(request, root=None):
-    """Bind a Qoder CN chat UUID to the current task and workspace metadata."""
+    """Bind the selected Qoder edition's UUID, task and workspace metadata."""
+    app_id = request.get('app_id') or request.get('id', '').partition(':')[0]
     sid = request.get('navigation_key')
-    if (not isinstance(sid, str) or
+    if (app_id not in QODER_IDS or not isinstance(sid, str) or
             not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', sid) or
-            request.get('id') != 'qoder-cn:' + sid):
+            request.get('id') != app_id + ':' + sid):
         raise Blocked('target_unverified')
-    path = root or Path.home() / 'Library/Application Support/com.qodercn.app.stable/main.sqlite'
+    folder = 'com.qoder.app.stable' if app_id == 'qoder' else 'com.qodercn.app.stable'
+    path = root or Path.home() / 'Library/Application Support' / folder / 'main.sqlite'
     try:
         with sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=0.5) as db:
             db.execute('PRAGMA query_only=ON')
             rows = db.execute('''SELECT title,cwd FROM chat_sessions WHERE session_id=?
                 AND archived=0 AND deleted_at IS NULL AND session_kind='standard'
                 AND owner_session_id IS NULL''', (sid,)).fetchall()
+            # Qoder can rename a workspace independently of its directory.
+            # Resolve the displayed name through this exact session's workspace
+            # ID; a filesystem basename alone falsely rejects such tasks.
+            workspace_name = None
+            if 'workspace_id' in {column[1] for column in db.execute('PRAGMA table_info(chat_sessions)')}:
+                workspace = db.execute('SELECT workspace_id FROM chat_sessions WHERE session_id=?', (sid,)).fetchone()
+                if workspace and workspace[0]:
+                    names = db.execute('''SELECT name FROM workspaces WHERE workspace_id=?
+                        AND archived=0 AND deleted_at IS NULL''', (workspace[0],)).fetchall()
+                    if len(names) != 1 or not isinstance(names[0][0], str) or not names[0][0].strip():
+                        raise Blocked('target_unverified')
+                    workspace_name = names[0][0]
         if len(rows) != 1:
             raise Blocked('target_unverified')
         title, project = rows[0]
@@ -373,13 +408,16 @@ def qoder_target(request, root=None):
                 not project.startswith('/') or project != request.get('project') or
                 not Path(project).name):
             raise Blocked('target_unverified')
-        return sid, title, Path(project).name, project
+        return sid, title, workspace_name or Path(project).name, project
     except (OSError, sqlite3.Error, TypeError, ValueError):
         raise Blocked('target_unverified')
 
 
-def qoder_chat_url(sid):
-    return 'qoder-cn-app://renderer/index.html?workbenchScope=primary#/chat/' + sid + '?surface=conversation'
+def qoder_chat_url(sid, app_id='qoder-cn'):
+    if app_id not in QODER_IDS:
+        raise Blocked('target_unverified')
+    scheme = 'qoder-app' if app_id == 'qoder' else 'qoder-cn-app'
+    return scheme + '://renderer/index.html?workbenchScope=primary#/chat/' + sid + '?surface=conversation'
 
 
 class MacBackend:
@@ -398,7 +436,7 @@ class MacBackend:
         self.stage = 'preflight'
         self.grok_identity = grok_target(request) if request['app_id'] == 'grok' else None
         self.zcode_identity = zcode_target(request) if request['app_id'] == 'zcode' else None
-        self.qoder_identity = qoder_target(request) if request['app_id'] == 'qoder-cn' else None
+        self.qoder_identity = qoder_target(request) if request['app_id'] in QODER_IDS else None
 
     def guard(self, fresh=False, after_write=False):
         if not self.ax.trusted():
@@ -406,9 +444,9 @@ class MacBackend:
         state = self.Quartz.CGSessionCopyCurrentDictionary()
         if not state or not state.get(self.Quartz.kCGSessionOnConsoleKey) or state.get('CGSSessionScreenIsLocked'):
             raise Blocked('locked')
-        # Yield before touching the app. During our own paste, focus/identity and
-        # exact composer readback take over (synthetic input may reset idle time).
-        if not after_write and self.winops.user_active(2):
+        # Our private events enter at the session tap, below the HID clocks.
+        # A real user action still interrupts us, including during paste/readback.
+        if self.winops.user_active(2):
             raise Blocked('user_active')
         if self.window and self.winops.frontmost_pid() != self.window.pid:
             raise Blocked('focus_changed')
@@ -418,7 +456,7 @@ class MacBackend:
                 from autoclaw_adapter import collect
             elif app == 'codex':
                 from codex_adapter import collect
-            elif app in ('grok', 'qoder-cn'):
+            elif app in ('grok', *QODER_IDS):
                 from extended_adapters import collect
             else:
                 from desktop_adapters import collect
@@ -476,32 +514,49 @@ class MacBackend:
     def label(self, node):
         return self.ax.element_name(node).strip()
 
+    def heading_title(self, node):
+        name = self.label(node)
+        if name in ('', '1'):
+            name = ''.join(self.label(child) for child in self.ax.children(node)).strip()
+        return name
+
+    def search_boxes(self, nodes):
+        return [node for node, role in nodes if role == 'AXComboBox' and
+                self.ax.placeholder(node) in ZCODE_SEARCH_PLACEHOLDERS]
+
     def current_identity(self, nodes):
         ax = self.ax
-        if self.request['app_id'] == 'qoder-cn':
+        if self.request['app_id'] in QODER_IDS:
             sid, title, project_name, _ = self.qoder_identity
             left, top, _, _ = self.window.rect
             urls = [str(ax.get_attr(node, 'AXURL', '')) for node, role in nodes if role == 'AXWebArea']
-            headings = [self.label(node) for node, role in nodes if role == 'AXHeading'
-                        and ax.rect_of(node) and ax.rect_of(node)[1] < top + 150
-                        and ax.rect_of(node)[0] > left + 170]
+            headings = [self.heading_title(node) for node, role in nodes if role == 'AXHeading'
+                        and ax.get_attr(node, 'AXValue', 1) in (1, '1')
+                        and ax.rect_of(node) and top <= ax.rect_of(node)[1] < top + 150
+                        and ax.rect_of(node)[0] > left + 50
+                        and ax.rect_of(node)[3] - ax.rect_of(node)[1] >= 10]
             contexts = [node for node, role in nodes if role == 'AXGroup'
                         and self.label(node) == '当前任务上下文']
             projects = [self.label(child) for parent in contexts for child in ax.children(parent)
                         if ax.role(child) == 'AXGroup']
-            return (urls.count(qoder_chat_url(sid)) == 1 and headings.count(title) == 1
+            return (urls.count(qoder_chat_url(sid, self.request['app_id'])) == 1 and headings == [title]
                     and len(contexts) == 1 and projects.count(project_name) == 1)
         if self.request['app_id'] == 'zcode':
             left, top, _, _ = self.window.rect
-            headings = [self.label(node) for node, role in nodes
+            headings = [node for node, role in nodes
                         if role == 'AXHeading' and ax.rect_of(node) and
-                        ax.rect_of(node)[1] < top + 150 and ax.rect_of(node)[0] > left + 170]
-            projects = [self.label(node) for node, role in nodes
-                        if role == 'AXButton' and ax.rect_of(node) and
-                        ax.rect_of(node)[1] < top + 150 and ax.rect_of(node)[0] > left + 170]
+                        ax.get_attr(node, 'AXValue', 1) in (1, '1') and
+                        top <= ax.rect_of(node)[1] < top + 100 and ax.rect_of(node)[0] > left + 50
+                        and ax.rect_of(node)[3] - ax.rect_of(node)[1] >= 10]
+            if len(headings) != 1 or self.heading_title(headings[0]) != self.title:
+                return False
+            header = ax.rect_of(headings[0])
+            projects = [self.label(node) for node, role in nodes if role == 'AXButton'
+                        and ax.rect_of(node) and ax.rect_of(node)[3] - ax.rect_of(node)[1] >= 10
+                        and left + 30 < ax.rect_of(node)[0] < header[0]
+                        and abs(ax.rect_of(node)[1] - header[1]) < 32]
             name = self.zcode_identity[1]
-            return (headings.count(self.title) == 1 and
-                    sum(value == name or value.startswith(name + ' · ') for value in projects) == 1)
+            return sum(value == name or value.startswith(name + ' · ') for value in projects) == 1
         headers = []
         for node, role in nodes:
             rect = ax.rect_of(node) if role in ('AXHeading', 'AXStaticText') else None
@@ -510,13 +565,12 @@ class MacBackend:
             # Only the conversation's top heading, never a title inside a
             # transcript or matching sidebar text. AutoClaw uses AXHeading 1.
             left, top, right, bottom = self.window.rect
-            if not (rect[1] < top + 150 and rect[0] > left + 170):
+            margin = 50 if self.request['app_id'] == 'autoclaw' else 170
+            if not (top <= rect[1] < top + 150 and rect[0] > left + margin
+                    and rect[3] - rect[1] >= 10):
                 continue
             if role == 'AXHeading' and ax.get_attr(node, 'AXValue', 1) in (1, '1'):
-                name = self.label(node)
-                if not name or name == '1':
-                    name = ' '.join(self.label(c) for c in ax.children(node)).strip()
-                headers.append(name)
+                headers.append(self.heading_title(node))
             elif self.request['app_id'] != 'autoclaw' and role == 'AXStaticText':
                 if self.label(node) == self.title:
                     headers.append(self.title)
@@ -530,13 +584,15 @@ class MacBackend:
                 if not rect:
                     continue
                 name = self.label(node)
-                if role == 'AXHeading' and rect[1] < self.window.rect[1] + 150 and rect[0] > self.window.rect[0] + 170:
-                    if name in ('', '1'):
-                        name = ' '.join(self.label(c) for c in ax.children(node)).strip()
-                    headings.append(name)
-                if role == 'AXPopUpButton' and rect[0] > self.window.rect[0] + 170:
+                if (role == 'AXHeading' and ax.get_attr(node, 'AXValue', 1) in (1, '1')
+                        and self.window.rect[1] <= rect[1] < self.window.rect[1] + 150
+                        and rect[0] > self.window.rect[0] + 50 and rect[3] - rect[1] >= 10):
+                    headings.append(self.heading_title(node))
+                if (role == 'AXPopUpButton' and rect[0] > self.window.rect[0] + 50
+                        and self.window.rect[1] + (self.window.rect[3] - self.window.rect[1]) * .5 <= rect[1]
+                        and rect[3] <= self.window.rect[3] and rect[3] - rect[1] >= 10):
                     selectors.append(name)
-            return (sum(grok_visible_title_matches(name, self.title) for name in headings) == 1
+            return (len(headings) == 1 and grok_visible_title_matches(headings[0], self.title)
                     and selectors.count(self.grok_identity[1]) == 1)
         return headers.count(self.title) == 1
 
@@ -551,10 +607,10 @@ class MacBackend:
             return grok_visible_title_matches(name, self.title, sidebar=True)
         if self.request['app_id'] == 'autoclaw' and name.startswith(self.title + ' '):
             rest = name[len(self.title):].strip()
-            return bool(re.fullmatch(r'(有未查看回复|正在回复\.\.\.|\d{1,2}:\d{2}|昨天|前天|\d{1,2}月\d{1,2}日)', rest))
+            return bool(AUTOCLAW_SIDEBAR_AGE.fullmatch(rest))
         return False
 
-    def route(self):
+    def bind_window(self):
         ax = self.ax
         apps = self.AppKit.NSRunningApplication.runningApplicationsWithBundleIdentifier_(self.bundle)
         if len(apps) != 1:
@@ -569,8 +625,30 @@ class MacBackend:
         from aiwatch.types import WindowInfo
         self.root, rect = usable[0]
         self.window = WindowInfo(0, ax.title(self.root), pid, self.bundle, rect, class_name=self.bundle)
+        return apps[0]
+
+    def inspect(self):
+        # Observe the current window without activating/navigating it. No draft,
+        # journal, send slot or recovery receipt is changed by this diagnostic.
+        if not self.ax.trusted():
+            raise Blocked('permission_required')
+        self.bind_window()
+        current = self.snapshot()
+        try:
+            validate_snapshot(current, None)
+            code = 'ready' if current.get('send_exists') else 'send_unavailable'
+        except Blocked as error:
+            code = str(error)
+        return dict(code=code, attempted=False, identity=current['identity'],
+                    input_count=current['input_count'], busy=current['busy'],
+                    send_exists=current['send_exists'], send_enabled=current['send_enabled'],
+                    empty_composer=current['value'] == '')
+
+    def route(self):
+        ax = self.ax
+        app = self.bind_window()
         self.stage = 'route'
-        self.focus_window(apps[0])
+        self.focus_window(app)
         target = self.request.get('target', '')
         if self.request['app_id'] in ('codex', 'workbuddy'):
             pattern = r'codex://threads/[A-Za-z0-9_-]+' if self.request['app_id'] == 'codex' else r'workbuddy://chat/[A-Za-z0-9_-]+'
@@ -585,18 +663,18 @@ class MacBackend:
             nodes = self.navigation_nodes(0.6)
         elif self.request['app_id'] == 'zcode':
             nodes = self.nodes()
-            search_open = any(role == 'AXComboBox' and ax.placeholder(node) == '搜索操作、任务或文件'
-                              for node, role in nodes)
+            search_open = bool(self.search_boxes(nodes))
             if search_open or not self.current_identity(nodes):
                 nodes = self.route_zcode_search(nodes)
             if not self.current_identity(nodes):
-                raise Blocked('target_unverified')
-        elif self.request['app_id'] == 'qoder-cn':
+                raise Blocked('header_unverified')
+        elif self.request['app_id'] in QODER_IDS:
             nodes = self.nodes()
             if not self.current_identity(nodes):
                 sid, title, _, _ = self.qoder_identity
+                nodes = self.expand_qoder_workspace(nodes)
                 matches = [node for node, role in nodes if role == 'AXLink'
-                           and str(ax.get_attr(node, 'AXURL', '')) == qoder_chat_url(sid)
+                           and str(ax.get_attr(node, 'AXURL', '')) == qoder_chat_url(sid, self.request['app_id'])
                            and self.label(node) == '任务“' + title + '”，Agent：nav.chat'
                            and 'AXPress' in ax.action_names(node)]
                 if len(matches) != 1:
@@ -610,84 +688,217 @@ class MacBackend:
         else:
             nodes = self.nodes()
         if not self.current_identity(nodes):
-            matches = []
-            for node, role in nodes:
-                if role != 'AXButton' or not self.sidebar_match(self.label(node)):
-                    continue
-                rect = ax.rect_of(node)
-                if rect and rect[0] < self.window.rect[0] + 300 and 'AXPress' in ax.action_names(node):
-                    matches.append(node)
+            if self.request['app_id'] == 'autoclaw':
+                nodes = self.expand_autoclaw_sidebar(nodes)
+            elif self.request['app_id'] == 'grok':
+                nodes = self.expand_grok_project(nodes)
+            matches = self.sidebar_candidates(nodes)
             if len(matches) != 1:
-                raise Blocked('target_unverified')
+                raise Blocked('sidebar_target_ambiguous' if matches else 'sidebar_target_missing')
             self.guard()
             if not ax.press(matches[0]):
                 raise Blocked('target_unverified')
-            nodes = self.navigation_nodes(0.45)
+            nodes = self.navigation_nodes(1.5)
         if not self.current_identity(nodes):
-            raise Blocked('target_unverified')
+            raise Blocked('header_unverified')
+
+    def sidebar_candidates(self, nodes):
+        ax = self.ax
+        return [node for node, role in nodes if role == 'AXButton' and
+                self.sidebar_match(self.label(node)) and ax.rect_of(node) and
+                ax.rect_of(node)[0] < self.window.rect[0] + 300 and
+                ax.rect_of(node)[3] - ax.rect_of(node)[1] >= 10 and
+                'AXPress' in ax.action_names(node)]
+
+    def expand_autoclaw_sidebar(self, nodes):
+        # Only reversible, uniquely named navigation controls. Multiple agents'
+        # "show more" buttons are ambiguous and remain for the user to expand.
+        for names in ({'展开侧边栏', 'Expand sidebar'}, {'展示更多', 'Show more'}):
+            if self.sidebar_candidates(nodes):
+                break
+            controls = [node for node, role in nodes if role == 'AXButton'
+                        and self.label(node) in names and self.ax.enabled(node)
+                        and self.ax.rect_of(node) and
+                        self.ax.rect_of(node)[0] < self.window.rect[0] + 300
+                        and 'AXPress' in self.ax.action_names(node)]
+            if len(controls) != 1:
+                continue
+            self.guard()
+            if not self.ax.press(controls[0]):
+                raise Blocked('sidebar_target_missing')
+            nodes = self.navigation_nodes(1.5)
+        return nodes
+
+    def expand_grok_project(self, nodes):
+        # The exact indexed project is the only collapsed group we may open.
+        # Never toggle an already-expanded group or guess between duplicate names.
+        if self.sidebar_candidates(nodes):
+            return nodes
+        controls = [node for node, role in nodes if role == 'AXButton'
+                    and self.label(node) == self.grok_identity[1]
+                    and self.ax.get_attr(node, 'AXExpanded') is False
+                    and self.ax.rect_of(node) and self.ax.rect_of(node)[0] < self.window.rect[0] + 300
+                    and 'AXPress' in self.ax.action_names(node)]
+        if len(controls) == 1:
+            self.guard()
+            if not self.ax.press(controls[0]):
+                raise Blocked('sidebar_target_missing')
+            nodes = self.navigation_nodes(1.5)
+        return nodes
+
+    def expand_qoder_workspace(self, nodes):
+        sid, _, name, _ = self.qoder_identity
+        target_url = qoder_chat_url(sid, self.request['app_id'])
+        for label in ('展开工作目录 ' + name, '展示 ' + name + ' 的更多任务'):
+            if any(role == 'AXLink' and str(self.ax.get_attr(node, 'AXURL', '')) == target_url
+                   for node, role in nodes):
+                break
+            controls = [node for node, role in nodes if role == 'AXButton'
+                        and self.label(node) == label and self.ax.enabled(node)
+                        and 'AXPress' in self.ax.action_names(node)]
+            if len(controls) != 1:
+                continue
+            self.guard()
+            if not self.ax.press(controls[0]):
+                raise Blocked('sidebar_target_missing')
+            nodes = self.navigation_nodes(1.5)
+        return nodes
 
     def route_zcode_search(self, nodes):
         ax = self.ax
         left, top, _, _ = self.window.rect
-        boxes = [node for node, role in nodes if role == 'AXComboBox' and
-                 ax.placeholder(node) == '搜索操作、任务或文件']
+        boxes = self.search_boxes(nodes)
         if not boxes:
             search = [node for node, role in nodes if role == 'AXButton' and
-                      self.label(node).startswith('搜索') and ax.rect_of(node) and
+                      self.label(node).split(' ')[0] in ('搜索', 'Search') and ax.rect_of(node) and
                       ax.rect_of(node)[0] < left + 300 and ax.rect_of(node)[1] < top + 150]
             if len(search) != 1:
-                raise Blocked('target_unverified')
+                raise Blocked('search_unavailable')
             self.guard()
             if not ax.press(search[0]):
-                raise Blocked('target_unverified')
+                raise Blocked('search_unavailable')
         deadline = time.monotonic() + 2
         while True:
             self.guard()
             nodes = self.nodes()
-            boxes = [node for node, role in nodes if role == 'AXComboBox' and
-                     ax.placeholder(node) == '搜索操作、任务或文件']
+            boxes = self.search_boxes(nodes)
             if len(boxes) == 1:
                 break
             if time.monotonic() >= deadline:
-                raise Blocked('target_unverified')
+                raise Blocked('search_unavailable')
             time.sleep(0.05)
-        if ax.set_attr(boxes[0], 'AXValue', self.title) != 0:
-            raise Blocked('target_unverified')
-        deadline = time.monotonic() + 2
+        self.write_search_query(boxes[0])
+        deadline = time.monotonic() + 4
         while True:
             self.guard()
             nodes = self.nodes()
-            boxes = [node for node, role in nodes if role == 'AXComboBox' and
-                     ax.placeholder(node) == '搜索操作、任务或文件']
+            boxes = self.search_boxes(nodes)
             if len(boxes) != 1 or ax.get_attr(boxes[0], 'AXValue') != self.title:
-                raise Blocked('target_unverified')
-            matches = []
-            for node, role in nodes:
-                if role != 'AXMenuItem':
-                    continue
-                if self.zcode_search_match(node):
-                    matches.append(node)
-            if len(matches) == 1:
+                raise Blocked('search_input_changed')
+            result = self.zcode_search_result(nodes)
+            if result is not None:
                 break
-            if len(matches) > 1 or time.monotonic() >= deadline:
-                raise Blocked('target_unverified')
+            if time.monotonic() >= deadline:
+                raise Blocked('search_result_missing')
             time.sleep(0.05)
         self.guard()
-        if not ax.press(matches[0]):
-            raise Blocked('target_unverified')
+        if not ax.press(result):
+            raise Blocked('search_unavailable')
         return self.navigation_nodes(1.5)
+
+    def zcode_search_result(self, nodes):
+        ax = self.ax
+        left, top, right, bottom = self.window.rect
+        matches = []
+        for node, role in nodes:
+            if role != 'AXMenuItem' or not ax.enabled(node) or 'AXPress' not in ax.action_names(node):
+                continue
+            rect = ax.rect_of(node)
+            if (not rect or rect[2] - rect[0] < 20 or rect[3] - rect[1] < 10 or
+                    not (left <= rect[0] < rect[2] <= right and top <= rect[1] < rect[3] <= bottom)):
+                continue
+            if self.zcode_search_match(node):
+                matches.append((rect[1], rect[0], node))
+        if not matches:
+            return None
+        # Content search can list multiple message hits from the same task.
+        # Only a globally unique indexed title proves those hits share a task;
+        # genuine duplicate titles retain the ambiguity check.
+        if len(matches) > 1 and not self.zcode_identity[3]:
+            raise Blocked('search_result_ambiguous')
+        return min(matches, key=lambda item: item[:2])[2]
+
+    def write_search_query(self, box):
+        # AXValue can change Electron's visible field without firing the search
+        # handler. Paste into the unique declared search field, never a composer.
+        ax = self.ax
+        self.guard()
+        current = self.search_boxes(self.nodes())
+        if len(current) != 1 or current[0] != box:
+            raise Blocked('search_input_changed')
+        rect = ax.rect_of(box)
+        if not rect or rect[2] - rect[0] < 20 or rect[3] - rect[1] < 10:
+            raise Blocked('search_unavailable')
+        self.guard()
+        self.inject.click_at((rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2)
+        self.guard()
+        if not ax.get_attr(box, 'AXFocused', False):
+            raise Blocked('search_unavailable')
+        self.inject.hotkey(0)
+        pb = self.AppKit.NSPasteboard.generalPasteboard()
+        saved = []
+        for item in pb.pasteboardItems() or []:
+            clone = self.AppKit.NSPasteboardItem.alloc().init()
+            for kind in item.types():
+                data = item.dataForType_(kind)
+                if data is not None:
+                    clone.setData_forType_(data, kind)
+            saved.append(clone)
+        pb.clearContents()
+        pb.setString_forType_(self.title, self.AppKit.NSPasteboardTypeString)
+        count = pb.changeCount()
+        try:
+            self.guard()
+            if not ax.get_attr(box, 'AXFocused', False):
+                raise Blocked('search_input_changed')
+            self.inject.hotkey(9)
+            deadline = time.monotonic() + 2
+            while True:
+                self.guard()
+                boxes = self.search_boxes(self.nodes())
+                if len(boxes) != 1 or not ax.get_attr(boxes[0], 'AXFocused', False):
+                    raise Blocked('search_input_changed')
+                if ax.get_attr(boxes[0], 'AXValue') == self.title:
+                    return
+                if time.monotonic() >= deadline:
+                    raise Blocked('search_input_changed')
+                time.sleep(0.05)
+        finally:
+            if pb.changeCount() == count:
+                pb.clearContents()
+                if saved:
+                    pb.writeObjects_(saved)
 
     def zcode_search_match(self, node):
         ax = self.ax
-        descendants = ax.children(node)
-        descendants += [child for parent in descendants for child in ax.children(parent)]
-        labels = [self.label(child) for child in descendants if ax.role(child) == 'AXStaticText']
+        stack = [(child, 1) for child in reversed(ax.children(node))]
+        labels, visited = [], 0
+        while stack:
+            child, depth = stack.pop()
+            visited += 1
+            if visited > 256 or depth > 8:
+                return False
+            if ax.role(child) == 'AXStaticText':
+                labels.append(self.label(child))
+            stack.extend((item, depth + 1) for item in reversed(ax.children(child)))
         # Current ZCode exposes the title as child text but folds the project
         # into the menu item's composite label. A globally unique indexed
         # title can select a unique result; route() then checks both header
         # and project button before the composer is touched.
-        return self.title in labels and (self.zcode_identity[1] in labels or
-                                         self.zcode_identity[3])
+        # The first text is the result's task title. Later text can be a message
+        # snippet mentioning our title inside an entirely different task.
+        return bool(labels) and labels[0] == self.title and (self.zcode_identity[1] in labels or
+                                                            self.zcode_identity[3])
 
     def navigation_nodes(self, timeout):
         # Fast apps need no fixed sleep. Slow navigation retains the existing
@@ -726,7 +937,8 @@ class MacBackend:
             if role not in ('AXTextArea', 'AXTextField', 'AXButton', 'AXGroup'):
                 continue
             rect = ax.rect_of(node)
-            if not rect or rect[0] < left + 170 or rect[1] < top + (bottom - top) * 0.50:
+            margin = 50 if self.request['app_id'] in ('autoclaw', 'zcode', 'grok', *QODER_IDS) else 170
+            if not rect or rect[0] < left + margin or rect[1] < top + (bottom - top) * 0.50:
                 continue
             name = self.label(node).lower()
             if role == 'AXButton':
@@ -734,6 +946,13 @@ class MacBackend:
                 if name in SEND_NAMES:
                     buttons.append(node)
             elif role in ('AXTextArea', 'AXTextField') or (role == 'AXGroup' and ax.role_description(node) in ('文本输入区', '文本编辑区', 'text entry area')):
+                if self.request['app_id'] == 'autoclaw' and not self.autoclaw_composer(node):
+                    continue
+                if self.request['app_id'] == 'zcode' and not ZCODE_COMPOSER_HINTS.intersection(self.composer_hints(node)):
+                    continue
+                hints = CHAT_COMPOSER_HINTS.get(self.request['app_id'])
+                if hints and not hints.intersection(self.composer_hints(node)):
+                    continue
                 if ax.enabled(node) and ('search' not in ax.placeholder(node).lower()) and '搜索' not in ax.placeholder(node):
                     boxes.append(node)
         value = None
@@ -751,6 +970,17 @@ class MacBackend:
         return dict(identity=self.current_identity(nodes), input_count=len(boxes), value=value,
                     busy=busy, send_exists=self.send_button is not None,
                     send_enabled=self.send_button is not None and ax.enabled(self.send_button))
+
+    def autoclaw_composer(self, node):
+        # Goal review forms can expose many editable textareas. Only the actual
+        # chat composer's declared hint may select the field to overwrite.
+        hints = self.composer_hints(node)
+        return any(hint in AUTOCLAW_COMPOSER_HINTS or
+                   re.fullmatch(r'发送给 [^\n]{1,80}', hint) for hint in hints)
+
+    def composer_hints(self, node):
+        return [self.ax.placeholder(node)] + [str(self.ax.get_attr(node, name, '') or '').strip()
+                for name in ('AXTitle', 'AXDescription', 'AXHelp')]
 
     def write(self, message):
         original = self.snapshot()
@@ -892,18 +1122,21 @@ def main():
             from aiwatch.mac import ax
             print(json.dumps({'code': 'ready' if ax.trusted() else 'permission_required', 'attempted': False}))
             return
-        if request.get('app_id') not in BUNDLES or request.get('mode') not in ('send', 'check'):
+        if request.get('app_id') not in BUNDLES or request.get('mode') not in ('send', 'check', 'inspect'):
             raise Blocked('unsupported')
         if not all(isinstance(request.get(k), str) and request[k] for k in ('key', 'id', 'title')):
             raise Blocked('invalid_request')
         backend = MacBackend(request)
-        result = perform(request, backend, Journal())
+        result = backend.inspect() if request.get('mode') == 'inspect' else perform(request, backend, Journal())
     except Blocked as e:
         result = {'code': str(e), 'attempted': bool(backend and backend.did_write)}
         if e.retry_after is not None:
             result['retry_after'] = e.retry_after
     except Exception:
         result = {'code': 'bridge_error', 'attempted': bool(backend and backend.did_write)}
+    if isinstance(locals().get('request'), dict) and request.get('mode') == 'inspect':
+        print(json.dumps(result))
+        return
     # Bounded local receipt contains no titles, drafts, paths or conversation text.
     try:
         directory = Path.home() / 'Library/Application Support/AgentRadar'

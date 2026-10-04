@@ -15,6 +15,8 @@ struct PromptRules: Codable, Equatable {
     var completionMode: String = "collaboration"
     var ragePrompt: String = Self.defaultRagePrompt
     var appRagePrompts: [String: String] = [:]
+    var appResumeTexts: [String: String] = [:]
+    var resumePrompt: String = ""
     var rageAlternateEvery = 3
     var rageAlternatePrompt: String = Self.defaultRageAlternatePrompt
 
@@ -29,7 +31,7 @@ struct PromptRules: Codable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case interruptText, rateLimitWakeEnabled, rateLimitWaitMinutes, rateLimitText, followUps
-        case completionMode, ragePrompt, appRagePrompts, rageAlternateEvery, rageAlternatePrompt
+        case completionMode, ragePrompt, appRagePrompts, appResumeTexts, resumePrompt, rageAlternateEvery, rageAlternatePrompt
     }
 
     init() {}
@@ -45,6 +47,8 @@ struct PromptRules: Codable, Equatable {
         completionMode = try values.decodeIfPresent(String.self, forKey: .completionMode) ?? completionMode
         ragePrompt = try values.decodeIfPresent(String.self, forKey: .ragePrompt) ?? ragePrompt
         appRagePrompts = try values.decodeIfPresent([String: String].self, forKey: .appRagePrompts) ?? appRagePrompts
+        appResumeTexts = try values.decodeIfPresent([String: String].self, forKey: .appResumeTexts) ?? appResumeTexts
+        resumePrompt = try values.decodeIfPresent(String.self, forKey: .resumePrompt) ?? resumePrompt
         rageAlternateEvery = try values.decodeIfPresent(Int.self, forKey: .rageAlternateEvery) ?? rageAlternateEvery
         rageAlternatePrompt = try values.decodeIfPresent(String.self, forKey: .rageAlternatePrompt) ?? rageAlternatePrompt
         self = normalized()
@@ -66,6 +70,8 @@ struct PromptRules: Codable, Equatable {
         result.rateLimitWaitMinutes = min(60, max(1, rateLimitWaitMinutes))
         result.followUps = followUps.mapValues(Self.sanitize)
         result.appRagePrompts = appRagePrompts.mapValues(Self.sanitize).filter { !$0.value.isEmpty }
+        result.appResumeTexts = appResumeTexts.mapValues(Self.sanitize).filter { !$0.value.isEmpty }
+        result.resumePrompt = Self.sanitize(resumePrompt)
         if result.appRagePrompts["grok"] == Self.previousDefaultGrokRagePrompt {
             result.appRagePrompts["grok"] = Self.defaultGrokRagePrompt
         }
@@ -121,6 +127,12 @@ struct PromptRules: Codable, Equatable {
     func ragePrompt(forApp appID: String) -> String {
         appRagePrompts[appID] ?? (appID == "grok" ? Self.defaultGrokRagePrompt : ragePrompt)
     }
+
+    /// 按软件的中断恢复文字：专属 > 全局自定义 > 固定默认（策略层常量）。
+    /// 字典值与全局值允许留空表示「用下一级」；解析在 ContinuationPolicy 完成。
+    static let appDisplayNames = ["workbuddy": "WorkBuddy", "workbuddy-ai": "WorkBuddy AI",
+                                  "zcode": "ZCode", "autoclaw": "AutoClaw", "grok": "Grok", "codex": "Codex",
+                                  "qoder": "Qoder", "qoder-cn": "Qoder CN"]
 }
 
 #if !PROMPT_RULES_MODEL_ONLY
@@ -418,8 +430,7 @@ private struct PromptEditorView: View {
             Divider()
             promptField("普通续接提示词", text: $editor.draft.ragePrompt,
                         detail: "狂暴模式下，未设置专属文字的软件使用这段提示词。", defaultText: PromptRules.defaultRagePrompt)
-            promptField("Grok 普通续接提示词", text: $editor.draft.grokRagePrompt,
-                        detail: "仅用于 Grok 的普通续接。", defaultText: PromptRules.defaultGrokRagePrompt)
+            perAppPromptSection
             Divider()
             Stepper("每条会话每 \(editor.draft.rageAlternateEvery) 次续接，发送 1 次特别提示词",
                     value: $editor.draft.rageAlternateEvery, in: 2...100)
@@ -519,6 +530,48 @@ private struct PromptEditorView: View {
             }
             Text(detail).font(.system(size: 10)).foregroundStyle(.secondary)
             EditorBox(text: text, label: title, height: height)
+        }
+    }
+
+    @State private var showAppPromptEditor = false
+    @State private var selectedAppForPrompts = ""
+
+    /// 按软件专属提示词：收起时只占一行（条目计数 + 添加入口），
+    /// 展开后每个软件两个小字段（续接 / 中断恢复），专属优先于通用。
+    private var perAppPromptSection: some View {
+        let apps = Set(editor.draft.appRagePrompts.keys).union(editor.draft.appResumeTexts.keys)
+            .union(["grok", "workbuddy-ai", "zcode", "autoclaw", "codex", "qoder", "qoder-cn"]).sorted()
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text("软件专属提示词").font(.system(size: 11, weight: .semibold))
+                Text("专属优先于通用续接").font(.system(size: 10)).foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+                Button(showAppPromptEditor ? "收起" : "自定义…") {
+                    if selectedAppForPrompts.isEmpty { selectedAppForPrompts = apps.first ?? "grok" }
+                    showAppPromptEditor.toggle()
+                }
+                .font(.system(size: 10)).buttonStyle(RadarButtonStyle())
+                .accessibilityLabel("自定义按软件专属提示词")
+            }
+            if showAppPromptEditor {
+                Picker("软件", selection: $selectedAppForPrompts) {
+                    ForEach(apps, id: \.self) { appID in
+                        Text(PromptRules.appDisplayNames[appID] ?? appID).tag(appID)
+                    }
+                }.pickerStyle(.menu).font(.system(size: 10))
+                let overrides = editor.draft.appRagePrompts[selectedAppForPrompts]
+                let resumeOverrides = editor.draft.appResumeTexts[selectedAppForPrompts]
+                promptField("专属续接提示词",
+                            text: Binding(get: { overrides ?? "" },
+                                          set: { editor.draft.appRagePrompts[selectedAppForPrompts] = $0 }),
+                            detail: "仅用于该软件的普通续接；留空使用通用提示词。",
+                            defaultText: "", height: 70)
+                promptField("专属中断恢复提示词",
+                            text: Binding(get: { resumeOverrides ?? "" },
+                                          set: { editor.draft.appResumeTexts[selectedAppForPrompts] = $0 }),
+                            detail: "该软件意外中断重启时使用；留空使用通用恢复提示词。",
+                            defaultText: "", height: 70)
+            }
         }
     }
 

@@ -81,7 +81,8 @@ class AutoClawCollector:
         if not isinstance(raw, dict):
             raise ValueError('index type')
         values = [dict({k: value[k] for k in FIELDS if k in value}, navigation_key=key)
-                  for key, value in raw.items() if isinstance(value, dict) and value.get('sessionId')]
+                  for key, value in raw.items() if isinstance(value, dict) and value.get('sessionId')
+                  and not re.match(r'^agent:[A-Za-z0-9_-]+:(?:subagent|cron|evolution-check):', key)]
         self.cache[key] = (signature, values)
         return values
 

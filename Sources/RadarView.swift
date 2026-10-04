@@ -47,10 +47,11 @@ struct RadarView: View {
             .strokeBorder(.white.opacity(0.08), lineWidth: 0.6).allowsHitTesting(false))
         // A single persistent control, outside either presentation, preserves
         // its hover state and screen anchor through expansion/collapse.
-        .overlay(alignment: store.expanded ? .topTrailing : .topLeading) {
-            HoverControl(symbol: store.expanded ? "chevron.right" : "chevron.left",
+        // 收起胶囊的箭头必须避开拖拽把手：默认（把手在左）箭头贴右缘，
+        // handleOnLeft 时镜像到左缘，否则点击多数变成拖动。
+        .overlay(alignment: store.expanded ? .topTrailing : (store.handleOnLeft ? .topLeading : .topTrailing)) {
+            HoverControl(symbol: store.expanded ? "chevron.right" : (store.handleOnLeft ? "chevron.left" : "chevron.right"),
                          label: store.expanded ? "折叠浮窗" : "展开全部应用") { store.toggleExpanded() }
-                .padding(.leading, store.expanded ? 0 : 7)
                 .padding(.trailing, store.expanded ? 7 : 0)
                 .padding(.top, 2)
         }
@@ -59,21 +60,22 @@ struct RadarView: View {
     }
 
     private var rail: some View {
-        // 箭头在左、数字在右，整组在胶囊内居中对称：
-        // 占位只取箭头字形的视觉宽度（约 14 点），数字不至于被推离中轴。
-        HStack(spacing: 5) {
-            Color.clear.frame(width: 14).allowsHitTesting(false)
-            Text(store.compactCountLabel)
-                .font(.system(size: 13, weight: .semibold, design: .rounded))
-                .monospacedDigit()
-                .lineLimit(1).minimumScaleFactor(0.7)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .contentShape(Rectangle())
-        .contextMenu { controls }
-        .help("拖动浮条")
-        .shadow(color: .black.opacity(0.65), radius: 1.5, y: 1)
+        // 数字和控制各占胶囊的一半；镜像时同时交换两者的位置。
+        // 不再按箭头字形宽度留白，避免按钮换边后覆盖数字。
+        Text(store.compactCountLabel)
+            .font(.system(size: 13, weight: .semibold, design: .rounded))
+            .monospacedDigit()
+            .lineLimit(1).minimumScaleFactor(0.7)
+            .frame(width: Self.compactControlWidth, height: 32)
+            .frame(maxWidth: .infinity, maxHeight: .infinity,
+                   alignment: store.handleOnLeft ? .trailing : .leading)
+            .contentShape(Rectangle())
+            .contextMenu { controls }
+            .help("拖动浮条")
+            .shadow(color: .black.opacity(0.65), radius: 1.5, y: 1)
     }
+
+    static let compactControlWidth: CGFloat = 30
 
     private var conversationList: some View {
         VStack(spacing: 0) {
@@ -501,7 +503,7 @@ private struct HoverControl: View {
         Button(action: action) {
             Image(systemName: symbol).font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.white.opacity(hovered ? 1 : 0.72))
-                .frame(width: 30, height: 28)
+                .frame(width: RadarView.compactControlWidth, height: 28)
                 .contentShape(Rectangle())
                 .scaleEffect(hovered && !reduceMotion ? 1.12 : 1)
         }.buttonStyle(RadarButtonStyle()).onHover { hovered = $0 }

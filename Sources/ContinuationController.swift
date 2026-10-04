@@ -261,7 +261,8 @@ final class ContinuationController {
                                       explanation: completed ? "手动继续当前会话" : "手动恢复当前会话",
                                       kind: completed ? "followup" : "interrupt",
                                       text: completed ? ContinuationPolicy.manualContinueText :
-                                          (row.app_id == "grok" ? ContinuationPolicy.grokResumeText : ContinuationPolicy.resumeText),
+                                          ContinuationPolicy.resumeText(forApp: row.app_id,
+                                              overrides: rules.appResumeTexts, global: rules.resumePrompt),
                                       delay: 3, patience: 15, automationMode: rules.completionMode, manual: true)
         event.bypassRestriction = !completed && rules.rateLimitWakeEnabled && ContinuationPolicy.isRateLimited(row)
         guard !paused, fresh, !excludedIDs.contains(sessionID), unique(row), ["completed", "interrupted"].contains(row.status),
@@ -301,6 +302,8 @@ final class ContinuationController {
                   (other.navigation_title ?? other.title) == (row.navigation_title ?? row.title) else { return false }
             // 同名但导航键不同（不同会话 ID）时可以区分定位，不再整体放弃恢复。
             if let key = row.navigation_key, let otherKey = other.navigation_key, key != otherKey { return false }
+            // ZCode 的跨项目同名任务由桥端 project+title 联合核验，工作区不同即可区分。
+            if row.app_id == "zcode", !row.project.isEmpty, row.project != other.project { return false }
             return true
         }
     }
@@ -431,10 +434,13 @@ final class ContinuationController {
         if now - event.detectedAt > event.patience { finish(event, "等待超过时限，本轮恢复已取消"); return }
         guard !bridge.isRunning else { return }
         if isAutomaticRageSend(event) {
-            guard let text = nextRagePrompt(for: current) else {
-                finish(event, "持续监督提示词为空，未自动发送"); return
+            if event.kind == "followup" {
+                guard let text = nextRagePrompt(for: current) else {
+                    finish(event, "持续监督提示词为空，未自动发送"); return
+                }
+                event.text = text
             }
-            event.text = text
+            // 中断恢复沿用策略层解析的按软件提示词，不套用续接轮换。
         }
         event.session = current; active = event
         executing = true
@@ -486,6 +492,18 @@ final class ContinuationController {
                     self.active = nil; self.queue.append(deferred)
                     self.notice(event, Self.explain(code), permission: code == "permission_required")
                 }
+            } else if !attempted && !event.manual && event.routeRetries < 3
+                      && ["target_unverified", "app_unavailable", "search_unavailable", "search_result_missing",
+                          "header_unverified", "sidebar_target_missing", "tree_incomplete"].contains(code) {
+                // 路由瞬态失败（标题自动改名、索引撕裂读、应用正在重启）
+                // 不再终止该轮恢复：有限次退避重试，持续失败仍然如实终局。
+                var deferred = self.active ?? event
+                deferred.routeRetries += 1
+                let fastInterrupt = event.automationMode == "rage" && event.kind == "interrupt" && !event.bypassRestriction
+                let fallback: Double = code == "app_unavailable" ? 20 : (fastInterrupt ? 1 : 5)
+                deferred.notBefore = self.clock() + max(1, retryAfter ?? fallback)
+                self.active = nil; self.queue.append(deferred)
+                self.notice(event, Self.explain(code) + "；稍后自动重试（\(deferred.routeRetries)/3）")
             } else { self.finish(event, Self.explain(code)) }
         }
     }
@@ -502,6 +520,15 @@ final class ContinuationController {
          "user_active": "你正在操作键盘鼠标，稍后再继续", "locked": "桌面已锁定或会话不可用，解锁后再继续",
          "draft_present": "本次请求未允许覆盖草稿，未发送", "input_changed": "输入回读不一致，已停止；请检查输入框",
          "composer_unreadable": "未找到唯一且可读取的对话输入框", "target_unverified": "无法核验对应会话，未输入文字",
+         "session_title_ambiguous": "同一项目有多个同名会话，请先给目标会话改成唯一标题；未输入文字",
+         "project_name_ambiguous": "多个工作区名称相同，无法核验目标项目；未输入文字",
+         "search_unavailable": "未找到可操作的原生任务搜索入口；未输入会话文字",
+         "search_input_changed": "任务搜索框失焦或回读不一致，已停止定位；未输入会话文字",
+         "search_result_missing": "原生搜索尚未找到完整标题对应的任务；未输入会话文字",
+         "search_result_ambiguous": "原生搜索有多个匹配任务，无法唯一定位；未输入会话文字",
+         "sidebar_target_missing": "侧栏中未找到目标会话，请展开对应智能体或更多会话；未输入文字",
+         "sidebar_target_ambiguous": "侧栏有多个匹配会话，无法唯一定位；未输入文字",
+         "header_unverified": "已导航，但顶部会话标题或项目与目标不一致；未输入文字",
          "window_ambiguous": "存在多个候选窗口，无法核验具体会话", "app_unavailable": "对应应用未运行或存在多个实例",
          "already_running": "会话仍在运行，不需要继续", "state_changed": "任务状态或轮次已变化，未继续发送",
          "focus_changed": "前台窗口发生变化，稍后重新定位", "tree_incomplete": "对话控件读取超时或不完整，本轮不发送",

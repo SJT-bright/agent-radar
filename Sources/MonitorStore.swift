@@ -766,7 +766,13 @@ final class MonitorStore: ObservableObject {
     }
 
     func toggleSupervision(for session: SessionRecord) {
-        setSupervision(!isSupervised(session), for: session)
+        if !isSupervised(session) { setSupervision(true, for: session); return }
+        // 按软件监督覆盖时单条「取消」是空操作：给出引导而不是静默失败。
+        if !supervisedSessionIDs.contains(session.id) {
+            actionMessage = "该应用由按软件监督覆盖；请在设置中取消该应用的监督"
+            return
+        }
+        setSupervision(false, for: session)
     }
 
     func setSupervision(_ enabled: Bool, for session: SessionRecord) {
@@ -863,6 +869,8 @@ final class MonitorStore: ObservableObject {
     func cancelContinuation() { continuation.cancelCurrent() }
     func showContinuationDiagnostics() {
         verifyAccessibility()
+        showDiagnostic(title: "AI 监督状态",
+                       text: continuation.diagnostic + "\n辅助功能：" + accessibilityCheckDetail)
     }
     func previewContinuationNotice() {
         onRecoveryNotice?(ContinuationNotice(title: "AI 监督 · 提醒预览", conversation: "中断后返回原会话",

@@ -178,5 +178,16 @@ class AutoClawTests(unittest.TestCase):
         self.assertEqual(row['navigation_title'], '界面短标题')
         self.assertEqual(row['navigation_key'], 'agent:main:demo')
 
+    def test_internal_workers_do_not_displace_desktop_sessions(self):
+        entry = self.fixture()
+        data = {'agent:main:demo': entry}
+        for kind in ('subagent', 'cron', 'evolution-check'):
+            for i in range(45):
+                data['agent:main:' + kind + ':' + str(i)] = dict(entry, updatedAt=(NOW + i) * 1000)
+        (self.directory / 'sessions.json').write_text(json.dumps(data))
+        rows = self.reader.collect()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['navigation_key'], 'agent:main:demo')
+
 if __name__ == '__main__':
     unittest.main()

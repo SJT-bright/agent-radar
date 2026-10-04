@@ -15,6 +15,7 @@ struct ContinuationEvent {
     var manual = false
     var notBefore: Double = 0
     var recoveryDelayReported = false
+    var routeRetries = 0
 }
 
 /// Only explicit lifecycle evidence arms automatic work. Historical rows are inert.
@@ -22,6 +23,17 @@ struct ContinuationPolicy {
     static let resumeText = "刚才中断了，请继续"
     static let grokResumeText = "刚才中断了，请继续未完成的工作；恢复后从真实使用者的角度检查体验，提出可验证的建议并实施优化，完成后说明验证结果。"
     static let manualContinueText = "请继续"
+
+    /// 中断恢复文字按软件解析：专属 > 全局自定义 > 固定默认（grok 保留专属默认）。
+    static func resumeText(forApp appID: String, overrides: [String: String], global: String) -> String {
+        let trim: (String?) -> String? = { text in
+            let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        if let custom = trim(overrides[appID]) { return custom }
+        if let globalText = trim(global) { return globalText }
+        return appID == "grok" ? grokResumeText : resumeText
+    }
     private var running: [String: (start: Double, seen: Double)] = [:]
     // A watermark per session survives observation resets; old rounds never re-arm.
     private var announced: [String: [String: Double]] = [:]
@@ -49,7 +61,7 @@ struct ContinuationPolicy {
         if row.app_id == "autoclaw" && (row.navigation_key == nil || row.navigation_title == nil) {
             return "未找到唯一的 AutoClaw 会话映射，暂不能自动定位"
         }
-        if !["codex", "workbuddy", "workbuddy-ai", "zcode", "autoclaw", "grok", "qoder-cn"].contains(row.app_id) {
+        if !["codex", "workbuddy", "workbuddy-ai", "zcode", "autoclaw", "grok", "qoder-cn", "qoder"].contains(row.app_id) {
             return "此应用尚未适配可靠的输入与发送定位"
         }
         return nil
@@ -106,6 +118,7 @@ struct ContinuationPolicy {
                           rateLimitText: String = "刚才被限流了，现在请继续",
                           followUps: [String: String] = [:],
                           completionMode: String = "collaboration", ragePrompt: String = "",
+                          appResumeTexts: [String: String] = [:], rageResumeText: String = "",
                           supervisedIDs: Set<String> = []) -> [ContinuationEvent] {
         var events: [ContinuationEvent] = []
         running = running.filter { now - $0.value.seen < 120 }
@@ -159,7 +172,7 @@ struct ContinuationPolicy {
             events.append(ContinuationEvent(session: row, key: Self.key(row), detectedAt: now,
                 canContinue: restriction == nil && !cooldown && (!rage || supervisedIDs.contains(row.id)),
                 explanation: (rage && !supervisedIDs.contains(row.id) ? "会话未标记监督，本轮只提醒" : nil) ?? restriction ?? (cooldown ? "本会话已触发恢复冷却，先检查连续失败原因" : "检测到本轮意外中断，即将返回原会话继续"),
-                text: rage ? (row.app_id == "grok" ? Self.grokResumeText : Self.resumeText)
+                text: rage ? Self.resumeText(forApp: row.app_id, overrides: appResumeTexts, global: rageResumeText)
                     : (rate ? rateLimitText : interruptText), delay: delay,
                 patience: max(600, delay + 600), bypassRestriction: rate,
                 automationMode: rage ? "rage" : "collaboration"))

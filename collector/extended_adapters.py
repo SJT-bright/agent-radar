@@ -186,6 +186,9 @@ class ExtendedCollector:
                                  and msg.get('turn_id') == live.get('turn_id'))
             if live_start and live_start >= max(started, ended) and not terminal_same_turn:
                 started, ended, updated = live_start, 0, max(updated, activity)
+                # A canceled previous projection must not mark a newer live
+                # turn as user-stopped. Its later terminal record decides anew.
+                row_user_stopped = False
                 if pid and -30 <= now - activity <= FRESH_SECONDS:
                     status, reason = 'running', 'Qoder 活动轮次缓冲区有近期执行记录，且对应应用进程存活'
                 else:
@@ -232,6 +235,7 @@ class ExtendedCollector:
             state['activity'] = max(state['activity'], stamp)
             if kind == 'turn_started':
                 state.update(status='running', started=stamp, ended=0, reason='Grok turn_started')
+                state.pop('user_stopped', None)
             elif kind == 'turn_ended':
                 outcome = event.get('outcome')
                 status = ('completed' if outcome == 'completed' else 'interrupted'
@@ -268,7 +272,10 @@ class ExtendedCollector:
         if not isinstance(sessions, list) or not isinstance(projects, list):
             raise ValueError('metadata shape')
         project_map = {p['id']: p.get('path', '') for p in projects if isinstance(p, dict) and 'id' in p}
-        candidates = [s for s in sessions if isinstance(s, dict) and not s.get('archived')]
+        candidates = [s for s in sessions if isinstance(s, dict) and not s.get('archived')
+                      and _uuid(s.get('id')) and _uuid(s.get('agentSessionId'))
+                      and isinstance(project_map.get(s.get('projectId')), str)
+                      and project_map[s['projectId']].startswith('/')]
         candidates.sort(key=lambda s: _timestamp(s.get('updatedAt')), reverse=True)
         result = []
         session_root = self.home / '.grok/sessions'

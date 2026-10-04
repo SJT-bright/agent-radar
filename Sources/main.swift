@@ -9,11 +9,21 @@ final class RadarPanel: NSPanel {
     private var dragOrigin: NSPoint?
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+    /// mouseUp 可能因休眠/快速用户切换而丢失：悬停 tick 校验真实按键，
+    /// 按键已释放即复位拖拽状态，避免悬停状态机永久卡死。
+    func clearDragIfReleased() {
+        if dragPointer != nil, NSEvent.pressedMouseButtons & 1 == 0 {
+            dragPointer = nil
+            dragOrigin = nil
+            dragActive = false
+        }
+    }
+
     override func sendEvent(_ event: NSEvent) {
         if event.type == .leftMouseDown {
             let point = event.locationInWindow
             let withinHandle = compactPresentation ?
-                (leftControl ? point.x >= 37 : point.x < frame.width - 37) :
+                (leftControl ? point.x >= RadarView.compactControlWidth : point.x < frame.width - RadarView.compactControlWidth) :
                 (point.y >= frame.height - 40 && point.x >= (leftControl ? 50 : 0) && point.x < frame.width - (leftControl ? 40 : 76))
             if withinHandle {
                 dragPointer = convertPoint(toScreen: event.locationInWindow)
@@ -100,6 +110,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                         self?.store.cancelContinuation(sessionID: sessionID, key: key)
                                     })
         }
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            self?.reclampPanelForScreenChange()
+        }
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.image = NSImage(systemSymbolName: "sparkle.viewfinder", accessibilityDescription: "任务雷达")
         statusItem.button?.toolTip = "任务雷达 · 显示悬浮窗"
@@ -131,8 +145,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if !store.expanded { store.setExpanded(true) }
         panel.orderFrontRegardless()
     }
+    /// 显示器拔插/改排列后面板可能滞留屏幕外：钳回可见区并取消进行中动画。
+    private func reclampPanelForScreenChange() {
+        panelMotion = nil
+        motionTimer?.invalidate()
+        motionTimer = nil
+        panel.setFrameOrigin(clamped(panel.frame.origin, size: panel.frame.size))
+    }
+
     private func updatePanelHover() {
         guard panel.isVisible else { return }
+        panel.clearDragIfReleased()
         let pointerInside = panel.frame.contains(NSEvent.mouseLocation) || panel.dragActive || store.settingsMenuTracking
         if let shouldExpand = hoverState.update(expanded: store.expanded,
                                                 pointerInside: pointerInside,

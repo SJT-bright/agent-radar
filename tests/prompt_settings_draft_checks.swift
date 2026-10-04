@@ -17,8 +17,8 @@ import Foundation
         check(untouched.validationMessages.isEmpty, "default prompts require no cleanup warnings")
         check(untouched.applying(to: original) == original,
               "saving an unchanged draft does not create an override or cancel pending work")
-        check(untouched.grokRagePrompt == PromptRules.defaultGrokRagePrompt,
-              "an absent Grok override displays the effective default")
+        check(untouched.appRagePrompts["grok"] == nil,
+              "an absent override is not shown as a filled field")
 
         var latest = original
         latest.completionMode = "rage"
@@ -26,13 +26,26 @@ import Foundation
         latest.appRagePrompts = ["claude": "Claude 自定义", "future-app": "未知应用自定义"]
         check(!untouched.hasChanges(comparedTo: latest),
               "immediate mode and unrelated rules do not mark a draft dirty")
-        latest.appRagePrompts["grok"] = PromptRules.defaultGrokRagePrompt
+        latest.appRagePrompts["grok"] = ""
         check(!untouched.hasChanges(comparedTo: latest),
-              "implicit and explicit Grok defaults are equivalent")
-        check(!PromptSettingsDraft(rules: latest).hasChanges(comparedTo: original),
-              "Grok default equivalence works in both directions")
-        latest.appRagePrompts["grok"] = "新 Grok 提示词"
-        check(untouched.hasChanges(comparedTo: latest), "a changed effective Grok prompt is detected")
+              "implicit and explicit empty Grok overrides are equivalent")
+        // 反向：draft 持有 grok=""（显式清空）对 original 判定不脏，
+        // normalized 后 grok 键被过滤，保存不会产生任何覆盖。
+        // （用干净上下文：此时 latest 已带 claude/future-app 覆盖，会干扰。）
+        var emptyOverrideRules = original
+        emptyOverrideRules.appRagePrompts["grok"] = ""
+        check(!PromptSettingsDraft(rules: emptyOverrideRules).hasChanges(comparedTo: original),
+              "empty override equivalence works in both directions")
+        latest.appRagePrompts["grok"] = "外部新出现的提示词"
+        // 别的窗口/会话新出现的 override 不属于本草稿：保存不会抹掉它们，
+        // 也就不该把未编辑的草稿标脏；用户在草稿里编辑过的键才参与判定。
+        check(!untouched.hasChanges(comparedTo: latest), "an outside override does not mark the draft dirty")
+        var editedGrok = untouched
+        editedGrok.appRagePrompts["grok"] = "我编辑的提示词"
+        check(editedGrok.hasChanges(comparedTo: latest), "editing the draft's own Grok override is dirty")
+        var withResume = untouched
+        withResume.appResumeTexts["grok"] = "新的 Grok 恢复提示词"
+        check(withResume.hasChanges(comparedTo: latest), "a per-app resume override is detected")
 
         let changes: [(String, (inout PromptSettingsDraft) -> Void)] = [
             ("interrupt text", { $0.interruptText = "新的中断提示词" }),
@@ -40,7 +53,8 @@ import Foundation
             ("wait minutes", { $0.rateLimitWaitMinutes = 12 }),
             ("rate-limit text", { $0.rateLimitText = "新的限流提示词" }),
             ("normal prompt", { $0.ragePrompt = "新的普通提示词" }),
-            ("Grok prompt", { $0.grokRagePrompt = "新的 Grok 提示词" }),
+            ("Grok prompt", { $0.appRagePrompts["grok"] = "新的 Grok 提示词" }),
+            ("Grok resume prompt", { $0.appResumeTexts["grok"] = "新的 Grok 恢复提示词" }),
             ("special interval", { $0.rageAlternateEvery = 7 }),
             ("special prompt", { $0.rageAlternatePrompt = "新的特别提示词" })
         ]
@@ -59,7 +73,7 @@ import Foundation
         edited.rateLimitWaitMinutes = 12
         edited.rateLimitText = "稍后继续"
         edited.ragePrompt = "完成当前改进"
-        edited.grokRagePrompt = "Grok 继续工作"
+        edited.appRagePrompts = ["grok": "Grok 继续工作"]
         edited.rageAlternateEvery = 5
         edited.rageAlternatePrompt = "从用户角度走查"
         let saved = edited.applying(to: latest)
@@ -69,13 +83,14 @@ import Foundation
               saved.appRagePrompts["future-app"] == "未知应用自定义",
               "save preserves known and unknown application overrides")
         check(saved.appRagePrompts["grok"] == "Grok 继续工作", "save updates only the owned Grok override")
+        check(saved.appResumeTexts.isEmpty, "resume overrides absent from the draft stay absent on save")
         check(saved.interruptText == "恢复工作" && saved.rateLimitText == "稍后继续",
               "save normalizes edited interruption prompts")
         check(saved.rateLimitWakeEnabled && saved.rateLimitWaitMinutes == 12,
               "save applies rate-limit controls")
         check(saved.ragePrompt == "完成当前改进" && saved.rageAlternateEvery == 5 &&
               saved.rageAlternatePrompt == "从用户角度走查", "save applies continuation settings")
-        check(latest.interruptText == original.interruptText && latest.appRagePrompts["grok"] == "新 Grok 提示词",
+        check(latest.interruptText == original.interruptText && latest.appRagePrompts["grok"] == "外部新出现的提示词",
               "applying a draft does not mutate the supplied rules")
         check(edited.hasChanges(comparedTo: saved), "cleaned input remains visible until the UI resets the draft")
         let refreshed = PromptSettingsDraft(rules: saved)
@@ -89,11 +104,11 @@ import Foundation
         check(emptySaved.interruptText.isEmpty && emptySaved.rateLimitText.isEmpty,
               "empty interruption prompts stay empty on save")
         empty.ragePrompt = " \n "
-        empty.grokRagePrompt = "\u{0}\u{7F}"
+        empty.appRagePrompts["grok"] = "\u{0}\u{7F}"
         empty.rageAlternatePrompt = "\t"
         check(empty.validationMessages.filter { $0.contains("默认提示词") }.count == 3,
-              "all three empty continuation prompts explain their default fallback")
-        check(hasWarning(empty, containing: "Grok 普通提示词包含控制字符"),
+              "empty continuation prompts explain their default fallback")
+        check(hasWarning(empty, containing: "Grok 专属提示词包含控制字符"),
               "a prompt emptied by control cleanup reports both causes")
         let defaultSaved = empty.applying(to: original)
         check(defaultSaved.ragePrompt == PromptRules.defaultRagePrompt &&

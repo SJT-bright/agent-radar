@@ -78,9 +78,14 @@ def src() -> Any:
 
 
 def post(event: Any) -> None:
-    """把事件投递到硬件层（HID 状态级，对前台应用有效）。"""
+    """把私有合成事件投递到会话层，对前台应用有效。
+
+    投递到 HID 入口仍会重置硬件输入计时，即使事件使用 private source。
+    搜索点击后的 user_active guard 因此会把自己的操作误认成真人输入。
+    会话入口保留编辑器的真实点击/按键行为，同时不污染 HID 让路计时。
+    """
     _load()
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+    Quartz.CGEventPost(Quartz.kCGSessionEventTap, event)
 
 
 def post_to_pid(event: Any, pid: int) -> None:
@@ -418,12 +423,12 @@ def _mouse_loc() -> Tuple[int, int]:
 
 
 def _idle_of(event_name: str) -> float:
-    """距上一次该类事件进入 HID 事件流过了多少秒。"""
+    """自检合成事件进入当前会话的时长，不能用作真人活动判断。"""
     et = getattr(Quartz, event_name, None)
     if et is None:
         return -1.0
     return float(Quartz.CGEventSourceSecondsSinceLastEventType(
-        Quartz.kCGEventSourceStateHIDSystemState, et))
+        Quartz.kCGEventSourceStateCombinedSessionState, et))
 
 
 def _app(bundle_id: str) -> Any:
@@ -467,7 +472,7 @@ def _selfcheck(live_bundle: str = "") -> int:
     idle1 = _idle_of("kCGEventKeyDown")
     streamed = 0.0 <= idle1 < 1.0
     print("  投两下 Shift（不出字、不触发快捷键）：KeyDown idle %.1fs -> %.1fs  %s"
-          % (idle0, idle1, "OK 事件进了 HID 流" if streamed else "FAIL 事件被丢掉（八成没给辅助功能权限）"))
+          % (idle0, idle1, "OK 事件进了会话流" if streamed else "FAIL 事件被丢掉（八成没给辅助功能权限）"))
     if not streamed:
         fails.append("键盘投递")
     # 内容核对：把要发的字符串真装进事件，再从事件里读回码元数（不投递，所以不打扰任何窗口）

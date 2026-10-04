@@ -1,7 +1,9 @@
 import json
+import os
 import sqlite3
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -313,6 +315,71 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(rows[0]["title"], "九号会话")
         self.assertTrue(all("暂时不可读" not in error for error in self.collector.last_errors))
 
+    def rollout(self, thread_id, cwd, thread_source="user", mtime=None):
+        day = time.strftime("%Y/%m/%d", time.localtime(mtime or time.time()))
+        directory = self.codex / "sessions" / day
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / ("rollout-%s.jsonl" % thread_id)
+        head = {"type": "session_meta", "payload": {"id": thread_id, "session_id": thread_id,
+                "cwd": cwd, "originator": "Codex Desktop", "thread_source": thread_source}}
+        path.write_text(json.dumps(head) + "\n")
+        if mtime:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def test_migration_without_threads_table_uses_rollout_fallback(self):
+        # Codex 迁移期：state 库存在但无 threads 表。rollout（thread_source=user）
+        # 必须兜底出真实行，subagent/guardian_review 排除，时间线来自 thread_turns。
+        (self.codex / "state_5.sqlite").unlink()
+        now = time.time()
+        self.rollout("01a0fdcd-6806-7470-abfb-609fa29a6af0", "/projects/迁移期项目")
+        self.rollout("01a0fdce-0000-7470-abfb-609fa29a6af0", "/x", thread_source="subagent")
+        self.rollout("01a0fdcf-1111-7470-abfb-609fa29a6af0", "/x", thread_source="guardian_review")
+        with sqlite3.connect(self.codex / "thread_history_1.sqlite") as con:
+            con.execute("INSERT INTO thread_turns VALUES(?,?,?,?,?)",
+                        ("01a0fdcd-6806-7470-abfb-609fa29a6af0", "completed", now - 300, now - 60, 1))
+        with patch("collector.codex_adapter._codex_owners", return_value={}):
+            rows = self.collector._codex({})
+        self.assertEqual([r["id"] for r in rows], ["codex:01a0fdcd-6806-7470-abfb-609fa29a6af0"])
+        self.assertEqual(rows[0]["status"], "completed")
+        self.assertEqual(rows[0]["project"], "/projects/迁移期项目")
+        self.assertEqual(rows[0]["started_at"], now - 300)
+        self.assertEqual(rows[0]["ended_at"], now - 60)
+        self.assertIn("Codex 会话", rows[0]["title"])
+        self.assertTrue(all("暂时不可读" not in e for e in self.collector.last_errors))
+
+    def test_migration_and_empty_fallback_degrades_previous_rows(self):
+        # 兜底也为空（无 rollout）时保持既有降级：上次行以 unknown 展示并报错。
+        (self.codex / "state_5.sqlite").unlink()
+        self.rollout("01a0fdcd-6806-7470-abfb-609fa29a6af0", "/projects/示例")
+        with patch("collector.codex_adapter._codex_owners", return_value={"abc": 8}):
+            first = self.collector._codex({8: {"app": "codex"}})
+        self.assertEqual(first[0]["status"], "unknown")
+        for child in (self.codex / "sessions").rglob("*.jsonl"):
+            child.unlink()
+        with patch("collector.codex_adapter._codex_owners", return_value={"abc": 8}):
+            rows = self.collector._codex({8: {"app": "codex"}})
+        self.assertEqual([r["id"] for r in rows], [first[0]["id"]])
+        self.assertTrue(any("Codex 会话数据库暂时不可读" in e for e in self.collector.last_errors))
+
+    def test_busy_state_database_retries_then_reads_without_degrade(self):
+        # 持锁写事务触发一次 SQLITE_BUSY：有限重试后必须读到真实行，
+        # 且不产生「暂时不可读」降级错误。
+        self.add_thread()
+        holder = sqlite3.connect(self.db)
+        holder.execute("BEGIN EXCLUSIVE")
+
+        def unlock_and_wait(_):
+            holder.rollback()
+            holder.close()
+
+        with patch("collector.codex_adapter.time.sleep", side_effect=unlock_and_wait), \
+                patch("collector.codex_adapter._codex_owners", return_value={"abc": 8}):
+            rows = self.collector._codex({8: {"app": "codex"}})
+        self.assertEqual([row["id"] for row in rows], ["codex:abc"])
+        self.assertEqual(rows[0]["status"], "running")
+        self.assertTrue(all("暂时不可读" not in e for e in self.collector.last_errors))
+
     def test_unreadable_state_databases_degrade_cached_rows(self):
         self.add_thread()
         with patch("collector.codex_adapter._codex_owners", return_value={"abc": 8}):
@@ -324,7 +391,7 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(rows[0]["title"], first[0]["title"])
         self.assertEqual(rows[0]["status"], "unknown")
         self.assertIn("会话数据库暂时不可读", rows[0]["evidence"])
-        self.assertIn("Codex 会话数据库暂时不可读", self.collector.last_errors)
+        self.assertTrue(any("Codex 会话数据库暂时不可读" in e for e in self.collector.last_errors))
 
     def test_lock_ownership_retries_transient_lsof_failure(self):
         self.add_thread()
@@ -346,7 +413,7 @@ class CollectorTests(unittest.TestCase):
     def test_first_unreadable_state_database_returns_nothing(self):
         self.db.write_bytes(b"not a real database at all")
         self.assertEqual(self.collector._codex({}), [])
-        self.assertIn("Codex 会话数据库暂时不可读", self.collector.last_errors)
+        self.assertTrue(any("Codex 会话数据库暂时不可读" in e for e in self.collector.last_errors))
 
     def test_first_claude_scan_runs_when_monotonic_near_zero(self):
         projects = self.claude / "projects" / "-example"
