@@ -12,6 +12,17 @@ struct NativeMonitorChecks {
         assert(!monitor.hasAIMetadata(bundleID: "com.apple.wallpaper.agent", name: "墙纸"))
         assert(!monitor.hasAIMetadata(bundleID: "com.openai.chat.computer-use", name: "ChatGPT Computer Use"))
         assert(!monitor.hasAIMetadata(bundleID: "ai.sample.helper", name: "Sample Helper"))
+        // New Google desktop apps must be discovered without an explicit
+        // user-added bundle or a successful generic AI-button discovery pass.
+        assert(monitor.knownApplication(bundleID: "com.google.GeminiMacOS", name: "Gemini")?.id == "gemini")
+        assert(monitor.knownApplication(bundleID: "COM.GOOGLE.GEMINIMACOS", name: "本地化应用名")?.id == "gemini")
+        assert(monitor.knownApplication(bundleID: "com.google.antigravity", name: "Antigravity")?.id == "antigravity")
+        assert(monitor.knownApplication(bundleID: "com.google.geminimacos", name: "Antigravity")?.id == "gemini")
+        assert(monitor.knownApplication(bundleID: "com.acme.unknown", name: "Gemini")?.id == "gemini")
+        assert(monitor.knownApplication(bundleID: "com.google.chrome", name: "Google Chrome") == nil)
+        assert(monitor.knownApplication(bundleID: "com.google.geminimacos.helper", name: "Gemini Helper") == nil)
+        assert(monitor.buttonStatus(label: "Stop", enabled: true, appID: "gemini") == nil)
+        assert(monitor.buttonStatus(label: "Send", enabled: true, appID: "antigravity") == nil)
         assert(monitor.discoveryBatch(["a", "b", "c", "d", "e"], cursor: 0) == ["a", "b"])
         assert(monitor.discoveryBatch(["a", "b", "c", "d", "e"], cursor: 4) == ["e", "a"])
         assert(monitor.discoveryBatch([], cursor: 5).isEmpty)
@@ -35,11 +46,11 @@ struct NativeMonitorChecks {
         assert(monitor.browserService("DeepSeek - 探索未至之境")?.id == "deepseek")
         assert(monitor.browserService("Learn ChatGPT development - Google Chrome") == nil)
         assert(monitor.browserService("普通项目 - Google Chrome") == nil)
-        let thread = "codex://threads/01a0c8b7-579f-7630-bec2-13c4afbdbf4a"
+        let thread = "codex://threads/f5e31bee-7f0d-544c-b254-92af141861c5"
         assert(monitor.safeDeepLink(thread, appID: "codex") != nil)
         assert(monitor.safeDeepLink(thread, appID: "claude") == nil)
         assert(monitor.safeDeepLink("codex://threads/not-an-id", appID: "codex") == nil)
-        assert(monitor.safeDeepLink("codex://threads//01a0c8b7-579f-7630-bec2-13c4afbdbf4a", appID: "codex") == nil)
+        assert(monitor.safeDeepLink("codex://threads//f5e31bee-7f0d-544c-b254-92af141861c5", appID: "codex") == nil)
         assert(monitor.safeDeepLink(thread + "?command=delete", appID: "codex") == nil)
         assert(monitor.safeDeepLink("file:///tmp/sample", appID: "codex") == nil)
         assert(monitor.safeDeepLink("workbuddy://chat/session-123", appID: "workbuddy") != nil)
@@ -47,9 +58,9 @@ struct NativeMonitorChecks {
         assert(monitor.safeDeepLink("workbuddy://chat/foo%2Fbar", appID: "workbuddy") == nil)
         assert(monitor.safeDeepLink("workbuddy://chat/..", appID: "workbuddy") == nil)
         assert(monitor.safeDeepLink("zcode://workspace/open?path=%2FUsers%2Fexample%2FDownloads", appID: "zcode") != nil)
-        let zcodeWorkspace = "zcode://workspace/open?path=%2FUsers%2Fexample%2F%E4%B8%AD%E6%96%87%E9%A1%B9%E7%9B%AE"
+        let zcodeWorkspace = "zcode://workspace/open?path=%2FUsers%2Fexample%2F%E7%A4%BA%E4%BE%8B%E9%A1%B9%E7%9B%AE"
         assert(monitor.safeDeepLink(zcodeWorkspace, appID: "zcode") != nil)
-        assert(monitor.safeDeepLink(zcodeWorkspace, appID: "zcode").flatMap { URLComponents(string: $0.absoluteString)?.queryItems?.first?.value } == "/Users/example/中文项目")
+        assert(monitor.safeDeepLink(zcodeWorkspace, appID: "zcode").flatMap { URLComponents(string: $0.absoluteString)?.queryItems?.first?.value } == "/Users/example/示例项目")
         assert(monitor.safeDeepLink("zcode://workspace/open?path=Users%2Fx", appID: "zcode") == nil)
         assert(monitor.safeDeepLink("zcode://workspace/open?session=%2FUsers%2Fx", appID: "zcode") == nil)
         assert(monitor.safeDeepLink("zcode://workspace/open?path=%2Fa%2F..%2Fb", appID: "zcode") == nil)
@@ -111,6 +122,6 @@ struct NativeMonitorChecks {
             let empty = NativeMonitor.carriedRows(previous: [], app: app, note: "x")
             check(empty.count == 1 && empty[0].id == "app:workbuddy:42", "empty history falls back to placeholder")
         }
-        print("NativeMonitor: 75 discovery, evidence, deep-link, carry-over, and CLI-container checks passed")
+        print("NativeMonitor: 84 discovery, evidence, deep-link, carry-over, and CLI-container checks passed")
     }
 }

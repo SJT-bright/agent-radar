@@ -9,7 +9,7 @@ import SwiftUI
 struct PromptRules: Codable, Equatable {
     var interruptText: String = "刚才中断了，请继续"
     var rateLimitWakeEnabled = false
-    var rateLimitWaitMinutes = 5
+    var rateLimitWaitSeconds = 10
     var rateLimitText: String = "刚才被限流了，现在请继续"
     var followUps: [String: String] = [:]
     var completionMode: String = "collaboration"
@@ -30,7 +30,7 @@ struct PromptRules: Codable, Equatable {
     private static let previousDefaultGrokRagePrompt = "请继续当前项目。先完成上一轮尚未完成的工作，再从真实使用者的角度走查关键体验，指出具体问题，提出可验证的改进建议并实施优化；完成后实际测试，说明改动、验证结果和剩余问题。下一轮继续寻找值得改进的地方，不要只停留在建议。"
 
     private enum CodingKeys: String, CodingKey {
-        case interruptText, rateLimitWakeEnabled, rateLimitWaitMinutes, rateLimitText, followUps
+        case interruptText, rateLimitWakeEnabled, rateLimitWaitSeconds, rateLimitWaitMinutes, rateLimitText, followUps
         case completionMode, ragePrompt, appRagePrompts, appResumeTexts, resumePrompt, rageAlternateEvery, rageAlternatePrompt
     }
 
@@ -41,7 +41,12 @@ struct PromptRules: Codable, Equatable {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         interruptText = try values.decodeIfPresent(String.self, forKey: .interruptText) ?? interruptText
         rateLimitWakeEnabled = try values.decodeIfPresent(Bool.self, forKey: .rateLimitWakeEnabled) ?? rateLimitWakeEnabled
-        rateLimitWaitMinutes = try values.decodeIfPresent(Int.self, forKey: .rateLimitWaitMinutes) ?? rateLimitWaitMinutes
+        if let seconds = try values.decodeIfPresent(Int.self, forKey: .rateLimitWaitSeconds) {
+            rateLimitWaitSeconds = seconds
+        } else if let minutes = try values.decodeIfPresent(Int.self, forKey: .rateLimitWaitMinutes) {
+            // Old minute waits migrate to the newly requested ten-second ceiling.
+            rateLimitWaitSeconds = minutes > 0 ? 10 : 1
+        }
         rateLimitText = try values.decodeIfPresent(String.self, forKey: .rateLimitText) ?? rateLimitText
         followUps = try values.decodeIfPresent([String: String].self, forKey: .followUps) ?? followUps
         completionMode = try values.decodeIfPresent(String.self, forKey: .completionMode) ?? completionMode
@@ -52,6 +57,22 @@ struct PromptRules: Codable, Equatable {
         rageAlternateEvery = try values.decodeIfPresent(Int.self, forKey: .rageAlternateEvery) ?? rageAlternateEvery
         rageAlternatePrompt = try values.decodeIfPresent(String.self, forKey: .rageAlternatePrompt) ?? rageAlternatePrompt
         self = normalized()
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(interruptText, forKey: .interruptText)
+        try values.encode(rateLimitWakeEnabled, forKey: .rateLimitWakeEnabled)
+        try values.encode(rateLimitWaitSeconds, forKey: .rateLimitWaitSeconds)
+        try values.encode(rateLimitText, forKey: .rateLimitText)
+        try values.encode(followUps, forKey: .followUps)
+        try values.encode(completionMode, forKey: .completionMode)
+        try values.encode(ragePrompt, forKey: .ragePrompt)
+        try values.encode(appRagePrompts, forKey: .appRagePrompts)
+        try values.encode(appResumeTexts, forKey: .appResumeTexts)
+        try values.encode(resumePrompt, forKey: .resumePrompt)
+        try values.encode(rageAlternateEvery, forKey: .rageAlternateEvery)
+        try values.encode(rageAlternatePrompt, forKey: .rageAlternatePrompt)
     }
 
     func normalized() -> PromptRules {
@@ -67,7 +88,7 @@ struct PromptRules: Codable, Equatable {
         result.rageAlternateEvery = min(100, max(2, rageAlternateEvery))
         result.rageAlternatePrompt = Self.sanitize(rageAlternatePrompt)
         if result.rageAlternatePrompt.isEmpty { result.rageAlternatePrompt = Self.defaultRageAlternatePrompt }
-        result.rateLimitWaitMinutes = min(60, max(1, rateLimitWaitMinutes))
+        result.rateLimitWaitSeconds = min(10, max(1, rateLimitWaitSeconds))
         result.followUps = followUps.mapValues(Self.sanitize)
         result.appRagePrompts = appRagePrompts.mapValues(Self.sanitize).filter { !$0.value.isEmpty }
         result.appResumeTexts = appResumeTexts.mapValues(Self.sanitize).filter { !$0.value.isEmpty }
@@ -148,7 +169,8 @@ private final class PromptEditorState: ObservableObject {
     init(store: MonitorStore, session: SessionRecord?) {
         self.store = store
         self.session = session
-        draft = PromptSettingsDraft(rules: store.promptRules)
+        draft = PromptSettingsDraft(rules: store.promptRules, reminderPopupEnabled: store.reminderPopupEnabled,
+                                    reminderSoundEnabled: store.reminderSoundEnabled)
         followUpText = session.flatMap { store.promptRules.followUps[$0.id] } ?? ""
     }
 
@@ -156,7 +178,8 @@ private final class PromptEditorState: ObservableObject {
         if let session = session {
             return followUpText != (store.promptRules.followUps[session.id] ?? "")
         }
-        return draft.hasChanges(comparedTo: store.promptRules)
+        return draft.hasChanges(comparedTo: store.promptRules, reminderPopupEnabled: store.reminderPopupEnabled,
+                                reminderSoundEnabled: store.reminderSoundEnabled)
     }
 
     var validationMessages: [String] {
@@ -180,7 +203,7 @@ private final class PromptEditorState: ObservableObject {
         if let session = session {
             store.setFollowUp(followUpText, for: session)
         } else {
-            store.applyRules(draft.applying(to: store.promptRules))
+            store.applySettingsDraft(draft)
         }
         reload()
         savedMessage = adjusted ? "已保存并处理上方提示的问题，可查看保存后的文字。" : "已保存，后续任务使用最新设置。"
@@ -188,7 +211,8 @@ private final class PromptEditorState: ObservableObject {
     }
 
     func reload() {
-        draft = PromptSettingsDraft(rules: store.promptRules)
+        draft = PromptSettingsDraft(rules: store.promptRules, reminderPopupEnabled: store.reminderPopupEnabled,
+                                    reminderSoundEnabled: store.reminderSoundEnabled)
         followUpText = session.flatMap { store.promptRules.followUps[$0.id] } ?? ""
         savedMessage = ""
     }
@@ -213,7 +237,7 @@ final class PromptSettingsController: NSObject, NSWindowDelegate {
         guard let editor = editor, editor.hasChanges else { return true }
         let alert = NSAlert()
         alert.messageText = "保存未保存的修改？"
-        alert.informativeText = "提示词与限流设置尚未保存。运行开关和监督选择已即时生效。"
+        alert.informativeText = "提醒、提示词与限流设置尚未保存。运行开关和监督选择已即时生效。"
         if !editor.validationMessages.isEmpty {
             alert.informativeText += "\n\n" + editor.validationMessages.joined(separator: "\n")
         }
@@ -374,7 +398,7 @@ private struct PromptEditorView: View {
 
     private var operationPage: some View {
         VStack(alignment: .leading, spacing: 14) {
-            sectionTitle("运行模式", detail: "本页开关与监督选择立即生效。")
+            sectionTitle("运行模式", detail: "模式、自动发送和常用功能立即生效；提醒设置点击底部保存后生效。")
             HStack(spacing: 8) {
                 modeButton("协作模式", mode: "collaboration", color: .blue)
                 modeButton("狂暴模式", mode: "rage", color: .red)
@@ -396,6 +420,24 @@ private struct PromptEditorView: View {
                     Text("尚未选择监督范围；开启总开关也不会自动选择会话。")
                         .font(.system(size: 10)).foregroundStyle(.orange)
                 }
+            }
+            Divider()
+            sectionTitle("提醒", detail: "修改后点击底部保存；弹窗和音效可分别设置。")
+            Toggle("显示提醒弹窗", isOn: $editor.draft.reminderPopupEnabled)
+                .radarHoverHighlight()
+                .accessibilityIdentifier("settings.reminderPopupEnabled")
+            Toggle("任务提醒音效", isOn: $editor.draft.reminderSoundEnabled)
+                .radarHoverHighlight()
+                .accessibilityIdentifier("settings.reminderSoundEnabled")
+            Text("开启音效后，提醒出现或桌面对话的新一轮任务完成时会发声。关闭弹窗后，任务完成仍会发声；暂停监控期间不触发提醒。")
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+            HStack {
+                Button("试听音效") { store.previewReminderSound() }
+                    .buttonStyle(RadarButtonStyle()).font(.system(size: 11))
+                    .help("播放当前任务提醒音效，不修改设置")
+                    .accessibilityIdentifier("settings.previewReminderSound")
+                Text("试听会直接播放，无需保存。")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
             }
             Divider()
             sectionTitle("常用功能", detail: "暂停监控期间，自动发送与自动插队一并暂停。")
@@ -444,12 +486,12 @@ private struct PromptEditorView: View {
 
     private var rateLimitPage: some View {
         VStack(alignment: .leading, spacing: 14) {
-            sectionTitle("限流后唤起", detail: "本页修改点击保存后生效。")
+            sectionTitle("限流后唤起", detail: "本页修改点击保存后生效；排定等待最多 10 秒。")
             Toggle("被限流时也自动唤起", isOn: $editor.draft.rateLimitWakeEnabled).radarHoverHighlight()
             VStack(alignment: .leading, spacing: 12) {
-                Stepper("等待 \(editor.draft.rateLimitWaitMinutes) 分钟后再发送",
-                        value: $editor.draft.rateLimitWaitMinutes, in: 1...60).radarHoverHighlight()
-                Text(isRage ? "狂暴模式在等待结束后，按各会话次数使用普通或特别提示词。" : "协作模式在等待结束后使用下方限流提示词。")
+                Stepper("等待 \(editor.draft.rateLimitWaitSeconds) 秒后重新核验",
+                        value: $editor.draft.rateLimitWaitSeconds, in: 1...10).radarHoverHighlight()
+                Text(isRage ? "狂暴模式在等待结束后使用已配置的恢复提示词。" : "协作模式在等待结束后使用下方限流提示词。")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
                 if !isRage {
                     promptField("限流唤起提示词", text: $editor.draft.rateLimitText,

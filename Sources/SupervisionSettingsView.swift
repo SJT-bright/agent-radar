@@ -203,12 +203,17 @@ struct SupervisionSettingsView: View {
         Toggle(isOn: Binding(get: { store.isSupervised(row) },
                              set: { store.setSupervision($0, for: row) })) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(row.title).font(.system(size: 10)).fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 4) {
+                    if let conflict = store.workspaceConflict(for: row) { WorkspaceConflictBadge(conflict: conflict) }
+                    Text(row.primaryDisplayName).font(.system(size: 11, weight: .semibold))
+                    .lineLimit(1).truncationMode(.middle)
+                }
+                if let title = row.secondaryDisplayName {
+                    Text(title).font(.system(size: 10)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 HStack(spacing: 6) {
                     Text(row.statusLabel)
-                    if !row.project.isEmpty {
-                        Text(row.displayProject).lineLimit(1).truncationMode(.middle)
-                    }
                     if store.supervisedSessionIDs.contains(row.id) {
                         Text("单独标记")
                     }
@@ -217,11 +222,11 @@ struct SupervisionSettingsView: View {
                     Text(reason).font(.system(size: 9)).foregroundStyle(.secondary)
                 }
             }
-            .help(row.title + (row.project.isEmpty ? "" : "\n" + row.project) + "\n" + store.supervisionDetail(for: row))
+            .help(row.displayIdentityDetail + "\n" + store.supervisionDetail(for: row))
         }
         .toggleStyle(.checkbox).radarHoverHighlight()
         .disabled(store.isAppSupervised(appID))
-        .accessibilityLabel(row.app_name + "：" + row.title + "，持续监督")
+        .accessibilityLabel(row.app_name + "：" + row.primaryDisplayName + "，对话：" + row.title + "，持续监督")
     }
 
     private func isExpanded(_ appID: String) -> Bool {

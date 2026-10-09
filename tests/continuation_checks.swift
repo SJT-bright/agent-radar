@@ -34,7 +34,7 @@ import Foundation
         check(transition("interrupted", mode: "rage").first?.text == ContinuationPolicy.resumeText, "rage interruption fixed")
         let rate = transition("interrupted", mode: "rage") { $0.status_reason = "配额 HTTP 429" }
         check(rate.first?.canContinue == true && rate.first?.text == ContinuationPolicy.resumeText, "rage rate fixed")
-        check(rate[0].delay == 300 && rate[0].bypassRestriction, "rate waits")
+        check(rate[0].delay == 10 && rate[0].bypassRestriction, "rate waits at most ten seconds")
         // 狂暴中断首次武装只等待 1 秒；不以跨新轮冷却阻塞恢复。
         check((transition("interrupted", mode: "rage").first?.delay ?? 999) == 1, "rage interruption arms after one second")
         // 长轮次中断（如 HTTP 502）在真实轮次起点下必须可自动恢复。

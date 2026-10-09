@@ -35,12 +35,20 @@ struct SessionRecord: Codable, Identifiable, Equatable {
     var navigation_title: String? = nil
     var navigation_key: String? = nil
     var user_stopped: Bool? = nil
-    var isReadable: Bool {
+    var hasDisplayIdentity: Bool {
         let name = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        return status != "unknown" && !name.isEmpty && name != app_name &&
+        return !name.isEmpty && name != app_name &&
             !name.contains("会话待识别") && !name.contains("未命名窗口") &&
             !["未命名会话", "未命名任务", "Claude 会话"].contains(name) &&
             !(app_id == "autoclaw" && name.hasPrefix("会话 "))
+    }
+    var isReadable: Bool { status != "unknown" && hasDisplayIdentity }
+    /// A verified Codex identity survives uncertain lifecycle evidence. Display
+    /// does not grant automation or count an unknown conversation as running.
+    var isDisplayable: Bool {
+        isReadable || (hasDisplayIdentity && app_id == "codex" && source == "local-session" &&
+            id.hasPrefix("codex:") && UUID(uuidString: String(id.dropFirst(6))) != nil &&
+            target == "codex://threads/" + String(id.dropFirst(6)))
     }
     var statusReason: String { status_reason ?? evidence }
     var timingExplanation: String {
@@ -52,7 +60,21 @@ struct SessionRecord: Codable, Identifiable, Equatable {
             "按数据源明确记录的本轮开始和结束事件计算")
     }
     var displayProject: String {
-        project.isEmpty ? "未识别项目 · 可手动标记" : URL(fileURLWithPath: project).lastPathComponent
+        Self.folderName(for: project) ?? "未识别工作文件夹"
+    }
+    static func folderName(for project: String) -> String? {
+        let path = project.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else { return nil }
+        let name = URL(fileURLWithPath: path).lastPathComponent
+        return name == "/" ? "根目录" : (name.isEmpty ? nil : name)
+    }
+    var primaryDisplayName: String { Self.folderName(for: project) ?? title }
+    var secondaryDisplayName: String? {
+        guard Self.folderName(for: project) != nil, title != primaryDisplayName else { return nil }
+        return title
+    }
+    var displayIdentityDetail: String {
+        "工作文件夹：\(project.isEmpty ? "未识别" : project)\n对话：\(title)"
     }
     /// 手动停止不算中断：不提醒、不计数、不置顶，只作中性展示。
     var userStoppedInterruption: Bool { status == "interrupted" && user_stopped == true }
@@ -83,6 +105,47 @@ struct SessionRecord: Codable, Identifiable, Equatable {
         if seconds >= 3600 { return "\(seconds / 3600)时\((seconds % 3600) / 60)分" }
         if seconds >= 60 { return "\(seconds / 60)分\(seconds % 60)秒" }
         return "\(seconds)秒"
+    }
+}
+
+struct WorkspaceConflict: Identifiable {
+    let id: String
+    let sessions: [SessionRecord]
+    var folderName: String { SessionRecord.folderName(for: id) ?? id }
+    var appNames: [String] {
+        Dictionary(grouping: sessions, by: \.app_id).values.compactMap { $0.first?.app_name }.sorted()
+    }
+    var fingerprint: String { id + "\n" + Set(sessions.map(\.app_id)).sorted().joined(separator: "\n") }
+    var detail: String {
+        "多个软件正在同一工作文件夹中工作，可能修改相同文件。\n工作文件夹：\(id)\n" +
+        sessions.map { "\($0.app_name)：\($0.title)" }.joined(separator: "\n")
+    }
+    static func detect(_ rows: [SessionRecord]) -> [WorkspaceConflict] {
+        let candidates = rows.filter { $0.isActive && $0.isReadable && !$0.app_id.isEmpty }
+        let groups = Dictionary(grouping: candidates.filter { canonicalPath($0.project) != nil },
+                                by: { canonicalPath($0.project)! })
+        return groups.compactMap { path, sessions in
+            guard Set(sessions.map(\.app_id)).count > 1 else { return nil }
+            return WorkspaceConflict(id: path, sessions: sessions.sorted { $0.id < $1.id })
+        }.sorted { $0.id < $1.id }
+    }
+    static func canonicalPath(_ path: String) -> String? {
+        let value = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard value.hasPrefix("/"), !value.contains("\0") else { return nil }
+        return URL(fileURLWithPath: value).standardizedFileURL.resolvingSymlinksInPath().path
+    }
+}
+
+struct WorkspaceConflictTracker {
+    private var previous = Set<String>()
+    private(set) var current: [WorkspaceConflict] = []
+    mutating func observe(_ rows: [SessionRecord], fresh: Bool) -> [WorkspaceConflict] {
+        // A stale/unreadable scan cannot prove that a conflict has ended.
+        guard fresh else { current = []; return [] }
+        current = WorkspaceConflict.detect(rows)
+        let new = current.filter { !previous.contains($0.fingerprint) }
+        previous = Set(current.map(\.fingerprint))
+        return new
     }
 }
 

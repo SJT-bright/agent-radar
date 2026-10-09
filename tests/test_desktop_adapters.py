@@ -125,7 +125,7 @@ class DesktopAdapterTests(unittest.TestCase):
 
     def test_zcode_workspace_link_needs_safe_absolute_path(self):
         self.zcode([
-            ("cn", "/Users/example/中文项目", "cn", "中文工作区", "completed", NOW * 1000, 0, 0),
+            ("cn", "/Users/example/示例项目", "cn", "中文工作区", "completed", NOW * 1000, 0, 0),
             ("relative", "Downloads/relative", "rel", "相对路径", "completed", NOW * 1000, 0, 0),
             ("traversal", "/a/../secret", "trav", "穿越", "completed", NOW * 1000, 0, 0),
             ("empty", "", "void", "无工作区", "completed", NOW * 1000, 0, 0),
@@ -133,7 +133,7 @@ class DesktopAdapterTests(unittest.TestCase):
         targets = {row["id"]: row["target"] for row in self.reader.collect()}
         self.assertEqual(targets["zcode:" + hashlib.sha256(b"cn").hexdigest()[:12] + ":cn"],
                          "zcode://workspace/open?path=%2FUsers%2Fexample%2F"
-                         "%E4%B8%AD%E6%96%87%E9%A1%B9%E7%9B%AE")
+                         "%E7%A4%BA%E4%BE%8B%E9%A1%B9%E7%9B%AE")
         self.assertEqual(targets["zcode:" + hashlib.sha256(b"relative").hexdigest()[:12] + ":rel"], "")
         self.assertEqual(targets["zcode:" + hashlib.sha256(b"traversal").hexdigest()[:12] + ":trav"], "")
         self.assertEqual(targets["zcode:" + hashlib.sha256(b"empty").hexdigest()[:12] + ":void"], "")

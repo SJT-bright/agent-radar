@@ -11,7 +11,7 @@ from extended_adapters import ExtendedCollector, _connect
 
 SID = 'e156e9a9-02c6-4e6d-b193-5fd2393194f8'
 OTHER = '40bf7ff9-19ae-429c-a716-22259c11b069'
-AGENT = '01a0b9a2-88f2-7bf3-9050-89d77b37f5a8'
+AGENT = 'd8731f9c-4ea5-5389-8782-29a8f0db5e19'
 NOW = 1790102000.0
 
 

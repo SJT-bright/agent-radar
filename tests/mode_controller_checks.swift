@@ -35,7 +35,7 @@ final class CompletedAnswerJudge: ContinuationSending {
         func setup(_ enabled: Bool = true, rage: Bool = true) -> (ContinuationController, MockContinuationBridge) {
             let bridge = MockContinuationBridge()
             let defaults = UserDefaults(suiteName: "agentradar.mode-controller.\(UUID().uuidString)")!
-            let controller = ContinuationController(bridge: bridge, judgeBridge: CompletedAnswerJudge(), clock: { now }, countDefaults: defaults)
+            let controller = ContinuationController(bridge: bridge, judgeBridge: CompletedAnswerJudge(), clock: { now }, inputIdle: { 1000 }, countDefaults: defaults)
             var rules = PromptRules(); rules.completionMode = rage ? "rage" : "collaboration"; rules.ragePrompt = "optimize"
             controller.rulesProvider = { rules }
             controller.configure(enabled: enabled, paused: false)

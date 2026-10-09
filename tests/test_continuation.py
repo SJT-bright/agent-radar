@@ -570,6 +570,49 @@ class GrokMetadataTests(unittest.TestCase):
 
 
 class AXSelectionTests(unittest.TestCase):
+    def test_zcode_returns_from_statistics_once_before_search(self):
+        b = self.backend('zcode')
+        b.guard = lambda **kw: None
+        b.current_identity = lambda nodes: nodes == ['verified task']
+        back = dict(label='返回工作区', rect=(10, 70, 120, 100), actions=['AXPress'])
+        calls = []
+        b.ax.press = lambda node: calls.append(node) or True
+        b.navigation_nodes = lambda _: ['verified task']
+        self.assertEqual(b.route_zcode_search([(back, 'AXButton')]), ['verified task'])
+        self.assertEqual(calls, [back])
+        # A still-rendering settings page never loops or presses repeatedly.
+        b.navigation_nodes = lambda _: [(back, 'AXButton')]
+        calls.clear()
+        with self.assertRaisesRegex(Blocked, 'search_unavailable'):
+            b.route_zcode_search([(back, 'AXButton')])
+        self.assertEqual(calls, [back])
+        calls.clear()
+        with self.assertRaisesRegex(Blocked, 'search_unavailable'):
+            b.route_zcode_search([(back, 'AXButton'), (dict(back), 'AXButton')])
+        self.assertEqual(calls, [])
+
+    def test_zcode_native_paste_avoids_partial_axvalue_and_rechecks_identity(self):
+        b = self.backend('zcode')
+        b.request['overwrite_draft'] = True
+        b.box = {'AXFocused': True}
+        b.guard = lambda **kw: None
+        b.ax.set_attr = lambda *args: self.fail('ZCode must not mutate AXValue before native paste')
+        value = ['existing draft']
+        identity = [True]
+        b.snapshot = lambda: dict(identity=identity[0], busy=False, input_count=1,
+                                  value=value[0], send_enabled=value[0] == MESSAGE)
+        b.focus_composer = lambda: None
+        actions = []
+        b.inject = SimpleNamespace(hotkey=lambda key: actions.append(key))
+        b.paste_verified = lambda text: value.__setitem__(0, text)
+        b.write(MESSAGE)
+        self.assertEqual(actions, [0])
+        self.assertEqual(value[0], MESSAGE)
+        b.focus_composer = lambda: identity.__setitem__(0, False)
+        with self.assertRaisesRegex(Blocked, 'target_unverified'):
+            b.write('another message')
+        self.assertEqual(value[0], MESSAGE)
+
     def backend(self, app='autoclaw'):
         class AX:
             @staticmethod
@@ -612,6 +655,55 @@ class AXSelectionTests(unittest.TestCase):
             self.assertIs(b.navigation_nodes(0.6), nodes)
         sleep.assert_not_called()
 
+    def test_zcode_large_history_does_not_hide_identity_search_or_composer(self):
+        b = self.backend('zcode')
+        history = dict(role='AXGroup', AXDOMClassList=['@md/conversation:px-6', 'gap-5', 'pb-5'],
+                       children=[dict(role='AXStaticText') for _ in range(6500)])
+        header = dict(role='AXHeading', label=b.title, rect=(400, 50, 600, 80))
+        project = dict(role='AXButton', label='Project', rect=(320, 50, 370, 80))
+        box = dict(role='AXGroup', placeholder='提出后续修改要求', description='text entry area',
+                   rect=(350, 600, 900, 700), AXValue='')
+        send = dict(role='AXButton', label='发送', rect=(850, 710, 900, 740))
+        stop = dict(role='AXButton', label='停止生成', rect=(800, 710, 850, 740))
+        search = dict(role='AXComboBox', placeholder='搜索操作、任务或文件')
+        b.root = dict(role='AXWindow', children=[search, dict(role='AXGroup',
+                      AXDOMIdentifier='conversation', children=[project, header, history, box, stop, send])])
+        b.zcode_identity = (b.title, 'Project', '/w/Project', True)
+        nodes = b.nodes()
+        self.assertEqual(len(nodes), 9)
+        self.assertEqual(b.search_boxes(nodes), [search])
+        snap = b.snapshot()
+        self.assertTrue(snap['identity'])
+        self.assertEqual(snap['input_count'], 1)
+        self.assertTrue(snap['busy'])
+        self.assertTrue(snap['send_exists'])
+        # Other providers, unknown classes, and lookalikes outside the
+        # conversation must still reject an incomplete control tree.
+        for mutation in ('other-app', 'unknown-layout', 'outside-conversation'):
+            with self.subTest(mutation=mutation):
+                b.request['app_id'] = 'zcode'
+                history['AXDOMClassList'] = ['@md/conversation:px-6', 'gap-5', 'pb-5']
+                b.root['children'][1]['AXDOMIdentifier'] = 'conversation'
+                if mutation == 'other-app': b.request['app_id'] = 'autoclaw'
+                if mutation == 'unknown-layout': history['AXDOMClassList'] = ['gap-5', 'pb-5']
+                if mutation == 'outside-conversation': b.root['children'][1]['AXDOMIdentifier'] = ''
+                with self.assertRaisesRegex(Blocked, 'tree_incomplete'):
+                    b.nodes()
+
+    def test_zcode_navigation_waits_for_editor_after_matching_header(self):
+        b = self.backend('zcode')
+        b.guard = lambda **_: None
+        header_only, mounted = [object()], [object()]
+        b.nodes = Mock(side_effect=[header_only, mounted])
+        b.current_identity = lambda _: True
+        b.snapshot = Mock(side_effect=[dict(identity=True, input_count=0, value=None, send_exists=False),
+                                      dict(identity=True, input_count=1, value='', send_exists=True)])
+        with patch('supervisor.bridge.time.sleep') as sleep:
+            self.assertIs(b.navigation_nodes(1.5), mounted)
+        self.assertEqual(b.nodes.call_count, 2)
+        self.assertEqual(b.snapshot.call_args_list[0].args, (header_only,))
+        sleep.assert_called_once()
+
     def test_inspect_is_readonly_and_excludes_draft_text(self):
         b = self.backend()
         b.bind_window = lambda: None
@@ -652,7 +744,8 @@ class AXSelectionTests(unittest.TestCase):
     def test_zcode_repeated_message_hits_choose_top_result_and_route(self):
         b = self.backend('zcode')
         b.zcode_identity = (b.title, 'Project', '/w/Project', True)
-        box = {'placeholder': '搜索操作、任务或文件', 'AXValue': b.title}
+        box = {'placeholder': '搜索操作、任务或文件', 'AXValue': b.title,
+               'rect': (200, 150, 500, 180)}
         def hit(y):
             return {'role': 'AXMenuItem', 'rect': (100, y, 700, y + 52), 'children': [
                 {'children': [{'role': 'AXStaticText', 'label': b.title}]},
@@ -682,6 +775,24 @@ class AXSelectionTests(unittest.TestCase):
             {'children': [{'role': 'AXStaticText', 'label': 'Other task'}]},
             {'children': [{'role': 'AXStaticText', 'label': b.title}]},
             {'role': 'AXStaticText', 'label': 'Project'}]}
+        self.assertFalse(b.zcode_search_match(result))
+
+    def test_zcode_highlighted_title_preserves_spaces_and_clipped_tail(self):
+        b = self.backend('zcode')
+        b.title = '剩余问题 相似图 pHash 堆叠 长标题...'
+        b.zcode_identity = (b.title, 'Project', '/w/Project', True)
+        def text(value, y=220, height=17):
+            return {'role': 'AXStaticText', 'label': value.strip(), 'AXValue': value,
+                    'rect': (200, y, 600, y + height)}
+        parts = ['剩余问题', ' ', '相似图', ' ', 'pHash', ' ', '堆叠', ' ', '长标题...']
+        leaves = [text(value) for value in parts[:-1]] + [text(parts[-1], 269, 1)]
+        result = {'children': leaves + [text(b.title, 238), text('Project', 228)]}
+        self.assertTrue(b.zcode_search_match(result))
+        # Same-line suffixes and a title occurring only in the snippet cannot
+        # become the target, even when the index says its title is unique.
+        result['children'].insert(1, text(' Other'))
+        self.assertFalse(b.zcode_search_match(result))
+        result['children'] = [text('Other task')] + [text(value, 238) for value in parts]
         self.assertFalse(b.zcode_search_match(result))
 
     def test_zcode_search_excludes_hidden_and_disabled_hits(self):
@@ -723,6 +834,58 @@ class AXSelectionTests(unittest.TestCase):
             self.assertFalse(b.sidebar_match(b.title + ' ' + suffix), suffix)
         self.assertFalse(b.sidebar_match('正确会话的备份 2天'))
 
+    def test_zcode_identity_captures_each_geometry_once_during_refresh(self):
+        b = self.backend('zcode')
+        b.zcode_identity = (b.title, 'Project', '/w/Project', True)
+        header = {'rect': (90, 60, 260, 81), 'AXValue': 1, 'label': b.title}
+        project = {'rect': (55, 57, 83, 85), 'label': 'Project'}
+        reads = {}
+        def transient_rect(node):
+            key = id(node)
+            reads[key] = reads.get(key, 0) + 1
+            return node['rect'] if reads[key] == 1 else None
+        b.ax.rect_of = transient_rect
+        self.assertTrue(b.current_identity([(header, 'AXHeading'), (project, 'AXButton')]))
+        self.assertEqual(list(reads.values()), [1, 1])
+
+    def test_zcode_identity_missing_geometry_or_label_fails_closed(self):
+        b = self.backend('zcode')
+        b.zcode_identity = (b.title, 'Project', '/w/Project', True)
+        header = {'rect': (90, 60, 260, 81), 'AXValue': 1, 'label': b.title}
+        project = {'rect': (55, 57, 83, 85), 'label': 'Project'}
+        nodes = [(header, 'AXHeading'), (project, 'AXButton')]
+        for node in (header, project):
+            rect = node.pop('rect')
+            self.assertFalse(b.current_identity(nodes))
+            node['rect'] = rect
+        project['label'] = ''
+        self.assertFalse(b.current_identity(nodes))
+        project['label'] = 'Project'
+        header['label'] = ''
+        self.assertFalse(b.current_identity(nodes))
+
+    def test_qoder_identity_captures_heading_geometry_once_during_refresh(self):
+        b = self.backend('qoder')
+        b.qoder_identity = ('sid', b.title, 'Project', '/w/Project')
+        header = {'rect': (90, 60, 260, 81), 'AXValue': 1, 'label': b.title}
+        area = {'AXURL': qoder_chat_url('sid', 'qoder')}
+        context = {'label': '当前任务上下文', 'children': [{'role': 'AXGroup', 'label': 'Project'}]}
+        rect = Mock(side_effect=[header['rect'], None])
+        b.ax.rect_of = rect
+        nodes = [(header, 'AXHeading'), (area, 'AXWebArea'), (context, 'AXGroup')]
+        self.assertTrue(b.current_identity(nodes))
+        rect.assert_called_once_with(header)
+        self.assertFalse(b.current_identity(nodes))
+
+    def test_sidebar_candidate_geometry_is_not_read_again_after_refresh(self):
+        b = self.backend()
+        target = {'rect': (20, 120, 270, 150), 'label': b.title}
+        rect = Mock(side_effect=[target['rect'], None])
+        b.ax.rect_of = rect
+        self.assertEqual(b.sidebar_candidates([(target, 'AXButton')]), [target])
+        rect.assert_called_once_with(target)
+        self.assertEqual(b.sidebar_candidates([(target, 'AXButton')]), [])
+
     def test_autoclaw_expands_only_unique_navigation_controls(self):
         b = self.backend()
         b.guard = lambda **_: None
@@ -738,7 +901,7 @@ class AXSelectionTests(unittest.TestCase):
         self.assertEqual(b.expand_autoclaw_sidebar([more, more]), [more, more])
         self.assertEqual(presses, [])
 
-    def test_search_paste_never_calls_composer_or_send_and_restores_clipboard(self):
+    def search_backend(self):
         b = self.backend('zcode')
         b.guard = lambda **_: None
         box = {'rect': (200, 200, 500, 230), 'AXFocused': True,
@@ -756,11 +919,81 @@ class AXSelectionTests(unittest.TestCase):
             NSPasteboardItem=SimpleNamespace(alloc=lambda: SimpleNamespace(init=lambda: clone)),
             NSPasteboardTypeString='text')
         b.snapshot = b.send = b.write = lambda *_: self.fail('search must never touch the composer/send')
+        return b, box, actions
+
+    def test_search_paste_never_calls_composer_or_send_and_restores_clipboard(self):
+        b, box, actions = self.search_backend()
         b.write_search_query(box)
         self.assertEqual(actions, ['focus-search', 0, 'clear', ('query', b.title), 9, 'clear', ('restore', True)])
         box['AXFocused'] = False
-        with self.assertRaisesRegex(Blocked, 'search_unavailable'):
+        box['AXValue'] = ''
+        with self.assertRaisesRegex(Blocked, 'search_input_changed'):
             b.write_search_query(box)
+
+    def test_search_rebinds_replaced_handle_before_paste(self):
+        b, old, actions = self.search_backend()
+        replacement = dict(old)
+        b.nodes = lambda: [(replacement, 'AXComboBox')]
+        def hotkey(key):
+            actions.append(key)
+            if key == 9:
+                replacement['AXValue'] = b.title
+        b.inject.hotkey = hotkey
+        b.write_search_query(old)
+        self.assertEqual(replacement['AXValue'], b.title)
+        self.assertEqual(old['AXValue'], '')
+        self.assertEqual(actions.count(9), 1)
+
+    def test_search_waits_for_delayed_focus_without_typing(self):
+        b, box, actions = self.search_backend()
+        pending = dict(box, AXFocused=False)
+        states = [[], [(pending, 'AXComboBox')], [(box, 'AXComboBox')]]
+        b.nodes = lambda: states.pop(0)
+        self.assertIs(b.wait_search_box({''}, focused=True), box)
+        self.assertEqual(actions, [])
+
+    def test_search_paste_survives_transient_missing_field_and_result_focus(self):
+        b, box, actions = self.search_backend()
+        after = dict(box, AXValue=b.title, AXFocused=False)
+        reads = []
+        def nodes():
+            if 9 not in actions:
+                return [(box, 'AXComboBox')]
+            reads.append(True)
+            return [] if len(reads) == 1 else [(after, 'AXComboBox')]
+        b.nodes = nodes
+        b.write_search_query(box)
+        self.assertEqual(actions.count(9), 1)
+        self.assertEqual(actions[-1], ('restore', True))
+
+    def test_search_exact_existing_query_uses_no_keyboard_or_clipboard(self):
+        b, box, actions = self.search_backend()
+        box.update(AXValue=b.title, AXFocused=False)
+        b.write_search_query(box)
+        self.assertEqual(actions, [])
+
+    def test_search_rejects_changed_value_duplicate_or_outside_field(self):
+        b, box, actions = self.search_backend()
+        for nodes, code in [
+            ([(dict(box, AXValue='Other query'), 'AXComboBox')], 'search_input_changed'),
+            ([(dict(box, AXValue=[]), 'AXComboBox')], 'search_input_changed'),
+            ([(box, 'AXComboBox'), (dict(box), 'AXComboBox')], 'search_input_changed'),
+            ([(dict(box, rect=(1200, 200, 1500, 230)), 'AXComboBox')], 'search_unavailable')]:
+            b.nodes = lambda: nodes
+            with self.assertRaisesRegex(Blocked, code):
+                b.write_search_query(box)
+        self.assertEqual(actions, [])
+
+    def test_search_user_activity_after_paste_stops_without_repeating(self):
+        b, box, actions = self.search_backend()
+        def guard(**_):
+            if 9 in actions:
+                raise Blocked('user_active')
+        b.guard = guard
+        with self.assertRaisesRegex(Blocked, 'user_active'):
+            b.write_search_query(box)
+        self.assertEqual(actions.count(9), 1)
+        self.assertEqual(actions[-1], ('restore', True))
 
     def test_send_promotes_only_one_new_queue_control(self):
         b = self.backend('zcode')

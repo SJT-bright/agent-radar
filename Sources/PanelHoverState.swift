@@ -36,9 +36,8 @@ struct PanelHoverState {
     }
 }
 
-/// Pure interaction state shared by native hover entry, click and menu dismissal.
-/// A menu owns the pointer while tracking, so its generated exit events must not
-/// arm another popup before dismissal.
+/// Shared by hover entry, click and dismissal. The popup is asynchronous;
+/// dismissal over its trigger must still require a real exit before reopening.
 struct SettingsMenuHoverState {
     private(set) var pointerInside = false
     private(set) var isOpen = false
@@ -68,5 +67,35 @@ struct SettingsMenuHoverState {
         self.pointerInside = pointerInside
         armed = !pointerInside
         return true
+    }
+}
+
+/// A brief grace period spans the small gap from trigger to menu and between
+/// submenu windows. It is retargetable rather than a queue of delayed closes.
+struct SettingsMenuDepartureState {
+    static let grace: TimeInterval = 0.18
+    private(set) var outsideSince: TimeInterval?
+    private(set) var keyboardPointer: CGPoint?
+
+    /// VoiceOver/keyboard activation need not move the hardware pointer onto
+    /// the trigger. Keep the menu available until pointer control resumes.
+    mutating func holdForKeyboard(pointer: CGPoint) {
+        keyboardPointer = pointer
+        outsideSince = nil
+    }
+
+    mutating func resumePointer() {
+        keyboardPointer = nil
+        outsideSince = nil
+    }
+
+    mutating func shouldClose(pointerInside: Bool, pointer: CGPoint? = nil, now: TimeInterval) -> Bool {
+        if let origin = keyboardPointer {
+            guard let pointer, hypot(pointer.x - origin.x, pointer.y - origin.y) >= 2 else { return false }
+            resumePointer()
+        }
+        if pointerInside { outsideSince = nil; return false }
+        guard let outsideSince else { self.outsideSince = now; return false }
+        return now - outsideSince >= Self.grace
     }
 }

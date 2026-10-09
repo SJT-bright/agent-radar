@@ -20,7 +20,7 @@ private final class SettingsStoreHarness {
     let defaults: UserDefaults
     let bridge = SettingsStoreBridge()
     var now = 1000.0
-    lazy var controller = ContinuationController(bridge: bridge, clock: { [unowned self] in self.now }, countDefaults: defaults)
+    lazy var controller = ContinuationController(bridge: bridge, clock: { [unowned self] in self.now }, inputIdle: { 1000 }, countDefaults: defaults)
     lazy var store = MonitorStore(defaults: defaults, writeHealthDiagnostics: false, continuation: controller)
 
     init(rage: Bool = false, rate: Bool = false, sends: Int = 0) {
@@ -29,7 +29,7 @@ private final class SettingsStoreHarness {
         var rules = store.promptRules
         rules.completionMode = rage ? "rage" : "collaboration"
         rules.rateLimitWakeEnabled = rate
-        rules.rateLimitWaitMinutes = 1
+        rules.rateLimitWaitSeconds = 1
         rules.interruptText = "original interruption"
         rules.rateLimitText = "original rate limit"
         rules.ragePrompt = "ordinary"
@@ -70,6 +70,101 @@ private final class SettingsStoreHarness {
         var checks = 0
         func check(_ condition: Bool, _ name: String) { precondition(condition, name); checks += 1 }
 
+        // All preferences use a unique suite, and no store/controller is started.
+        // Exercise the same combined draft-save path as the settings window.
+        do {
+            let h = SettingsStoreHarness()
+            check(h.store.reminderPopupEnabled && h.store.reminderSoundEnabled,
+                  "legacy settings without reminder keys default popup and sound to enabled")
+            check(h.defaults.object(forKey: MonitorStore.reminderPopupDefaultsKey) == nil &&
+                  h.defaults.object(forKey: MonitorStore.reminderSoundDefaultsKey) == nil,
+                  "reading legacy reminder settings does not write defaults")
+            var callbacks = 0
+            h.store.onReminderPreferencesChanged = { callbacks += 1 }
+            for (popup, sound) in [(true, true), (false, true), (true, false), (false, false)] {
+                let draft = PromptSettingsDraft(rules: h.store.promptRules, reminderPopupEnabled: popup,
+                                                reminderSoundEnabled: sound)
+                h.store.applySettingsDraft(draft)
+                let reloaded = MonitorStore(defaults: h.defaults, writeHealthDiagnostics: false)
+                check(reloaded.reminderPopupEnabled == popup && reloaded.reminderSoundEnabled == sound,
+                      "each independent reminder preference combination survives reload")
+                check(!draft.hasChanges(comparedTo: reloaded.promptRules,
+                                        reminderPopupEnabled: reloaded.reminderPopupEnabled,
+                                        reminderSoundEnabled: reloaded.reminderSoundEnabled),
+                      "reloading saved reminder preferences clears draft changes")
+            }
+            check(callbacks == 3, "unchanged reminder save is silent and each actual change notifies once")
+            var notices = 0, previews = 0
+            h.store.onRecoveryNotice = { _ in notices += 1 }
+            h.store.onPreviewReminderSound = { previews += 1 }
+            h.store.previewContinuationNotice()
+            h.store.previewReminderSound()
+            check(notices == 1, "popup disable still delivers recovery notices to independent sound handling")
+            check(previews == 1, "explicit sound preview remains available when both reminder preferences are disabled")
+        }
+        do {
+            let h = SettingsStoreHarness()
+            let interrupted = h.enqueue()
+            h.defaults.set("preserve unknown settings", forKey: "futureSettingsMarker")
+            let originalDomain = h.defaults.persistentDomain(forName: h.suite) ?? [:]
+            let originalRules = h.store.promptRules
+            let originalScope = h.store.supervisedSessionIDs
+            let originalAppScope = h.store.supervisedAppIDs
+            let originalCancels = h.bridge.cancelled
+            var callbacks = 0
+            h.store.onReminderPreferencesChanged = {
+                callbacks += 1
+                check(h.defaults.object(forKey: MonitorStore.reminderPopupDefaultsKey) as? Bool == false &&
+                      h.defaults.object(forKey: MonitorStore.reminderSoundDefaultsKey) as? Bool == true,
+                      "preference callback reads both already-persisted settings")
+            }
+            let draft = PromptSettingsDraft(rules: h.store.promptRules, reminderPopupEnabled: false,
+                                            reminderSoundEnabled: true)
+            h.store.applySettingsDraft(draft)
+            h.store.applySettingsDraft(draft)
+            check(callbacks == 1, "saving the same reminder draft twice sends one change callback")
+            check(h.store.promptRules == originalRules && h.store.autoContinueEnabled,
+                  "reminder-only save preserves execution rules and the automatic-send opt-in")
+            check(h.store.supervisedSessionIDs == originalScope && h.store.supervisedAppIDs == originalAppScope,
+                  "reminder-only save preserves per-session and per-software supervision")
+            check(h.controller.pendingSessionIDs.contains(interrupted.id) && h.bridge.cancelled == originalCancels,
+                  "reminder-only save does not cancel queued continuation work")
+            var savedDomain = h.defaults.persistentDomain(forName: h.suite) ?? [:]
+            savedDomain.removeValue(forKey: MonitorStore.reminderPopupDefaultsKey)
+            savedDomain.removeValue(forKey: MonitorStore.reminderSoundDefaultsKey)
+            check(NSDictionary(dictionary: savedDomain).isEqual(to: originalDomain),
+                  "reminder-only save preserves all other persisted defaults including unknown keys")
+            h.now += 5; h.observe([interrupted])
+            check(h.bridge.requests.count == 1 &&
+                  h.bridge.requests.first?["text"] as? String == "original interruption",
+                  "authorized queued recovery still executes its original prompt after reminder-only save")
+        }
+        do {
+            let h = SettingsStoreHarness()
+            h.bridge.hold = true
+            let interrupted = h.enqueue()
+            h.now += 5; h.observe([interrupted])
+            check(h.bridge.isRunning, "fixture has a held in-flight continuation verification")
+            let originalCancels = h.bridge.cancelled
+            h.store.applySettingsDraft(PromptSettingsDraft(rules: h.store.promptRules,
+                                                          reminderPopupEnabled: true, reminderSoundEnabled: false))
+            check(h.bridge.isRunning && h.bridge.cancelled == originalCancels &&
+                  h.controller.pendingSessionIDs.contains(interrupted.id),
+                  "sound-only save preserves an in-flight authorized continuation operation")
+        }
+        do {
+            let h = SettingsStoreHarness()
+            var observations: [Bool] = []
+            h.store.onSessionsObserved = { rows, fresh in
+                check(rows.isEmpty, "pause and stop clear the independent completion observation snapshot")
+                observations.append(fresh)
+            }
+            h.store.togglePause()
+            h.store.stop()
+            check(observations == [false, false],
+                  "pause and stop invalidate completion observations to avoid delayed completion sounds")
+        }
+
         // Exercise the same store.applyRules path used by Save, not a direct
         // controller.configure call that could hide a missing store invalidation.
         do {
@@ -94,7 +189,7 @@ private final class SettingsStoreHarness {
         do {
             let h = SettingsStoreHarness(rate: true)
             _ = h.enqueue(rate: true)
-            var rules = h.store.promptRules; rules.rateLimitWaitMinutes = 20
+            var rules = h.store.promptRules; rules.rateLimitWaitSeconds = 20
             h.store.applyRules(rules)
             check(h.controller.pendingSessionIDs.isEmpty, "saving changed wait cancels old deadline")
         }

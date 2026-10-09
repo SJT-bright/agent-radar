@@ -35,6 +35,9 @@ CHAT_COMPOSER_HINTS = {'grok': {'消息输入框', '随心输入'},
 ZCODE_SEARCH_PLACEHOLDERS = {'搜索操作、任务或文件', 'Search actions, tasks, or files'}
 ZCODE_COMPOSER_HINTS = {'提出后续修改要求', '继续输入以排队后续修改',
                         'Ask for follow-up changes', 'Keep typing to queue follow-up changes'}
+# ZCode's rendered historical turns, separate from the sticky composer sibling.
+# Only this exact renderer signature inside #conversation may be omitted.
+ZCODE_TRANSCRIPT_CLASSES = {'@md/conversation:px-6', 'gap-5', 'pb-5'}
 AUTOCLAW_SIDEBAR_AGE = re.compile(
     r'(?:有未查看回复|正在回复\.{3}|\d{1,2}:\d{2}|昨天|前天|\d{1,2}月\d{1,2}日|'
     r'\d+\s*(?:天|周|个月|年))')
@@ -497,18 +500,29 @@ class MacBackend:
 
     def nodes(self):
         ax = self.ax
-        queue, out, deadline = [(self.root, 0)], [], time.monotonic() + 6
+        queue, out, deadline = [(self.root, 0, False)], [], time.monotonic() + 6
+        zcode = self.request['app_id'] == 'zcode'
         while queue:
             if len(out) > 6000 or time.monotonic() > deadline:
                 raise Blocked('tree_incomplete')
-            node, depth = queue.pop()
+            node, depth, conversation = queue.pop()
             if depth > 55:
                 raise Blocked('tree_incomplete')
             role = ax.role(node)
             if role in ('AXMenuBar', 'AXMenu', 'AXMenuExtra'):
                 continue
             out.append((node, role))
-            queue.extend((c, depth + 1) for c in reversed(ax.children(node)))
+            if zcode and role == 'AXGroup':
+                conversation |= ax.get_attr(node, 'AXDOMIdentifier', '') == 'conversation'
+                classes = ax.get_attr(node, 'AXDOMClassList', []) or []
+                if (conversation and not isinstance(classes, str)
+                        and ZCODE_TRANSCRIPT_CLASSES.issubset(classes)):
+                    # Full transcript/code token trees can exceed 6000 nodes
+                    # before reaching the editor. They are not identity, search,
+                    # busy, send or queue controls. Never accept a truncated
+                    # control tree; unknown layouts keep the existing limits.
+                    continue
+            queue.extend((c, depth + 1, conversation) for c in reversed(ax.children(node)))
         return out
 
     def label(self, node):
@@ -530,11 +544,13 @@ class MacBackend:
             sid, title, project_name, _ = self.qoder_identity
             left, top, _, _ = self.window.rect
             urls = [str(ax.get_attr(node, 'AXURL', '')) for node, role in nodes if role == 'AXWebArea']
-            headings = [self.heading_title(node) for node, role in nodes if role == 'AXHeading'
-                        and ax.get_attr(node, 'AXValue', 1) in (1, '1')
-                        and ax.rect_of(node) and top <= ax.rect_of(node)[1] < top + 150
-                        and ax.rect_of(node)[0] > left + 50
-                        and ax.rect_of(node)[3] - ax.rect_of(node)[1] >= 10]
+            headings = []
+            for node, role in nodes:
+                rect = ax.rect_of(node) if role == 'AXHeading' else None
+                if (rect and ax.get_attr(node, 'AXValue', 1) in (1, '1')
+                        and top <= rect[1] < top + 150 and rect[0] > left + 50
+                        and rect[3] - rect[1] >= 10):
+                    headings.append(self.heading_title(node))
             contexts = [node for node, role in nodes if role == 'AXGroup'
                         and self.label(node) == '当前任务上下文']
             projects = [self.label(child) for parent in contexts for child in ax.children(parent)
@@ -543,18 +559,25 @@ class MacBackend:
                     and len(contexts) == 1 and projects.count(project_name) == 1)
         if self.request['app_id'] == 'zcode':
             left, top, _, _ = self.window.rect
-            headings = [node for node, role in nodes
-                        if role == 'AXHeading' and ax.rect_of(node) and
-                        ax.get_attr(node, 'AXValue', 1) in (1, '1') and
-                        top <= ax.rect_of(node)[1] < top + 100 and ax.rect_of(node)[0] > left + 50
-                        and ax.rect_of(node)[3] - ax.rect_of(node)[1] >= 10]
-            if len(headings) != 1 or self.heading_title(headings[0]) != self.title:
+            headings = []
+            for node, role in nodes:
+                # AX controls can disappear between reads during navigation.
+                # Capture geometry once, including the header used below.
+                rect = ax.rect_of(node) if role == 'AXHeading' else None
+                if (rect and ax.get_attr(node, 'AXValue', 1) in (1, '1')
+                        and top <= rect[1] < top + 100 and rect[0] > left + 50
+                        and rect[3] - rect[1] >= 10):
+                    headings.append((node, rect))
+            if len(headings) != 1 or self.heading_title(headings[0][0]) != self.title:
                 return False
-            header = ax.rect_of(headings[0])
-            projects = [self.label(node) for node, role in nodes if role == 'AXButton'
-                        and ax.rect_of(node) and ax.rect_of(node)[3] - ax.rect_of(node)[1] >= 10
-                        and left + 30 < ax.rect_of(node)[0] < header[0]
-                        and abs(ax.rect_of(node)[1] - header[1]) < 32]
+            header = headings[0][1]
+            projects = []
+            for node, role in nodes:
+                rect = ax.rect_of(node) if role == 'AXButton' else None
+                if (rect and rect[3] - rect[1] >= 10
+                        and left + 30 < rect[0] < header[0]
+                        and abs(rect[1] - header[1]) < 32):
+                    projects.append(self.label(node))
             name = self.zcode_identity[1]
             return sum(value == name or value.startswith(name + ' · ') for value in projects) == 1
         headers = []
@@ -704,11 +727,14 @@ class MacBackend:
 
     def sidebar_candidates(self, nodes):
         ax = self.ax
-        return [node for node, role in nodes if role == 'AXButton' and
-                self.sidebar_match(self.label(node)) and ax.rect_of(node) and
-                ax.rect_of(node)[0] < self.window.rect[0] + 300 and
-                ax.rect_of(node)[3] - ax.rect_of(node)[1] >= 10 and
-                'AXPress' in ax.action_names(node)]
+        matches = []
+        for node, role in nodes:
+            rect = ax.rect_of(node) if role == 'AXButton' else None
+            if (rect and self.sidebar_match(self.label(node))
+                    and rect[0] < self.window.rect[0] + 300 and rect[3] - rect[1] >= 10
+                    and 'AXPress' in ax.action_names(node)):
+                matches.append(node)
+        return matches
 
     def expand_autoclaw_sidebar(self, nodes):
         # Only reversible, uniquely named navigation controls. Multiple agents'
@@ -716,11 +742,13 @@ class MacBackend:
         for names in ({'展开侧边栏', 'Expand sidebar'}, {'展示更多', 'Show more'}):
             if self.sidebar_candidates(nodes):
                 break
-            controls = [node for node, role in nodes if role == 'AXButton'
-                        and self.label(node) in names and self.ax.enabled(node)
-                        and self.ax.rect_of(node) and
-                        self.ax.rect_of(node)[0] < self.window.rect[0] + 300
-                        and 'AXPress' in self.ax.action_names(node)]
+            controls = []
+            for node, role in nodes:
+                rect = self.ax.rect_of(node) if role == 'AXButton' else None
+                if (rect and self.label(node) in names and self.ax.enabled(node)
+                        and rect[0] < self.window.rect[0] + 300
+                        and 'AXPress' in self.ax.action_names(node)):
+                    controls.append(node)
             if len(controls) != 1:
                 continue
             self.guard()
@@ -734,11 +762,14 @@ class MacBackend:
         # Never toggle an already-expanded group or guess between duplicate names.
         if self.sidebar_candidates(nodes):
             return nodes
-        controls = [node for node, role in nodes if role == 'AXButton'
-                    and self.label(node) == self.grok_identity[1]
+        controls = []
+        for node, role in nodes:
+            rect = self.ax.rect_of(node) if role == 'AXButton' else None
+            if (rect and self.label(node) == self.grok_identity[1]
                     and self.ax.get_attr(node, 'AXExpanded') is False
-                    and self.ax.rect_of(node) and self.ax.rect_of(node)[0] < self.window.rect[0] + 300
-                    and 'AXPress' in self.ax.action_names(node)]
+                    and rect[0] < self.window.rect[0] + 300
+                    and 'AXPress' in self.ax.action_names(node)):
+                controls.append(node)
         if len(controls) == 1:
             self.guard()
             if not self.ax.press(controls[0]):
@@ -764,14 +795,35 @@ class MacBackend:
             nodes = self.navigation_nodes(1.5)
         return nodes
 
-    def route_zcode_search(self, nodes):
+    def route_zcode_search(self, nodes, allow_workspace_return=True):
         ax = self.ax
         left, top, _, _ = self.window.rect
         boxes = self.search_boxes(nodes)
         if not boxes:
-            search = [node for node, role in nodes if role == 'AXButton' and
-                      self.label(node).split(' ')[0] in ('搜索', 'Search') and ax.rect_of(node) and
-                      ax.rect_of(node)[0] < left + 300 and ax.rect_of(node)[1] < top + 150]
+            search = []
+            for node, role in nodes:
+                rect = ax.rect_of(node) if role == 'AXButton' else None
+                if (rect and self.label(node).split(' ')[0] in ('搜索', 'Search')
+                        and rect[0] < left + 300 and rect[1] < top + 150):
+                    search.append(node)
+            if not search and allow_workspace_return:
+                # Settings/statistics has no task search. Return only through
+                # the explicit header control, then reacquire all UI handles.
+                back = []
+                for node, role in nodes:
+                    rect = ax.rect_of(node) if role == 'AXButton' else None
+                    if (rect and self.label(node) in ('返回工作区', 'Back to workspace')
+                            and ax.enabled(node) and 'AXPress' in ax.action_names(node)
+                            and left <= rect[0] < left + 300 and top <= rect[1] < top + 150):
+                        back.append(node)
+                if len(back) == 1:
+                    self.guard()
+                    if not ax.press(back[0]):
+                        raise Blocked('search_unavailable')
+                    nodes = self.navigation_nodes(1.5)
+                    if self.current_identity(nodes):
+                        return nodes
+                    return self.route_zcode_search(nodes, allow_workspace_return=False)
             if len(search) != 1:
                 raise Blocked('search_unavailable')
             self.guard()
@@ -792,9 +844,12 @@ class MacBackend:
         while True:
             self.guard()
             nodes = self.nodes()
-            boxes = self.search_boxes(nodes)
-            if len(boxes) != 1 or ax.get_attr(boxes[0], 'AXValue') != self.title:
-                raise Blocked('search_input_changed')
+            box = self.checked_search_box(nodes, {self.title})
+            if box is None:
+                if time.monotonic() >= deadline:
+                    raise Blocked('search_input_changed')
+                time.sleep(0.05)
+                continue
             result = self.zcode_search_result(nodes)
             if result is not None:
                 break
@@ -833,18 +888,26 @@ class MacBackend:
         # handler. Paste into the unique declared search field, never a composer.
         ax = self.ax
         self.guard()
-        current = self.search_boxes(self.nodes())
-        if len(current) != 1 or current[0] != box:
+        baseline = ax.get_attr(box, 'AXValue')
+        if not isinstance(baseline, str):
             raise Blocked('search_input_changed')
-        rect = ax.rect_of(box)
-        if not rect or rect[2] - rect[0] < 20 or rect[3] - rect[1] < 10:
-            raise Blocked('search_unavailable')
+        # Rebind by the unique declared field, not an Electron AX handle that
+        # can be replaced when the command panel renders. Reuse an exact query.
+        box = self.wait_search_box({baseline})
+        if baseline == self.title:
+            return
+        for attempt in range(2):
+            self.guard()
+            box = self.wait_search_box({baseline})
+            rect = ax.rect_of(box)
+            self.inject.click_at((rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2)
+            if self.wait_search_box({baseline}, focused=True, timeout=0.6, retry_focus=True) is not None:
+                break
+            if attempt == 1:
+                raise Blocked('search_input_changed')
         self.guard()
-        self.inject.click_at((rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2)
-        self.guard()
-        if not ax.get_attr(box, 'AXFocused', False):
-            raise Blocked('search_unavailable')
         self.inject.hotkey(0)
+        self.wait_search_box({baseline}, focused=True)
         pb = self.AppKit.NSPasteboard.generalPasteboard()
         saved = []
         for item in pb.pasteboardItems() or []:
@@ -859,37 +922,61 @@ class MacBackend:
         count = pb.changeCount()
         try:
             self.guard()
-            if not ax.get_attr(box, 'AXFocused', False):
-                raise Blocked('search_input_changed')
+            self.wait_search_box({baseline}, focused=True)
             self.inject.hotkey(9)
-            deadline = time.monotonic() + 2
-            while True:
-                self.guard()
-                boxes = self.search_boxes(self.nodes())
-                if len(boxes) != 1 or not ax.get_attr(boxes[0], 'AXFocused', False):
-                    raise Blocked('search_input_changed')
-                if ax.get_attr(boxes[0], 'AXValue') == self.title:
-                    return
-                if time.monotonic() >= deadline:
-                    raise Blocked('search_input_changed')
-                time.sleep(0.05)
+            # After paste no more keys are sent: exact readback is sufficient
+            # even if focus moves to a result during a React/AX refresh.
+            self.wait_search_box({baseline, '', self.title}, expected=self.title, timeout=2)
         finally:
             if pb.changeCount() == count:
                 pb.clearContents()
                 if saved:
                     pb.writeObjects_(saved)
 
+    def checked_search_box(self, nodes, values):
+        boxes = self.search_boxes(nodes)
+        if len(boxes) > 1:
+            raise Blocked('search_input_changed')
+        if not boxes:
+            return None
+        box = boxes[0]
+        rect = self.ax.rect_of(box)
+        left, top, right, bottom = self.window.rect
+        if (not self.ax.enabled(box) or not rect or rect[2] - rect[0] < 20 or
+                rect[3] - rect[1] < 10 or
+                not (left <= rect[0] < rect[2] <= right and top <= rect[1] < rect[3] <= bottom)):
+            raise Blocked('search_unavailable')
+        value = self.ax.get_attr(box, 'AXValue')
+        if not isinstance(value, str) or value not in values:
+            raise Blocked('search_input_changed')
+        return box
+
+    def wait_search_box(self, values, focused=False, expected=None, timeout=0.6, retry_focus=False):
+        deadline = time.monotonic() + timeout
+        while True:
+            self.guard()
+            box = self.checked_search_box(self.nodes(), values)
+            if (box is not None and (not focused or self.ax.get_attr(box, 'AXFocused', False))
+                    and (expected is None or self.ax.get_attr(box, 'AXValue') == expected)):
+                return box
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if focused and box is not None and retry_focus:
+                    return None
+                raise Blocked('search_input_changed')
+            time.sleep(min(0.05, remaining))
+
     def zcode_search_match(self, node):
         ax = self.ax
         stack = [(child, 1) for child in reversed(ax.children(node))]
-        labels, visited = [], 0
+        texts, visited = [], 0
         while stack:
             child, depth = stack.pop()
             visited += 1
             if visited > 256 or depth > 8:
                 return False
             if ax.role(child) == 'AXStaticText':
-                labels.append(self.label(child))
+                texts.append(child)
             stack.extend((item, depth + 1) for item in reversed(ax.children(child)))
         # Current ZCode exposes the title as child text but folds the project
         # into the menu item's composite label. A globally unique indexed
@@ -897,8 +984,26 @@ class MacBackend:
         # and project button before the composer is touched.
         # The first text is the result's task title. Later text can be a message
         # snippet mentioning our title inside an entirely different task.
-        return bool(labels) and labels[0] == self.title and (self.zcode_identity[1] in labels or
-                                                            self.zcode_identity[3])
+        labels = [self.label(child) for child in texts]
+        if not labels:
+            return False
+        title = labels[0]
+        first = ax.rect_of(texts[0])
+        if first and first[3] - first[1] >= 10:
+            # Multi-word queries split the truncated title into highlighted
+            # spans, including whitespace leaves. Reassemble only its first
+            # line; never include the separate message-snippet or project row.
+            parts = []
+            for child in texts:
+                rect = ax.rect_of(child)
+                if not rect:
+                    return False
+                if rect[3] - rect[1] >= 10 and abs(rect[1] - first[1]) > 3:
+                    break
+                value = ax.get_attr(child, 'AXValue')
+                parts.append(value if isinstance(value, str) else ax.element_name(child))
+            title = ''.join(parts).strip()
+        return title == self.title and (self.zcode_identity[1] in labels or self.zcode_identity[3])
 
     def navigation_nodes(self, timeout):
         # Fast apps need no fixed sleep. Slow navigation retains the existing
@@ -908,7 +1013,14 @@ class MacBackend:
             self.guard()
             nodes = self.nodes()
             remaining = deadline - time.monotonic()
-            if self.current_identity(nodes) or remaining <= 0:
+            ready = self.current_identity(nodes)
+            if ready and self.request['app_id'] == 'zcode':
+                # ZCode renders the new header before its editor mounts.
+                # A matching title alone must not end the navigation wait.
+                current = self.snapshot(nodes)
+                ready = (current['identity'] and current['input_count'] == 1
+                         and current['value'] is not None and current['send_exists'])
+            if ready or remaining <= 0:
                 return nodes
             time.sleep(min(0.05, remaining))
 
@@ -926,9 +1038,9 @@ class MacBackend:
             time.sleep(0.1)
         raise Blocked('focus_changed')
 
-    def snapshot(self):
+    def snapshot(self, nodes=None):
         ax = self.ax
-        nodes = self.nodes()
+        nodes = self.nodes() if nodes is None else nodes
         if self.request['app_id'] == 'grok' and any(self.label(n) in ('已断开', '发生应用错误', '应用发生错误') or 'Minified React error' in self.label(n) for n, role in nodes if role in ('AXStaticText', 'AXHeading')):
             raise Blocked('app_ui_unavailable')
         boxes, buttons, busy = [], [], False
@@ -990,7 +1102,7 @@ class MacBackend:
         self.did_write = True
         # WorkBuddy's contenteditable accepts AXValue visually but does not
         # notify its editor model. Always use real paste for these editions.
-        if self.request.get('app_id') not in ('workbuddy', 'workbuddy-ai', 'grok'):
+        if self.request.get('app_id') not in ('workbuddy', 'workbuddy-ai', 'grok', 'zcode'):
             self.ax.set_attr(self.box, 'AXValue', message)
             time.sleep(0.2)
         snapshot = self.snapshot()
@@ -1132,8 +1244,16 @@ def main():
         result = {'code': str(e), 'attempted': bool(backend and backend.did_write)}
         if e.retry_after is not None:
             result['retry_after'] = e.retry_after
-    except Exception:
-        result = {'code': 'bridge_error', 'attempted': bool(backend and backend.did_write)}
+    except Exception as e:
+        trace = e.__traceback__
+        while trace and trace.tb_next:
+            trace = trace.tb_next
+        # Code location only: never include the exception's text, local values,
+        # external filenames, clipboard contents or conversation details.
+        result = {'code': 'bridge_error', 'attempted': bool(backend and backend.did_write),
+                  'error_type': type(e).__name__,
+                  'error_function': trace.tb_frame.f_code.co_name if trace else '',
+                  'error_line': trace.tb_lineno if trace else 0}
     if isinstance(locals().get('request'), dict) and request.get('mode') == 'inspect':
         print(json.dumps(result))
         return

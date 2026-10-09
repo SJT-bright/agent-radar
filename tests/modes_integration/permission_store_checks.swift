@@ -7,7 +7,7 @@ import Foundation
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         defaults.set(true, forKey: "autoContinueOptIn.v2")
-        let store = MonitorStore(defaults: defaults)
+        let store = MonitorStore(defaults: defaults, writeHealthDiagnostics: false)
         store.beginPermissionRepair()
         check(store.permissionRepairActive && store.autoContinueEnabled, "repair pauses runtime while preserving preference")
         check(defaults.bool(forKey: "autoContinueOptIn.v2"), "repair does not alter persistent authorization")

@@ -4,6 +4,11 @@ import json
 import math
 from pathlib import Path
 import sys
+import threading
+import time
+import contextlib
+import io
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -63,6 +68,126 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(snapshot["sessions"][0]["id"], "zcode:b")
         self.assertTrue(any("RuntimeError" in message for message in snapshot["errors"]))
         self.assertNotIn("private source text", json.dumps(snapshot))
+
+
+class WatchPipelineTests(unittest.TestCase):
+    def watcher(self, adapters):
+        watcher = pipeline.WatchCollector(adapters)
+        self.addCleanup(watcher.close)
+        return watcher
+
+    def test_slow_source_does_not_block_healthy_sources_or_start_overlapping_scans(self):
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+        def slow():
+            calls.append(1)
+            entered.set()
+            release.wait(timeout=2)
+            return [row("slow:a")]
+        self.addCleanup(release.set)
+        watcher = self.watcher([("slow", SimpleNamespace(collect=slow)),
+                                ("fast", SimpleNamespace(collect=lambda: [row("fast:a")]))])
+        started = time.monotonic()
+        first = watcher.snapshot(budget=0.03)
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertTrue(entered.is_set())
+        self.assertEqual([item["id"] for item in first["sessions"]], ["fast:a"])
+        second = watcher.snapshot(budget=0.03)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(second["sessions"][0]["status"], "running")
+        release.set()
+        final = watcher.snapshot(budget=1)
+        self.assertEqual({item["id"] for item in final["sessions"]}, {"slow:a", "fast:a"})
+
+    def test_pending_source_keeps_identity_but_cannot_refresh_cached_trusted_status(self):
+        release = threading.Event()
+        calls = []
+        original = row("slow:a", turn_id="round-a", started_at=100)
+        def collect():
+            calls.append(1)
+            if len(calls) > 1:
+                release.wait(timeout=2)
+            return [original]
+        self.addCleanup(release.set)
+        watcher = self.watcher([("slow", SimpleNamespace(collect=collect))])
+        first = watcher.snapshot(budget=1)
+        self.assertEqual(first["sessions"][0]["status"], "running")
+        pending = watcher.snapshot(budget=0.02)
+        cached = pending["sessions"][0]
+        self.assertEqual((cached["id"], cached["turn_id"], cached["status"]),
+                         ("slow:a", "round-a", "unknown"))
+        self.assertIn("待确认", cached["status_reason"])
+        self.assertEqual(original["status"], "running")
+        release.set()
+        final = watcher.snapshot(budget=1)
+        self.assertEqual(final["sessions"][0]["status"], "running")
+
+    def test_failed_source_retains_unconfirmed_identity_without_private_exception_text(self):
+        calls = []
+        def collect():
+            calls.append(1)
+            if len(calls) > 1:
+                raise RuntimeError("private database information")
+            return [row(status="completed")]
+        watcher = self.watcher([("source", SimpleNamespace(collect=collect))])
+        watcher.snapshot(budget=1)
+        failed = watcher.snapshot(budget=1)
+        self.assertEqual(failed["sessions"][0]["status"], "unknown")
+        self.assertIn("RuntimeError", failed["errors"][0])
+        self.assertNotIn("private", json.dumps(failed))
+
+    def test_broken_diagnostic_does_not_discard_successful_sessions(self):
+        def diagnostics():
+            raise ValueError("private error detail")
+        watcher = self.watcher([("source", SimpleNamespace(collect=lambda: [row()],
+                                                        diagnostics=diagnostics))])
+        result = watcher.snapshot(budget=1)
+        self.assertEqual(result["sessions"][0]["status"], "running")
+        self.assertIn("ValueError", result["errors"][0])
+        self.assertNotIn("private", json.dumps(result))
+
+    def test_only_stalled_source_requests_restart_at_45_seconds_without_overlapping(self):
+        release = threading.Event()
+        calls, clock = [], [100.0]
+        def slow():
+            calls.append(1)
+            release.wait(timeout=2)
+            return []
+        self.addCleanup(release.set)
+        watcher = self.watcher([("slow", SimpleNamespace(collect=slow)),
+                                ("fast", SimpleNamespace(collect=lambda: [row("fast:a")]))])
+        watcher.last_rows["slow"] = [row("slow:a")]
+        with patch.object(pipeline.time, "monotonic", side_effect=lambda: clock[0]):
+            first = watcher.snapshot(budget=0.02)
+            self.assertEqual(watcher.stalled_sources, [])
+            clock[0] = 144.999
+            watcher.snapshot(budget=0.02)
+            self.assertEqual(watcher.stalled_sources, [])
+            clock[0] = 145.0
+            final = watcher.snapshot(budget=0.02)
+        self.assertEqual(watcher.stalled_sources, ["slow"])
+        self.assertEqual(len(calls), 1)
+        rows = {item["id"]: item for item in final["sessions"]}
+        self.assertEqual(rows["slow:a"]["status"], "unknown")
+        self.assertEqual(rows["fast:a"]["status"], "running")
+        self.assertTrue(any("待确认" in error and "重启本地采集器" in error for error in final["errors"]))
+
+    def test_main_flushes_final_unknown_snapshot_before_controlled_collector_exit(self):
+        class ExitProbe(BaseException):
+            pass
+        final = {"sessions": [row(status="unknown")], "errors": ["正在重启本地采集器"],
+                 "collected_at": 100.0}
+        watcher = SimpleNamespace(snapshot=lambda: final, stalled_sources=["slow"], close=lambda: None)
+        output = io.StringIO()
+        def forced_exit(code):
+            self.assertEqual(code, pipeline.WATCH_RESTART_EXIT_CODE)
+            self.assertEqual(json.loads(output.getvalue()), final)
+            raise ExitProbe()
+        with patch.object(pipeline, "WatchCollector", return_value=watcher), \
+             patch.object(sys, "argv", ["collector", "--watch"]), \
+             patch.object(pipeline.os, "_exit", side_effect=forced_exit), \
+             contextlib.redirect_stdout(output), self.assertRaises(ExitProbe):
+            pipeline.main()
 
 
 if __name__ == "__main__":

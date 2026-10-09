@@ -1,5 +1,15 @@
 import SwiftUI
 
+struct WorkspaceConflictBadge: View {
+    let conflict: WorkspaceConflict
+    var body: some View {
+        Image(systemName: "exclamationmark.triangle.fill")
+            .font(.system(size: 10)).foregroundStyle(.orange)
+            .help(conflict.detail)
+            .accessibilityLabel("警告：多个软件正在同一文件夹工作；" + conflict.appNames.joined(separator: "、"))
+    }
+}
+
 /// Shared feedback for every in-window action. Native menus retain system highlighting.
 struct RadarButtonStyle: ButtonStyle {
     var cornerRadius: CGFloat = 7

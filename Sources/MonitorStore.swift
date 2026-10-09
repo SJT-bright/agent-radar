@@ -37,6 +37,12 @@ final class MonitorStore: ObservableObject {
     @Published var paused = false
     @Published var autoContinueEnabled: Bool
     @Published var autoQueueInsertionEnabled: Bool
+    @Published private(set) var reminderPopupEnabled: Bool
+    @Published private(set) var reminderSoundEnabled: Bool
+    static let reminderPopupDefaultsKey = "reminderPopupEnabled.v1"
+    static let reminderSoundDefaultsKey = "reminderSoundEnabled.v1"
+    var onReminderPreferencesChanged: (() -> Void)?
+    var onPreviewReminderSound: (() -> Void)?
     @Published private(set) var keepAwakeEnabled: Bool
     @Published private(set) var keepAwakeStatus = KeepAwakeStatus()
     private let keepAwake = KeepAwakeController()
@@ -47,10 +53,14 @@ final class MonitorStore: ObservableObject {
     static let appSupervisionDefaultsKey = "supervisedAppIDs.v1"
     @Published var recoverySummary = "自动继续正在检查"
     var onRecoveryNotice: ((ContinuationNotice) -> Void)?
+    var onSessionsObserved: (([SessionRecord], Bool) -> Void)?
+    @Published private(set) var workspaceConflicts: [WorkspaceConflict] = []
+    private var workspaceConflictTracker = WorkspaceConflictTracker()
+    var onWorkspaceConflictsChanged: ((Set<String>) -> Void)?
     private let continuation: ContinuationController
     private let queueInsertion = QueueInsertionController()
     @Published var expanded = false
-    // Native menu tracking extends the floating panel’s hover region.
+    // The settings popover extends the floating panel’s hover region.
     var settingsMenuTracking = false
     @Published private(set) var expandedApps: Set<String> = []
     // 控制位固定在右侧：展开时箭头贴面板最右，收起胶囊整体贴屏幕最右缘；
@@ -77,6 +87,7 @@ final class MonitorStore: ObservableObject {
     private let monitor = NativeMonitor()
     private let nativeQueue = DispatchQueue(label: "radar.native", qos: .utility)
     private let decoderQueue = DispatchQueue(label: "radar.decode", qos: .utility)
+    private let diagnosticWriter = HealthDiagnosticWriter()
     private var nativeSessions: [SessionRecord] = []
     private var localSessions: [SessionRecord] = []
     private var process: Process?
@@ -105,6 +116,8 @@ final class MonitorStore: ObservableObject {
             .flatMap { try? JSONDecoder().decode([RemovedSession].self, from: $0) } ?? []
         autoContinueEnabled = defaults.bool(forKey: "autoContinueOptIn.v2")
         autoQueueInsertionEnabled = defaults.object(forKey: "autoQueueInsertion.v1") as? Bool ?? true
+        reminderPopupEnabled = defaults.object(forKey: Self.reminderPopupDefaultsKey) as? Bool ?? true
+        reminderSoundEnabled = defaults.object(forKey: Self.reminderSoundDefaultsKey) as? Bool ?? true
         keepAwakeEnabled = defaults.bool(forKey: "keepAwakeEnabled.v1")
         promptRules = PromptRules.load(from: defaults)
         supervisedSessionIDs = Set((defaults.stringArray(forKey: Self.supervisionDefaultsKey) ?? []).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
@@ -148,6 +161,7 @@ final class MonitorStore: ObservableObject {
     }
 
     func stop() {
+        onSessionsObserved?([], false)
         keepAwake.stop()
         queueInsertion.stop()
         continuation.stop()
@@ -166,6 +180,9 @@ final class MonitorStore: ObservableObject {
         pausedAt = paused ? Date() : nil
         continuation.configure(enabled: autoContinueEnabled && !permissionRepairActive, paused: paused)
         if paused {
+            onSessionsObserved?([], false)
+            workspaceConflicts = []
+            onWorkspaceConflictsChanged?([])
             collectorGeneration += 1
             outputPipe?.fileHandleForReading.readabilityHandler = nil
             process?.terminate()
@@ -253,13 +270,7 @@ final class MonitorStore: ObservableObject {
                 let snapshot = try JSONDecoder().decode(CollectorSnapshot.self, from: line)
                 DispatchQueue.main.async { [weak self] in
                     guard let self = self, !self.paused, generation == self.collectorGeneration else { return }
-                    self.localSessions = snapshot.sessions
-                    self.collectorErrors = snapshot.errors
-                    self.transportErrors = []
-                    self.lastLocalUpdate = Date(timeIntervalSince1970: snapshot.collected_at)
-                    self.collectorLastProgress = ProcessInfo.processInfo.systemUptime
-                    self.hasSnapshot = true
-                    self.rebuild()
+                    self.acceptSnapshot(snapshot)
                 }
             } catch {
                 DispatchQueue.main.async { [weak self] in
@@ -269,6 +280,17 @@ final class MonitorStore: ObservableObject {
                 }
             }
         }
+    }
+
+    func acceptSnapshot(_ snapshot: CollectorSnapshot) {
+        guard !paused, !stopping else { return }
+        localSessions = snapshot.sessions
+        collectorErrors = snapshot.errors
+        transportErrors = []
+        lastLocalUpdate = Date(timeIntervalSince1970: snapshot.collected_at)
+        collectorLastProgress = ProcessInfo.processInfo.systemUptime
+        hasSnapshot = true
+        rebuild()
     }
 
     func refreshNative() {
@@ -281,9 +303,9 @@ final class MonitorStore: ObservableObject {
             DispatchQueue.main.async {
                 self.scanning = false
                 guard !self.paused else { return }
-                self.apps = scan.apps
+                if self.apps != scan.apps { self.apps = scan.apps }
                 self.nativeSessions = scan.sessions
-                self.accessibility = scan.accessibility
+                if self.accessibility != scan.accessibility { self.accessibility = scan.accessibility }
                 if !scan.accessibility {
                     self.recordWindowPermissionRevocation()
                 }
@@ -298,9 +320,10 @@ final class MonitorStore: ObservableObject {
 
     private func rebuild() {
         let stale = hasSnapshot && Date().timeIntervalSince(lastLocalUpdate) > 15
-        errors = collectorErrors + transportErrors
-        if stale { errors.append("会话采集暂未更新，活动状态已降级") }
-        if !hasSnapshot && Date().timeIntervalSince(lastLaunch) > 12 { errors.append("正在等待本地会话采集器") }
+        var nextErrors = collectorErrors + transportErrors
+        if stale { nextErrors.append("会话采集暂未更新，活动状态已降级") }
+        if !hasSnapshot && Date().timeIntervalSince(lastLaunch) > 12 { nextErrors.append("正在等待本地会话采集器") }
+        if errors != nextErrors { errors = nextErrors }
         let liveIDs = Set(apps.map(\.id))
         let locals = localSessions.map { session -> SessionRecord in
             var s = session
@@ -318,13 +341,26 @@ final class MonitorStore: ObservableObject {
         let fallback = nativeSessions.filter { !covered.contains($0.app_id) }
         var unique: [String: SessionRecord] = [:]
         for item in locals + fallback { unique[item.id] = item }
-        sessions = clocks.update(Array(unique.values), now: Date().timeIntervalSince1970).sorted {
+        let nextSessions = clocks.update(Array(unique.values), now: Date().timeIntervalSince1970).sorted {
             if pins.contains($0.id) != pins.contains($1.id) { return pins.contains($0.id) }
             if $0.priority != $1.priority { return $0.priority < $1.priority }
             return $0.updated_at > $1.updated_at
         }
-        lastUpdate = hasSnapshot ? lastLocalUpdate : nil
+        if sessions != nextSessions { sessions = nextSessions }
+        let nextUpdate = hasSnapshot ? lastLocalUpdate : nil
+        if lastUpdate != nextUpdate { lastUpdate = nextUpdate }
+        let monitoredSessions = sessions.filter { !isRemoved($0) }
+        let newConflicts = workspaceConflictTracker.observe(monitoredSessions,
+                                                           fresh: hasSnapshot && !stale && !paused)
+        let nextConflicts = workspaceConflictTracker.current
+        if workspaceConflicts.map(\.id) != nextConflicts.map(\.id) ||
+            workspaceConflicts.map(\.sessions) != nextConflicts.map(\.sessions) {
+            workspaceConflicts = nextConflicts
+        }
+        onWorkspaceConflictsChanged?(Set(workspaceConflicts.map(\.id)))
+        for conflict in newConflicts { showWorkspaceConflict(conflict) }
         refreshSupervision()
+        onSessionsObserved?(monitoredSessions, hasSnapshot && !stale && !paused)
         continuation.observe(sessions, fresh: hasSnapshot && !stale && !paused,
                              excludedIDs: removedSessionIDs)
         onResize?(expanded)
@@ -333,6 +369,20 @@ final class MonitorStore: ObservableObject {
 
     var ongoingSessions: [SessionRecord] {
         displaySessions.filter { $0.isActive }
+    }
+
+    func workspaceConflict(for session: SessionRecord) -> WorkspaceConflict? {
+        workspaceConflicts.first { $0.sessions.contains { $0.id == session.id } }
+    }
+
+    func showWorkspaceConflict(_ conflict: WorkspaceConflict) {
+        onRecoveryNotice?(ContinuationNotice(title: "同目录工作提醒", conversation: "",
+            message: conflict.appNames.joined(separator: "、") + " 正在同一文件夹中工作，可能修改相同文件。请检查是否需要暂停其中一个。",
+            sessionID: "workspace-conflict:" + conflict.id, project: conflict.id, isWorkspaceConflict: true))
+    }
+
+    func showWorkspaceConflicts() {
+        for conflict in workspaceConflicts { showWorkspaceConflict(conflict) }
     }
 
     var compactCountLabel: String {
@@ -353,6 +403,9 @@ final class MonitorStore: ObservableObject {
         let liveIDs = Set(apps.map(\.id))
         let readable = sessions.filter(\.isReadable)
         var result = readable.filter { $0.isActive }
+        result += sessions.filter {
+            $0.status == "unknown" && $0.isDisplayable && liveIDs.contains($0.app_id) && isTodayRow($0)
+        }
         let failures = Dictionary(grouping: readable.filter {
             $0.status == "interrupted" && $0.user_stopped != true &&
                 now - ($0.ended_at ?? $0.updated_at) < 86400
@@ -374,7 +427,7 @@ final class MonitorStore: ObservableObject {
         }.map(\.app_id))
         for id in ids.subtracting(represented).filter({ !$0.hasPrefix("browser-") }) {
             let rows = sessions.filter { $0.app_id == id }
-            if let latest = rows.max(by: { $0.updated_at < $1.updated_at }), latest.isReadable,
+            if let latest = rows.max(by: { $0.updated_at < $1.updated_at }), latest.isDisplayable,
                isTodayRow(latest) {
                 result.append(latest)
             }
@@ -409,7 +462,7 @@ final class MonitorStore: ObservableObject {
         let shown = Set(grouped.values.flatMap { $0.map(\.id) })
         // 久远对话只留在后台：分组展开只补充当天的其余会话，且有界封顶。
         let allReadable = sessions.filter {
-            $0.isReadable && !isRemoved($0) && !shown.contains($0.id) && isTodayRow($0)
+            $0.isDisplayable && !isRemoved($0) && !shown.contains($0.id) && isTodayRow($0)
         }.sorted { $0.updated_at > $1.updated_at }.prefix(12)
         for session in allReadable where grouped[session.app_id] != nil {
             grouped[session.app_id, default: []].append(session)
@@ -439,10 +492,12 @@ final class MonitorStore: ObservableObject {
         let screenHeight = NSScreen.main?.visibleFrame.height ?? 800
         let groups = conversationGroups
         let contentHeight: CGFloat = groups.isEmpty ? 66 : groups.reduce(CGFloat(8)) { height, group in
-            let primaryHeight: CGFloat = ["interrupted", "stalled"].contains(group.primary.status) ? 76 : 62
+            let primaryHeight: CGFloat = (["interrupted", "stalled"].contains(group.primary.status) ? 76 : 62)
+                + (group.primary.secondaryDisplayName == nil ? 0 : 14)
             let extrasHeight: CGFloat = isAppGroupExpanded(group.id)
                 ? group.sessions.dropFirst().reduce(CGFloat(0)) { sum, session in
-                    sum + (["interrupted", "stalled"].contains(session.status) ? 54 : 40) + 2
+                    sum + (["interrupted", "stalled"].contains(session.status) ? 54 : 40)
+                        + (session.secondaryDisplayName == nil ? 0 : 14) + 2
                 } : 0
             return height + primaryHeight + extrasHeight + 4
         }
@@ -727,6 +782,22 @@ final class MonitorStore: ObservableObject {
         writeDiagnostic()
     }
 
+    /// 提醒偏好独立保存；只修改弹窗或音效不会取消已授权的恢复任务。
+    func applySettingsDraft(_ draft: PromptSettingsDraft) {
+        let rules = draft.applying(to: promptRules)
+        if rules != promptRules { applyRules(rules) }
+        guard reminderPopupEnabled != draft.reminderPopupEnabled ||
+                reminderSoundEnabled != draft.reminderSoundEnabled else { return }
+        reminderPopupEnabled = draft.reminderPopupEnabled
+        reminderSoundEnabled = draft.reminderSoundEnabled
+        removalDefaults.set(reminderPopupEnabled, forKey: Self.reminderPopupDefaultsKey)
+        removalDefaults.set(reminderSoundEnabled, forKey: Self.reminderSoundDefaultsKey)
+        onReminderPreferencesChanged?()
+        writeDiagnostic()
+    }
+
+    func previewReminderSound() { onPreviewReminderSound?() }
+
     func isSupervised(_ session: SessionRecord) -> Bool {
         supervisedSessionIDs.contains(session.id) || supervisedAppIDs.contains(session.app_id)
     }
@@ -873,8 +944,10 @@ final class MonitorStore: ObservableObject {
                        text: continuation.diagnostic + "\n辅助功能：" + accessibilityCheckDetail)
     }
     func previewContinuationNotice() {
-        onRecoveryNotice?(ContinuationNotice(title: "AI 监督 · 提醒预览", conversation: "中断后返回原会话",
-                                              message: "自动发送关闭时只提醒。狂暴模式已标记的可恢复中断，发现后 1 秒排定，再核验会话、覆盖输入框并发送继续提示词。这次仅预览。"))
+        let row = displaySessions.first
+        onRecoveryNotice?(ContinuationNotice(title: "AI 监督 · 提醒预览", conversation: row?.title ?? "中断后返回原会话",
+                                              message: "自动发送关闭时只提醒。狂暴模式已标记的可恢复中断，发现后 1 秒排定，再核验会话、覆盖输入框并发送继续提示词。这次仅预览。",
+                                              project: row?.project ?? ""))
     }
     func applicationIcon(for session: SessionRecord) -> NSImage? {
         if let app = apps.first(where: { $0.id == session.app_id || ($0.pid == session.pid && session.app_id.hasPrefix("web-")) }), !app.path.isEmpty {
@@ -905,18 +978,21 @@ final class MonitorStore: ObservableObject {
         func stamp(_ value: Double?) -> String {
             value.map { formatter.string(from: Date(timeIntervalSince1970: $0)) } ?? "数据源未提供"
         }
-        showDiagnostic(title: session.app_name + " · 状态与计时", text: "\(session.title)\n\n\(session.statusLabel)\n\(session.statusReason)\n\n计时依据\n\(session.timingExplanation)\n开始：\(stamp(session.started_at))\n结束：\(stamp(session.ended_at))\n\n状态证据\n\(session.evidence)")
+        showDiagnostic(title: session.app_name + " · 状态与计时", text: "\(session.displayIdentityDetail)\n\n\(session.statusLabel)\n\(session.statusReason)\n\n计时依据\n\(session.timingExplanation)\n开始：\(stamp(session.started_at))\n结束：\(stamp(session.ended_at))\n\n状态证据\n\(session.evidence)")
     }
     var backgroundDiagnostic: String {
         var lines = [accessibility ? "窗口权限：辅助功能已开启" : "窗口权限：任务雷达尚未获得辅助功能授权；扣子等依赖窗口读取的应用无法取得对话信息。本地会话读取不受影响。"]
         lines.append("自动发现：已开启。每轮检查运行中的应用，识别 AI 名称/标识；授权后轮询未知应用的明确生成按钮，识别后自动记住。能确认标题和状态的会话自动显示，无须逐个手动添加。")
         for app in apps.sorted(by: { $0.name < $1.name }) {
             let rows = sessions.filter { $0.app_id == app.id }
-            let unreadable = rows.filter { !$0.isReadable }
+            let unreadable = rows.filter { !$0.isDisplayable }
             let visible = displaySessions.filter { $0.app_id == app.id }.count
             let unread = unreadable.max(by: { $0.updated_at < $1.updated_at })
             let reason = unread.map { $0.status == "unknown" ? $0.statusReason : "本地记录缺少可识别的对话标题，已留在后台" }
-            lines.append("\(app.name) · 已显示 \(visible) 个对话" + (reason.map { "\n后台：" + $0 } ?? (rows.isEmpty ? "\n本轮没有可读取的会话数据" : "\n本地会话数据可读取")))
+            let uncertain = rows.filter { $0.status == "unknown" && $0.isDisplayable && !isRemoved($0) }.count
+            lines.append("\(app.name) · 已显示 \(visible) 个对话" +
+                         (uncertain > 0 ? "\n\(uncertain) 条对话身份已读取，轮次状态待确认" : "") +
+                         (reason.map { "\n后台：" + $0 } ?? (rows.isEmpty ? "\n本轮没有可读取的会话数据" : "\n本地会话数据可读取")))
         }
         if !errors.isEmpty { lines.append("采集错误\n" + errors.joined(separator: "\n")) }
         return lines.joined(separator: "\n\n")
@@ -974,8 +1050,6 @@ final class MonitorStore: ObservableObject {
     private func writeDiagnostic() {
         guard writeHealthDiagnostics else { return }
         // Minimal local health receipt; no conversation bodies, paths or titles.
-        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/AgentRadar")
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let info: [String: Any] = ["observed_at": Date().timeIntervalSince1970, "local_update": lastLocalUpdate.timeIntervalSince1970,
                                   "accessibility": accessibility, "apps": apps.map(\.name), "session_count": sessions.count,
                                   "accessibility_check": accessibilityCheckLabel,
@@ -991,10 +1065,13 @@ final class MonitorStore: ObservableObject {
                                   "app_version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown",
                                   "running": activeCount, "waiting": waitingCount, "interrupted": interruptedCount,
                                   "visible_rows": displaySessions.count, "background_transparency": transparency,
+                                  "workspace_conflicts": workspaceConflicts.count,
                                   "removed_sessions": removedSessions.count,
                                   "frost_level": frostLevel.label,
                                   "auto_continue_enabled": autoContinueEnabled,
                                   "auto_queue_insertion_enabled": autoQueueInsertionEnabled,
+                                  "reminder_popup_enabled": reminderPopupEnabled,
+                                  "reminder_sound_enabled": reminderSoundEnabled,
                                   "collector_restarts": collectorRestarts,
                                   "follow_up_armed": promptRules.followUps.count,
                                   "supervised_sessions": supervisedSessionIDs.count,
@@ -1008,8 +1085,49 @@ final class MonitorStore: ObservableObject {
                                   "continuation_status": recoverySummary,
                                   "unreadable_background_rows": sessions.filter { !$0.isReadable }.count,
                                   "errors": errors, "paused": paused]
-        if let data = try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys]) {
+        diagnosticWriter.submit(info)
+    }
+}
+
+/// Keep at most one pending receipt. Serialization and atomic disk writes never
+/// block AppKit tracking, and a slow disk cannot accumulate a snapshot backlog.
+final class HealthDiagnosticWriter {
+    private let queue = DispatchQueue(label: "radar.health", qos: .utility)
+    private let lock = NSLock()
+    private var pending: [String: Any]?
+    private var draining = false
+    private let write: (Data) -> Void
+
+    init(write: ((Data) -> Void)? = nil) {
+        self.write = write ?? { data in
+            let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/AgentRadar")
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             try? data.write(to: dir.appendingPathComponent("health.json"), options: .atomic)
+        }
+    }
+
+    func submit(_ info: [String: Any]) {
+        lock.lock()
+        pending = info
+        let start = !draining
+        draining = true
+        lock.unlock()
+        if start { queue.async { self.drain() } }
+    }
+
+    private func drain() {
+        while true {
+            lock.lock()
+            guard let info = pending else {
+                draining = false
+                lock.unlock()
+                return
+            }
+            pending = nil
+            lock.unlock()
+            if let data = try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys]) {
+                write(data)
+            }
         }
     }
 }

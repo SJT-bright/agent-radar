@@ -77,6 +77,19 @@ class StatusTests(unittest.TestCase):
             self.assertNotIn("private", json.dumps(cache.entries))
             self.assertEqual(_codex_status(history, tail, None)[0], "unknown")
 
+    def test_cold_window_ignores_task_started_mentions_in_outputs_and_partial_records(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "mentions.jsonl"
+            output = {"type": "response_item", "timestamp": 210, "payload": {
+                "type": "function_call_output", "output": "task_started " * 30_000}}
+            path.write_text(json.dumps(event("task_started", 200, turn_id="verified")) + "\n" +
+                            json.dumps(output) + "\n" +
+                            json.dumps(event("task_started", 220, turn_id="partial")))
+            cache = TailCache()
+            tail = cache.read(path, "codex")
+            self.assertEqual((tail["turn_id"], tail["started_at"]), ("verified", 200))
+            self.assertNotIn("output", json.dumps(cache.entries))
+
     def test_incremental_lifecycle_survives_tail_eviction_and_old_abort(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "append.jsonl"
@@ -181,6 +194,111 @@ class StatusTests(unittest.TestCase):
                 self.assertEqual(collector.collect(), [])
             self.assertEqual(list(root.iterdir()), [])
 
+    def test_progressive_backfill_recovers_long_unchanged_round_with_bounded_blocks(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "long.jsonl"
+            filler = json.dumps({"type": "response_item", "timestamp": 210,
+                "payload": {"type": "function_call_output", "call_id": "tool", "output": "x" * 600}}) + "\n"
+            path.write_text(json.dumps(event("task_started", 200, turn_id="new")) + "\n" + filler * 12)
+            cache = TailCache()
+            lengths = []
+            metadata = cache._metadata
+            def capture(raw, start, **kwargs):
+                lengths.append(len(raw))
+                return metadata(raw, start, **kwargs)
+            with patch("collector.codex_adapter.TAIL_BYTES", 256), \
+                 patch("collector.codex_adapter.CODEX_SCAN_BYTES", 2048), \
+                 patch.object(cache, "_metadata", side_effect=capture):
+                first = cache.read(path, "codex")
+                self.assertTrue(first["lifecycle_scan_incomplete"])
+                for _ in range(12):
+                    tail = cache.read(path, "codex")
+                    if tail.get("started_at"):
+                        break
+            self.assertEqual((tail["status"], tail["started_at"], tail["turn_id"]), ("running", 200, "new"))
+            self.assertNotIn("lifecycle_scan_incomplete", tail)
+            self.assertTrue(all(length <= 2048 for length in lengths))
+            self.assertEqual(cache.backfills, {})
+            self.assertNotIn("output", str(cache.entries))
+            self.assertEqual(_codex_status({}, tail, None)[0], "unknown")
+
+    def test_backfill_replays_waiting_answer_and_ignores_old_turn_terminal(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "requests.jsonl"
+            filler = json.dumps({"type": "response_item", "timestamp": 210,
+                "payload": {"type": "function_call_output", "call_id": "other", "output": "x" * 600}}) + "\n"
+            request = {"type": "response_item", "timestamp": 205, "payload": {
+                "type": "function_call", "name": "request_user_input", "call_id": "q", "arguments": "private question"}}
+            answer = {"type": "response_item", "timestamp": 220, "payload": {
+                "type": "function_call_output", "call_id": "q", "output": "private answer"}}
+            for answered in (False, True):
+                with self.subTest(answered=answered):
+                    path.write_text(json.dumps(event("task_started", 200, turn_id="new")) + "\n" +
+                        json.dumps(request) + "\n" + filler * 8 +
+                        (json.dumps(answer) + "\n" if answered else "") +
+                        json.dumps(event("turn_aborted", 230, turn_id="old")) + "\n")
+                    cache = TailCache()
+                    with patch("collector.codex_adapter.TAIL_BYTES", 256), patch("collector.codex_adapter.CODEX_SCAN_BYTES", 2048):
+                        for _ in range(12):
+                            tail = cache.read(path, "codex")
+                            if tail.get("started_at"):
+                                break
+                    self.assertEqual(tail["status"], "running" if answered else "waiting")
+                    self.assertEqual(tail["turn_id"], "new")
+                    self.assertNotIn("private", str(cache.backfills) + str(cache.entries))
+
+    def test_backfill_keeps_appended_terminal_and_resets_after_replacement(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "append.jsonl"
+            filler = json.dumps({"type": "response_item", "timestamp": 210,
+                "payload": {"type": "function_call_output", "output": "x" * 600}}) + "\n"
+            path.write_text(json.dumps(event("task_started", 200, turn_id="new")) + "\n" + filler * 8)
+            cache = TailCache()
+            with patch("collector.codex_adapter.TAIL_BYTES", 256), patch("collector.codex_adapter.CODEX_SCAN_BYTES", 2048):
+                cache.read(path, "codex")
+                with path.open("a") as stream:
+                    stream.write(json.dumps(event("task_complete", 230, turn_id="new")) + "\n")
+                for _ in range(12):
+                    tail = cache.read(path, "codex")
+                    if tail.get("started_at"):
+                        break
+                self.assertEqual((tail["status"], tail["ended_at"]), ("completed", 230))
+                path.write_text(json.dumps(event("task_started", 300, turn_id="replacement")) + "\n")
+                tail = cache.read(path, "codex")
+            self.assertEqual((tail["status"], tail["turn_id"]), ("running", "replacement"))
+            self.assertEqual(cache.backfills, {})
+
+    def test_backfill_metadata_budget_cannot_claim_unverified_running(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "budget.jsonl"
+            filler = json.dumps({"type": "response_item", "timestamp": 210,
+                "payload": {"type": "function_call_output", "call_id": "tool", "output": "x" * 200}}) + "\n"
+            path.write_text(json.dumps(event("task_started", 200, turn_id="new")) + "\n" + filler * 30)
+            cache = TailCache()
+            with patch("collector.codex_adapter.TAIL_BYTES", 256), \
+                 patch("collector.codex_adapter.CODEX_SCAN_BYTES", 2048), \
+                 patch("collector.codex_adapter.CODEX_METADATA_LIMIT", 2):
+                cache.read(path, "codex")
+                tail = cache.read(path, "codex")
+            self.assertEqual(_codex_status({}, tail, 22)[0], "unknown")
+            self.assertNotIn("started_at", tail)
+            self.assertEqual(cache.backfills, {})
+
+    def test_same_sized_rewrite_invalidates_cached_round(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "rewrite.jsonl"
+            first = json.dumps(event("task_started", 200, turn_id="old")) + "\n"
+            second = json.dumps(event("task_started", 300, turn_id="new")) + "\n"
+            self.assertEqual(len(first), len(second))
+            path.write_text(first)
+            cache = TailCache()
+            cache.read(path, "codex")
+            old_mtime = path.stat().st_mtime_ns
+            path.write_text(second)
+            os.utime(path, ns=(old_mtime + 1000000, old_mtime + 1000000))
+            tail = cache.read(path, "codex")
+            self.assertEqual((tail["turn_id"], tail["started_at"]), ("new", 300))
+
 
 class CollectorTests(unittest.TestCase):
     def setUp(self):
@@ -250,6 +368,13 @@ class CollectorTests(unittest.TestCase):
             with _readonly(missing): pass
         self.assertFalse(missing.exists())
 
+    def test_database_open_failure_returns_diagnostic_without_unbound_error(self):
+        for error in (OSError("private source path"), sqlite3.DatabaseError("private detail")):
+            with self.subTest(kind=type(error).__name__), \
+                 patch("collector.codex_adapter.sqlite3.connect", side_effect=error):
+                self.assertFalse(self.collector._read_threads_database(self.db))
+                self.assertEqual(self.collector._last_db_error, type(error).__name__)
+
     def test_coherent_new_round_clock_does_not_mix_old_history(self):
         self.add_thread(status="interrupted", updated=100)
         with sqlite3.connect(self.codex / "thread_history_1.sqlite") as con:
@@ -286,6 +411,20 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(len(rows), 20)
         self.assertEqual(rows[0]["id"], "codex:19")
         self.assertEqual(rows[1]["id"], "codex:18")
+
+    def test_internal_review_threads_cannot_evict_user_or_automation_threads(self):
+        for i in range(60):
+            self.add_thread(str(i), "completed", updated=i)
+        with sqlite3.connect(self.db) as con:
+            con.execute("ALTER TABLE threads ADD COLUMN thread_source TEXT")
+            con.execute("UPDATE threads SET thread_source='guardian_review' WHERE updated_at>=20")
+            con.execute("UPDATE threads SET thread_source='subagent' WHERE id='19'")
+            con.execute("UPDATE threads SET thread_source='user' WHERE id='18'")
+            con.execute("UPDATE threads SET thread_source='automation' WHERE id='17'")
+        with patch("collector.codex_adapter._codex_owners", return_value={}):
+            rows = self.collector._codex({})
+        self.assertEqual(len(rows), 19)
+        self.assertEqual([r["id"] for r in rows[:2]], ["codex:18", "codex:17"])
 
     def test_state_database_choice_is_numeric(self):
         for number in (9, 10):
@@ -332,15 +471,15 @@ class CollectorTests(unittest.TestCase):
         # 必须兜底出真实行，subagent/guardian_review 排除，时间线来自 thread_turns。
         (self.codex / "state_5.sqlite").unlink()
         now = time.time()
-        self.rollout("01a0fdcd-6806-7470-abfb-609fa29a6af0", "/projects/迁移期项目")
-        self.rollout("01a0fdce-0000-7470-abfb-609fa29a6af0", "/x", thread_source="subagent")
-        self.rollout("01a0fdcf-1111-7470-abfb-609fa29a6af0", "/x", thread_source="guardian_review")
+        self.rollout("ecc793cc-aaff-56c5-b399-865d5a506662", "/projects/迁移期项目")
+        self.rollout("7d5a1f26-d63a-576f-9aa4-0f1c9ee289a3", "/x", thread_source="subagent")
+        self.rollout("d8f370e5-d171-5afc-a837-3a2378b16991", "/x", thread_source="guardian_review")
         with sqlite3.connect(self.codex / "thread_history_1.sqlite") as con:
             con.execute("INSERT INTO thread_turns VALUES(?,?,?,?,?)",
-                        ("01a0fdcd-6806-7470-abfb-609fa29a6af0", "completed", now - 300, now - 60, 1))
+                        ("ecc793cc-aaff-56c5-b399-865d5a506662", "completed", now - 300, now - 60, 1))
         with patch("collector.codex_adapter._codex_owners", return_value={}):
             rows = self.collector._codex({})
-        self.assertEqual([r["id"] for r in rows], ["codex:01a0fdcd-6806-7470-abfb-609fa29a6af0"])
+        self.assertEqual([r["id"] for r in rows], ["codex:ecc793cc-aaff-56c5-b399-865d5a506662"])
         self.assertEqual(rows[0]["status"], "completed")
         self.assertEqual(rows[0]["project"], "/projects/迁移期项目")
         self.assertEqual(rows[0]["started_at"], now - 300)
@@ -351,7 +490,7 @@ class CollectorTests(unittest.TestCase):
     def test_migration_and_empty_fallback_degrades_previous_rows(self):
         # 兜底也为空（无 rollout）时保持既有降级：上次行以 unknown 展示并报错。
         (self.codex / "state_5.sqlite").unlink()
-        self.rollout("01a0fdcd-6806-7470-abfb-609fa29a6af0", "/projects/示例")
+        self.rollout("ecc793cc-aaff-56c5-b399-865d5a506662", "/projects/示例")
         with patch("collector.codex_adapter._codex_owners", return_value={"abc": 8}):
             first = self.collector._codex({8: {"app": "codex"}})
         self.assertEqual(first[0]["status"], "unknown")

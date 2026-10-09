@@ -72,6 +72,15 @@ struct RadarView: View {
             .contentShape(Rectangle())
             .contextMenu { controls }
             .help("拖动浮条")
+            .overlay(alignment: .topTrailing) {
+                if !store.workspaceConflicts.isEmpty {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 7)).foregroundStyle(.orange)
+                        .padding(.trailing, store.handleOnLeft ? 2 : 32).padding(.top, 2)
+                        .help("\(store.workspaceConflicts.count) 个工作文件夹存在多软件同时工作；展开查看感叹号")
+                        .allowsHitTesting(false)
+                }
+            }
             .shadow(color: .black.opacity(0.65), radius: 1.5, y: 1)
     }
 
@@ -83,6 +92,13 @@ struct RadarView: View {
                 if store.handleOnLeft { Color.clear.frame(width: 30, height: 30).allowsHitTesting(false) }
                 Image(systemName: "sparkles").font(.system(size: 12))
                 Text("任务雷达").font(.system(size: 12, weight: .semibold))
+                if !store.workspaceConflicts.isEmpty {
+                    Button { store.showWorkspaceConflicts() } label: {
+                        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                    }.buttonStyle(RadarButtonStyle())
+                        .help("\(store.workspaceConflicts.count) 个工作文件夹存在多软件同时工作；点击查看")
+                        .accessibilityLabel("同目录工作提醒，\(store.workspaceConflicts.count) 个文件夹")
+                }
                 Spacer(minLength: 0)
                 HoverSettingsMenu(store: store)
                     .frame(width: 30, height: 26)
@@ -258,10 +274,11 @@ struct RadarView: View {
     }
 }
 
-/// NSMenu provides native submenu tracking without stealing the panel's hover.
-/// Rebuild on every opening so status, removed conversations and checks are fresh.
+/// Rebuild the action model on opening; asynchronous panels render the menu
+/// without NSMenu's modal pointer tracking or a blocked hover-close path.
 private struct HoverSettingsMenu: NSViewRepresentable {
     let store: MonitorStore
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     func makeNSView(context: Context) -> HoverSettingsButton {
         let button = HoverSettingsButton()
@@ -271,8 +288,11 @@ private struct HoverSettingsMenu: NSViewRepresentable {
 
     func updateNSView(_ button: HoverSettingsButton, context: Context) { configure(button) }
 
+    static func dismantleNSView(_ button: HoverSettingsButton, coordinator: ()) { button.closeMenu() }
+
     private func configure(_ button: HoverSettingsButton) {
         button.isEnabled = store.expanded
+        button.reduceMotion = reduceMotion
         button.image = NSImage(systemSymbolName: store.errors.isEmpty ? "ellipsis" : "exclamationmark.circle",
                                accessibilityDescription: "设置")?
             .withSymbolConfiguration(.init(pointSize: 12, weight: .regular))
@@ -373,12 +393,36 @@ private final class SettingsActionItem: NSMenuItem {
     @objc private func invoke() { perform() }
 }
 
-private final class HoverSettingsButton: NSButton, NSMenuDelegate {
+final class HoverSettingsButton: NSButton {
     var makeMenu: (() -> NSMenu)?
     var trackingChanged: ((Bool) -> Void)?
+    var reduceMotion = false {
+        didSet {
+            if oldValue != reduceMotion { updateAppearance() }
+        }
+    }
+    override var isEnabled: Bool {
+        didSet {
+            if !isEnabled {
+                openGeneration += 1
+                pendingOpen?.cancel()
+                pendingOpen = nil
+                popover.close()
+            }
+            updateAppearance()
+            window?.invalidateCursorRects(for: self)
+        }
+    }
     private var hoverArea: NSTrackingArea?
     private var pendingOpen: DispatchWorkItem?
+    private var openGeneration = 0
     private var hoverState = SettingsMenuHoverState()
+    private var pointerHovered = false
+    private let popover = HoverSettingsPopover()
+    private var hoverProgress: CGFloat = 0
+    private var hoverTarget: CGFloat = 0
+    private var appearanceTimer: Timer?
+    private var previousAppearanceTick: TimeInterval = 0
 
     init() {
         super.init(frame: .zero)
@@ -388,15 +432,50 @@ private final class HoverSettingsButton: NSButton, NSMenuDelegate {
         bezelStyle = .regularSquare
         contentTintColor = .white.withAlphaComponent(0.78)
         wantsLayer = true
-        layer?.cornerRadius = 6
         target = self
         action = #selector(openFromClick)
         setAccessibilityLabel("设置")
         setAccessibilityHelp("悬停或点击打开任务雷达设置")
         setAccessibilityRole(.menuButton)
+        popover.didClose = { [weak self] in self?.finishTracking() }
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    // AppKit controls can rebuild their backing layers. Draw the affordance in
+    // the control itself so it cannot lose its size or sit behind that rebuild.
+    override var wantsUpdateLayer: Bool { false }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let reduced = reduceMotion || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let lift: CGFloat = reduced ? 0 : (isFlipped ? -1 : 1) * hoverProgress * 1.5
+        if hoverProgress > 0.001 {
+            let surface = NSBezierPath(roundedRect: bounds.insetBy(dx: 2, dy: 3).offsetBy(dx: 0, dy: lift),
+                                       xRadius: 6, yRadius: 6)
+            NSGraphicsContext.saveGraphicsState()
+            let shadow = NSShadow()
+            shadow.shadowColor = NSColor.black.withAlphaComponent(0.28 * hoverProgress)
+            shadow.shadowBlurRadius = 3
+            shadow.shadowOffset = NSSize(width: 0, height: -2)
+            shadow.set()
+            NSColor.white.withAlphaComponent(0.20 * hoverProgress).setFill()
+            surface.fill()
+            NSGraphicsContext.restoreGraphicsState()
+            NSColor.white.withAlphaComponent(0.58 * hoverProgress).setStroke()
+            surface.lineWidth = 0.8
+            surface.stroke()
+        }
+        NSGraphicsContext.saveGraphicsState()
+        let transform = AffineTransform(translationByX: 0, byY: lift)
+        (transform as NSAffineTransform).concat()
+        super.draw(dirtyRect)
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        if isEnabled { addCursorRect(bounds, cursor: .pointingHand) }
+    }
 
     override func updateTrackingAreas() {
         if let hoverArea { removeTrackingArea(hoverArea) }
@@ -412,21 +491,32 @@ private final class HoverSettingsButton: NSButton, NSMenuDelegate {
         guard isEnabled, hoverState.entered() else { return }
         // A short dwell prevents a pass through the header from opening settings.
         pendingOpen?.cancel()
+        openGeneration += 1
+        let generation = openGeneration
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.pointerInside else { return }
+            guard let self, self.openGeneration == generation, self.pointerInside else { return }
             self.openMenu()
         }
         pendingOpen = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: work)
     }
 
     override func mouseExited(with event: NSEvent) {
+        openGeneration += 1
         pendingOpen?.cancel()
         setHovered(false)
         hoverState.exited()
     }
 
-    @objc private func openFromClick() { openMenu(explicitClick: true) }
+    @objc private func openFromClick() {
+        if popover.isOpen { closeMenu() } else { openMenu(explicitClick: true) }
+    }
+
+    func closeMenu() {
+        openGeneration += 1
+        pendingOpen?.cancel(); pendingOpen = nil
+        popover.close()
+    }
 
     private func openMenu(explicitClick: Bool = false) {
         guard isEnabled, window != nil, let menu = makeMenu?(),
@@ -434,13 +524,10 @@ private final class HoverSettingsButton: NSButton, NSMenuDelegate {
         pendingOpen?.cancel()
         trackingChanged?(true)
         setHovered(true)
-        menu.delegate = self
-        menu.popUp(positioning: nil, at: NSPoint(x: bounds.minX, y: bounds.minY), in: self)
-        // Also handles a cancelled/empty popup for which no close delegate fires.
-        finishTracking()
+        popover.open(menu, from: self, reduceMotion: reduceMotion,
+                     keyboardInitiated: explicitClick && !pointerInside)
+        if !popover.isOpen { finishTracking() }
     }
-
-    func menuDidClose(_ menu: NSMenu) { finishTracking() }
 
     private func finishTracking() {
         guard hoverState.closed(pointerInside: pointerInside) else { return }
@@ -455,8 +542,47 @@ private final class HoverSettingsButton: NSButton, NSMenuDelegate {
     }
 
     private func setHovered(_ hovered: Bool) {
-        contentTintColor = .white.withAlphaComponent(hovered ? 1 : 0.78)
-        layer?.backgroundColor = NSColor.white.withAlphaComponent(hovered ? 0.14 : 0).cgColor
+        pointerHovered = hovered
+        updateAppearance()
+    }
+
+    private func updateAppearance() {
+        let active = isEnabled && (pointerHovered || hoverState.isOpen)
+        hoverTarget = active ? 1 : 0
+        if reduceMotion || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            appearanceTimer?.invalidate(); appearanceTimer = nil
+            hoverProgress = hoverTarget
+            updateDrawing()
+            return
+        }
+        guard abs(hoverProgress - hoverTarget) > 0.005 else { updateDrawing(); return }
+        guard appearanceTimer == nil else { return }
+        previousAppearanceTick = ProcessInfo.processInfo.systemUptime
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            let dt = min(0.05, max(0, now - self.previousAppearanceTick))
+            self.previousAppearanceTick = now
+            self.hoverProgress += (self.hoverTarget - self.hoverProgress) * CGFloat(1 - exp(-dt * 28))
+            if abs(self.hoverProgress - self.hoverTarget) < 0.005 {
+                self.hoverProgress = self.hoverTarget
+                self.appearanceTimer?.invalidate(); self.appearanceTimer = nil
+            }
+            self.updateDrawing()
+        }
+        appearanceTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func updateDrawing() {
+        contentTintColor = .white.withAlphaComponent(isEnabled ? 0.78 + 0.22 * hoverProgress : 0.4)
+        needsDisplay = true
+    }
+
+    deinit {
+        pendingOpen?.cancel()
+        appearanceTimer?.invalidate()
+        popover.close()
     }
 }
 
@@ -555,9 +681,19 @@ private struct ConversationCard: View {
                         .fixedSize()
                     if groupCount > 1 { Color.clear.frame(width: 29, height: 20) }
                 }
-                Text(session.title).font(.system(size: 11.5, weight: .medium))
-                    .lineLimit(1).frame(height: 16, alignment: .topLeading)
+                HStack(spacing: 4) {
+                    if let conflict = store.workspaceConflict(for: session) {
+                        WorkspaceConflictBadge(conflict: conflict)
+                    }
+                    Text(session.primaryDisplayName).font(.system(size: 11.5, weight: .semibold))
+                    .lineLimit(1).truncationMode(.middle).frame(height: 16, alignment: .topLeading)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                if let title = session.secondaryDisplayName {
+                    Text(title).font(.system(size: 9.5)).foregroundStyle(.white.opacity(0.72))
+                        .lineLimit(1).frame(height: 11, alignment: .topLeading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
                 TimelineView(.periodic(from: .now, by: 1)) { context in
                     let now = (store.pausedAt ?? context.date).timeIntervalSince1970
                     HStack(spacing: 4) {
@@ -590,7 +726,8 @@ private struct ConversationCard: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }.padding(.horizontal, 9).padding(.vertical, 3)
-                .frame(height: (session.status == "interrupted" || session.status == "stalled") ? 76 : 62)
+                .frame(height: ((session.status == "interrupted" || session.status == "stalled") ? 76 : 62)
+                    + (session.secondaryDisplayName == nil ? 0 : 14))
                 .shadow(color: .black.opacity(0.65), radius: 1.5, y: 1)
                 .background(RoundedRectangle(cornerRadius: 11)
                     .fill(.white.opacity(hovered ? 0.26 : 0.055)))
@@ -603,7 +740,7 @@ private struct ConversationCard: View {
             .shadow(color: .black.opacity(hovered ? 0.20 : 0), radius: hovered ? 5 : 0, y: hovered ? 4 : 0)
             .onHover { hovered = $0 }
             .animation(reduceMotion ? nil : .spring(response: 0.26, dampingFraction: 1), value: hovered)
-            .accessibilityLabel("\(session.app_name)：\(session.title)，\(session.statusLabel)")
+            .accessibilityLabel("\(session.app_name)：\(session.primaryDisplayName)，对话：\(session.title)，\(session.statusLabel)" + (store.workspaceConflict(for: session) == nil ? "" : "，警告：多个软件正在同一文件夹工作"))
             .overlay(alignment: .topTrailing) {
                 Button { store.showSessionDetails(session) } label: {
                     Color.clear.frame(width: 64, height: 26).contentShape(Rectangle())
@@ -641,7 +778,7 @@ private struct ConversationCard: View {
                         .contentShape(Rectangle())
                 }.buttonStyle(RadarButtonStyle())
                     .opacity(0.9)
-                    .padding(.trailing, 6).padding(.top, 42)
+                    .padding(.trailing, 6).padding(.top, session.secondaryDisplayName == nil ? 42 : 56)
                     .help("从雷达移除此会话；保留原聊天，可撤销")
                     .accessibilityLabel(session.app_name + "：从雷达移除会话")
             }
@@ -666,7 +803,7 @@ private struct ConversationCard: View {
                 Divider()
                 Button("从雷达移除会话", role: .destructive) { store.removeSession(session) }
             }
-            .help("\(session.title)\n\(session.statusLabel) · \(session.statusReason)\n\(session.timingExplanation)\n点击右上角状态可查看详情")
+            .help("\(session.displayIdentityDetail)\n\(session.statusLabel) · \(session.statusReason)\n\(session.timingExplanation)\n点击右上角状态可查看详情")
     }
 
     @ViewBuilder private var appIcon: some View {
@@ -693,11 +830,19 @@ private struct CompactConversationRow: View {
         Button { store.openSession(session) } label: {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
-                    Text(session.title).font(.system(size: 9.5, weight: .medium)).lineLimit(1)
+                    if let conflict = store.workspaceConflict(for: session) {
+                        WorkspaceConflictBadge(conflict: conflict)
+                    }
+                    Text(session.primaryDisplayName).font(.system(size: 10, weight: .semibold))
+                        .lineLimit(1).truncationMode(.middle)
                     Spacer(minLength: 2)
                     Circle().fill(statusColor).frame(width: 3, height: 3)
                     Text(session.statusLabel + " ⓘ").font(.system(size: 8, weight: .medium))
                         .foregroundStyle(statusColor).fixedSize()
+                }
+                if let title = session.secondaryDisplayName {
+                    Text(title).font(.system(size: 9)).foregroundStyle(.white.opacity(0.72))
+                        .lineLimit(1).frame(height: 12, alignment: .topLeading)
                 }
                 TimelineView(.periodic(from: .now, by: 1)) { context in
                     let now = (store.pausedAt ?? context.date).timeIntervalSince1970
@@ -723,7 +868,7 @@ private struct CompactConversationRow: View {
                         .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
                 }
             }.padding(.leading, 26).padding(.trailing, 9).padding(.vertical, 3)
-                .frame(height: showsReason ? 54 : 40)
+                .frame(height: (showsReason ? 54 : 40) + (session.secondaryDisplayName == nil ? 0 : 14))
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(RoundedRectangle(cornerRadius: 9).fill(.white.opacity(hovered ? 0.21 : 0.04)))
                 .overlay(alignment: .leading) {
@@ -736,7 +881,7 @@ private struct CompactConversationRow: View {
             .offset(y: hovered && !reduceMotion ? -1 : 0)
             .onHover { hovered = $0 }
             .animation(reduceMotion ? nil : .spring(response: 0.22, dampingFraction: 1), value: hovered)
-            .accessibilityLabel("\(session.app_name)：\(session.title)，\(session.statusLabel)")
+            .accessibilityLabel("\(session.app_name)：\(session.primaryDisplayName)，对话：\(session.title)，\(session.statusLabel)" + (store.workspaceConflict(for: session) == nil ? "" : "，警告：多个软件正在同一文件夹工作"))
             .overlay(alignment: .topTrailing) {
                 Button { store.showSessionDetails(session) } label: {
                     Color.clear.frame(width: 58, height: 19).contentShape(Rectangle())
@@ -776,6 +921,6 @@ private struct CompactConversationRow: View {
                 Divider()
                 Button("从雷达移除会话", role: .destructive) { store.removeSession(session) }
             }
-            .help("\(session.title)\n\(session.statusLabel) · \(session.statusReason)\n\(session.timingExplanation)\n点击右上角状态可查看详情")
+            .help("\(session.displayIdentityDetail)\n\(session.statusLabel) · \(session.statusReason)\n\(session.timingExplanation)\n点击右上角状态可查看详情")
     }
 }

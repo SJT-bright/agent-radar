@@ -19,7 +19,7 @@ final class RoundtripJudge: ContinuationSending {
         var now = 1_000_000_000.0
         let bridge = CaptureBridge()
         let defaults = UserDefaults(suiteName: "agentradar.request-roundtrip.\(UUID().uuidString)")!
-        let tested = ContinuationController(bridge: bridge, judgeBridge: RoundtripJudge(), clock: { now }, countDefaults: defaults)
+        let tested = ContinuationController(bridge: bridge, judgeBridge: RoundtripJudge(), clock: { now }, inputIdle: { 1000 }, countDefaults: defaults)
         var rules = PromptRules(); rules.completionMode = "rage"; rules.ragePrompt = "继续优化并验证"
         rules.rageAlternateEvery = 3; rules.rageAlternatePrompt = "以用户视角优化并验证"
         tested.rulesProvider = { rules }; tested.configure(enabled: true, paused: false)

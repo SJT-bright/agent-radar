@@ -1,6 +1,46 @@
 import AppKit
 import Foundation
 
+enum HardwareInputIdle {
+    static let requiredSeconds: Double = 2
+    // Match supervisor/winops: explicit HID input only, never all WindowServer events.
+    static var seconds: Double {
+        let kinds: [UInt32] = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 22, 25, 26, 27]
+        let values = kinds.map { CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: CGEventType(rawValue: $0)!) }
+        guard values.allSatisfy({ $0.isFinite && $0 >= 0 }) else { return 0 }
+        return values.min() ?? 0
+    }
+    static func remaining(_ idle: Double) -> Double {
+        guard idle.isFinite && idle >= 0 else { return requiredSeconds }
+        return max(0, requiredSeconds - idle)
+    }
+}
+
+struct RecoveryTiming: Equatable {
+    enum Phase { case scheduled, rateLimited, inputIdle, queue, operating, confirming }
+    var phase: Phase
+    var deadline: Double
+    func label(at now: Double, idleSeconds: Double) -> String {
+        let idle = Int(ceil(HardwareInputIdle.remaining(idleSeconds)))
+        let remaining = Int(ceil(max(0, deadline - now)))
+        switch phase {
+        case .rateLimited:
+            return remaining > 0 ? "限流后 \(remaining) 秒重新核验" : "限流等待结束，准备核验原会话"
+        case .scheduled, .inputIdle:
+            if remaining > 0 { return "\(remaining) 秒后准备操作电脑" }
+            if idle > 0 { return "键鼠静止倒计时：\(idle) 秒" }
+            return "倒计时 0 秒，准备核验原会话"
+        case .queue: return "排队等待前一项操作完成"
+        case .operating: return "正在操作电脑 · 已开始 \(max(0, Int(now - deadline))) 秒"
+        case .confirming: return remaining > 0 ? "等待会话响应：\(remaining) 秒" : "仍在等待会话响应，不重复发送"
+        }
+    }
+    func inputHint(idleSeconds: Double) -> String {
+        if phase == .confirming { return "已点击发送，正在确认新轮次" }
+        return "键鼠需连续静止 2 秒 · 当前还需 \(Int(ceil(HardwareInputIdle.remaining(idleSeconds)))) 秒"
+    }
+}
+
 struct ContinuationNotice {
     var title: String
     var conversation: String
@@ -12,6 +52,14 @@ struct ContinuationNotice {
     var recoveryKey: String? = nil
     var canRetry = false
     var isRecovering = false
+    var project = ""
+    var isWorkspaceConflict = false
+    var timing: RecoveryTiming? = nil
+    var primaryDisplayName: String { SessionRecord.folderName(for: project) ?? conversation }
+    var secondaryDisplayName: String? {
+        guard SessionRecord.folderName(for: project) != nil, !conversation.isEmpty, conversation != primaryDisplayName else { return nil }
+        return conversation
+    }
 }
 
 protocol ContinuationSending: AnyObject {
@@ -89,6 +137,9 @@ final class ContinuationController {
     private var successfulRageSends: [String: Int]
     private var supervisedIDs = Set<String>()
     private let clock: () -> Double
+    private let inputIdle: () -> Double
+    private var operationBeganAt: Double?
+    private var reportedTiming: [String: RecoveryTiming] = [:]
     private var rows: [SessionRecord] = []
     private var excludedIDs = Set<String>()
     private var lastFresh: Double?
@@ -107,10 +158,10 @@ final class ContinuationController {
     private var rules: PromptRules { rulesProvider?() ?? PromptRules() }
     private var fresh: Bool { lastFresh.map { clock() - $0 <= 15 } ?? false }
 
-    init(bridge: ContinuationSending = ContinuationBridge(), judgeBridge: ContinuationSending = ContinuationBridge(), clock: @escaping () -> Double = { Date().timeIntervalSince1970 }, countDefaults: UserDefaults = .standard) {
+    init(bridge: ContinuationSending = ContinuationBridge(), judgeBridge: ContinuationSending = ContinuationBridge(), clock: @escaping () -> Double = { Date().timeIntervalSince1970 }, inputIdle: @escaping () -> Double = { HardwareInputIdle.seconds }, countDefaults: UserDefaults = .standard) {
         // Keep judgeBridge in the initializer for existing callers, but never run answer judgement.
         _ = judgeBridge
-        self.bridge = bridge; self.clock = clock; self.countDefaults = countDefaults
+        self.bridge = bridge; self.clock = clock; self.inputIdle = inputIdle; self.countDefaults = countDefaults
         self.successfulRageSends = (countDefaults.dictionary(forKey: Self.rageSendCountsKey) ?? [:]).compactMapValues {
             guard let count = $0 as? Int, count >= 0 else { return nil }
             return count
@@ -123,7 +174,7 @@ final class ContinuationController {
         self.enabled = enabled
         monitoringBeganAt = enabled && !paused ? clock() : nil
         timer?.invalidate()
-        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
+        let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in self?.tick() }
         self.timer = timer
         RunLoop.main.add(timer, forMode: .common)
         checkReadiness()
@@ -195,7 +246,7 @@ final class ContinuationController {
         let included = sessions.filter { !excludedIDs.contains($0.id) }
         var events = policy.observe(included, now: now,
             interruptText: current.interruptText, rateLimitAllowed: current.rateLimitWakeEnabled,
-            rateLimitDelay: Double(current.rateLimitWaitMinutes) * 60, rateLimitText: current.rateLimitText,
+            rateLimitDelay: Double(current.rateLimitWaitSeconds), rateLimitText: current.rateLimitText,
             completionMode: current.completionMode, ragePrompt: current.ragePrompt, supervisedIDs: supervisedIDs)
         // A fresh ZCode lifecycle end can be committed between snapshots even
         // when its running row was briefly absent. It is a new monitored round
@@ -212,7 +263,7 @@ final class ContinuationController {
                 policy.observeConfirmedRound(row, now: now)
                 events += policy.observe([row], now: now,
                     interruptText: current.interruptText, rateLimitAllowed: current.rateLimitWakeEnabled,
-                    rateLimitDelay: Double(current.rateLimitWaitMinutes) * 60, rateLimitText: current.rateLimitText,
+                    rateLimitDelay: Double(current.rateLimitWaitSeconds), rateLimitText: current.rateLimitText,
                     completionMode: current.completionMode, ragePrompt: current.ragePrompt,
                     supervisedIDs: supervisedIDs)
             }
@@ -235,15 +286,19 @@ final class ContinuationController {
     private func discardQueued(_ matches: (ContinuationEvent) -> Bool, message: String) {
         let cancelled = queue.filter(matches)
         queue.removeAll(where: matches)
-        for event in cancelled where event.manual { notice(event, message, cancellable: false) }
+        for event in cancelled { notice(event, message, cancellable: false) }
+    }
+    private static func preparationDelay(_ seconds: Double) -> Double {
+        seconds.isFinite ? min(10, max(0, seconds)) : 10
     }
     private func enqueue(_ incoming: ContinuationEvent) {
         guard !attemptedKeys.contains(incoming.key), active?.key != incoming.key,
               !queue.contains(where: { $0.key == incoming.key }) else { return }
         var event = incoming
-        event.notBefore = clock() + max(0, event.delay)
+        event.notBefore = clock() + Self.preparationDelay(event.delay)
+        event.waitMessage = event.bypassRestriction ? "检测到限流，最多等待 10 秒后重新核验原会话" : (event.manual ? "已排定手动恢复" : "已排定恢复，发送前会再次核验会话")
         queue.append(event)
-        notice(event, event.manual ? "已排定手动恢复" : "已排定恢复，发送前会再次核验会话", cancellable: true)
+        notice(event, event.waitMessage, cancellable: true)
     }
     func startRageForCompleted() {
         guard enabled, !paused, fresh, rules.completionMode == "rage" else {
@@ -337,11 +392,29 @@ final class ContinuationController {
     }
     private func notice(_ event: ContinuationEvent, _ message: String, cancellable: Bool = true, permission: Bool = false) {
         lastResult = message; onSummary?(message)
-        let recovering = (active?.key == event.key && executing) || confirmations[event.key] != nil || queue.contains { $0.key == event.key && $0.manual }
+        let recovering = active?.key == event.key || confirmations[event.key] != nil || queue.contains { $0.key == event.key }
+        let timing = cancellable ? timing(for: event) : nil
+        if let timing = timing { reportedTiming[event.key] = timing } else { reportedTiming[event.key] = nil }
         onNotice?(ContinuationNotice(title: event.session.app_name + (event.kind == "completion" ? " · 完成待验收" : event.kind == "followup" ? " · 持续监督" : " · 中断恢复"),
             conversation: event.session.title, message: message, cancellable: cancellable,
             needsPermission: permission, isCompletion: event.kind == "completion", sessionID: event.session.id,
-            recoveryKey: event.key, canRetry: !recovering && retryAllowed(event), isRecovering: recovering))
+            recoveryKey: event.key, canRetry: !recovering && retryAllowed(event), isRecovering: recovering,
+            project: event.session.project, timing: timing))
+    }
+    private func timing(for event: ContinuationEvent) -> RecoveryTiming? {
+        if let pending = confirmations[event.key] { return RecoveryTiming(phase: .confirming, deadline: pending.until) }
+        if active?.key == event.key, executing { return RecoveryTiming(phase: .operating, deadline: operationBeganAt ?? clock()) }
+        guard let scheduled = queue.first(where: { $0.key == event.key }) ?? (active?.key == event.key ? active : nil) else { return nil }
+        let busy = (executing && active?.key != event.key) || bridge.isRunning
+        let phase: RecoveryTiming.Phase = busy ? .queue : (scheduled.notBefore <= clock() && HardwareInputIdle.remaining(inputIdle()) > 0 ? .inputIdle : (scheduled.bypassRestriction ? .rateLimited : .scheduled))
+        return RecoveryTiming(phase: phase, deadline: scheduled.notBefore)
+    }
+    private func updateWaitingNotices() {
+        let waiting = queue + (executing ? [] : active.map { [$0] } ?? [])
+        for event in waiting {
+            guard let state = timing(for: event), state != reportedTiming[event.key] else { continue }
+            notice(event, state.phase == .inputIdle ? "检测到键鼠操作，停用后会自动重新核验" : (event.waitMessage.isEmpty ? "已排定恢复，发送前会再次核验会话" : event.waitMessage))
+        }
     }
     private func discardConfirmations(_ matches: (ContinuationEvent) -> Bool, message: String) {
         let cancelled = confirmations.values.map { $0.event }.filter(matches)
@@ -390,7 +463,7 @@ final class ContinuationController {
     private func reportRecoveryDelays(at now: Double) {
         func overdue(_ event: ContinuationEvent) -> Bool {
             !event.manual && event.automationMode == "rage" && event.kind == "interrupt"
-                && !event.bypassRestriction && !event.recoveryDelayReported && now - event.detectedAt > 10
+                && !event.recoveryDelayReported && now - event.detectedAt > 10
         }
         if var event = active, executing, overdue(event) {
             event.recoveryDelayReported = true; active = event
@@ -412,6 +485,7 @@ final class ContinuationController {
         }
         confirmNewRound()
         reportRecoveryDelays(at: now)
+        updateWaitingNotices()
         guard !executing else { return }
         discardQueued({ now - $0.detectedAt > $0.patience }, message: "等待超过时限，本轮恢复已取消")
         if active == nil, !bridge.isRunning, let index = nextReadyIndex(at: now) {
@@ -433,6 +507,7 @@ final class ContinuationController {
         if let reason = restriction { finish(event, reason); return }
         if now - event.detectedAt > event.patience { finish(event, "等待超过时限，本轮恢复已取消"); return }
         guard !bridge.isRunning else { return }
+        guard HardwareInputIdle.remaining(inputIdle()) == 0 else { updateWaitingNotices(); return }
         if isAutomaticRageSend(event) {
             if event.kind == "followup" {
                 guard let text = nextRagePrompt(for: current) else {
@@ -444,7 +519,9 @@ final class ContinuationController {
         }
         event.session = current; active = event
         executing = true
+        operationBeganAt = now
         notice(event, "正在定位原会话并检查输入框…")
+        updateWaitingNotices()
         var request: [String: Any] = ["mode": "send", "id": current.id, "app_id": current.app_id,
             "title": current.title, "key": event.key, "target": current.target, "text": event.text,
             "project": current.project, "source": current.source,
@@ -485,26 +562,31 @@ final class ContinuationController {
                     deferred.recoveryDelayReported = self.active?.recoveryDelayReported ?? event.recoveryDelayReported
                     let fastInterrupt = event.automationMode == "rage" && event.kind == "interrupt" && !event.bypassRestriction
                     let fallback: Double = code == "permission_required" ? 15 : (fastInterrupt ? 1 : (code == "cooldown" ? 60 : 5))
-                    deferred.notBefore = self.clock() + max(1, retryAfter ?? fallback)
-                    if code == "cooldown" && event.automationMode == "rage" {
-                        deferred.patience = max(deferred.patience, deferred.notBefore - deferred.detectedAt + 600)
+                    deferred.notBefore = self.clock() + max(1, Self.preparationDelay(retryAfter ?? fallback))
+                    if code == "cooldown", let wait = retryAfter, !wait.isFinite || wait > 10 {
+                        self.finish(event, "恢复组件要求超过 10 秒的冷却，本轮已停止；请检查原会话")
+                        return
                     }
+                    deferred.waitMessage = Self.explain(code)
                     self.active = nil; self.queue.append(deferred)
-                    self.notice(event, Self.explain(code), permission: code == "permission_required")
+                    self.notice(deferred, deferred.waitMessage, permission: code == "permission_required")
                 }
             } else if !attempted && !event.manual && event.routeRetries < 3
                       && ["target_unverified", "app_unavailable", "search_unavailable", "search_result_missing",
-                          "header_unverified", "sidebar_target_missing", "tree_incomplete"].contains(code) {
+                          "header_unverified", "sidebar_target_missing", "tree_incomplete", "composer_unreadable"].contains(code) {
                 // 路由瞬态失败（标题自动改名、索引撕裂读、应用正在重启）
                 // 不再终止该轮恢复：有限次退避重试，持续失败仍然如实终局。
                 var deferred = self.active ?? event
                 deferred.routeRetries += 1
                 let fastInterrupt = event.automationMode == "rage" && event.kind == "interrupt" && !event.bypassRestriction
                 let fallback: Double = code == "app_unavailable" ? 20 : (fastInterrupt ? 1 : 5)
-                deferred.notBefore = self.clock() + max(1, retryAfter ?? fallback)
+                deferred.notBefore = self.clock() + max(1, Self.preparationDelay(retryAfter ?? fallback))
+                deferred.waitMessage = Self.explain(code) + "；稍后自动重试（\(deferred.routeRetries)/3）"
                 self.active = nil; self.queue.append(deferred)
-                self.notice(event, Self.explain(code) + "；稍后自动重试（\(deferred.routeRetries)/3）")
-            } else { self.finish(event, Self.explain(code)) }
+                self.notice(deferred, deferred.waitMessage)
+            } else { self.finish(event, code == "user_active" && attempted
+                ? "已输入文字后检测到键鼠操作，本轮已停止。请检查原会话；为避免重复发送，不自动重试"
+                : Self.explain(code)) }
         }
     }
     private func finish(_ event: ContinuationEvent, _ message: String) {
@@ -517,7 +599,7 @@ final class ContinuationController {
          "app_ui_unavailable": "目标应用界面报错或连接已断开，请先恢复该应用",
          "journal_capacity": "防重复会话记录已达容量，本轮保持未发送",
          "ready": "输入组件已就绪", "permission_required": "需要给「任务雷达」开启辅助功能；授权后会重新检查本轮状态",
-         "user_active": "你正在操作键盘鼠标，稍后再继续", "locked": "桌面已锁定或会话不可用，解锁后再继续",
+         "user_active": "检测到键鼠操作；请连续停用鼠标和键盘 2 秒，再核验恢复", "locked": "桌面已锁定或会话不可用，解锁后再继续",
          "draft_present": "本次请求未允许覆盖草稿，未发送", "input_changed": "输入回读不一致，已停止；请检查输入框",
          "composer_unreadable": "未找到唯一且可读取的对话输入框", "target_unverified": "无法核验对应会话，未输入文字",
          "session_title_ambiguous": "同一项目有多个同名会话，请先给目标会话改成唯一标题；未输入文字",

@@ -16,6 +16,7 @@ struct ContinuationEvent {
     var notBefore: Double = 0
     var recoveryDelayReported = false
     var routeRetries = 0
+    var waitMessage = ""
 }
 
 /// Only explicit lifecycle evidence arms automatic work. Historical rows are inert.
@@ -114,7 +115,7 @@ struct ContinuationPolicy {
     }
     mutating func observe(_ rows: [SessionRecord], now: Double,
                           interruptText: String = resumeText,
-                          rateLimitAllowed: Bool = false, rateLimitDelay: Double = 300,
+                          rateLimitAllowed: Bool = false, rateLimitDelay: Double = 10,
                           rateLimitText: String = "刚才被限流了，现在请继续",
                           followUps: [String: String] = [:],
                           completionMode: String = "collaboration", ragePrompt: String = "",
@@ -168,7 +169,7 @@ struct ContinuationPolicy {
             // A newly verified round is independently recoverable. The durable
             // bridge watermark still prevents a second send to the same round.
             // Rate limits retain their configured wait; speeding up cannot clear them.
-            let delay = rate ? rateLimitDelay : (rage ? 1 : 5)
+            let delay = rate ? min(10, max(1, rateLimitDelay.isFinite ? rateLimitDelay : 10)) : (rage ? 1 : 5)
             events.append(ContinuationEvent(session: row, key: Self.key(row), detectedAt: now,
                 canContinue: restriction == nil && !cooldown && (!rage || supervisedIDs.contains(row.id)),
                 explanation: (rage && !supervisedIDs.contains(row.id) ? "会话未标记监督，本轮只提醒" : nil) ?? restriction ?? (cooldown ? "本会话已触发恢复冷却，先检查连续失败原因" : "检测到本轮意外中断，即将返回原会话继续"),

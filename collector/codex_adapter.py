@@ -24,6 +24,7 @@ except ImportError:
 MAX_SESSIONS = 50
 TAIL_BYTES = 262_144
 CODEX_SCAN_BYTES = 8 * 1024 * 1024
+CODEX_METADATA_LIMIT = 4096
 
 
 def _timestamp(value: Any) -> float:
@@ -133,6 +134,110 @@ class TailCache:
         self.entries: dict[str, tuple[tuple, dict]] = {}
         self.offsets: dict[str, int] = {}
         self.pending: dict[str, dict[str, float]] = {}
+        self.backfills: dict[str, dict] = {}
+
+    @staticmethod
+    def _codex_event(state: dict, pending: dict, event: dict):
+        """Fold lifecycle metadata in file order, including answered requests."""
+        payload = event.get("payload", {})
+        if not isinstance(payload, dict):
+            return
+        stamp = _timestamp(event.get("timestamp"))
+        subtype, kind = payload.get("type"), event.get("type")
+        if kind == "event_msg":
+            states = {"task_started": "running", "task_complete": "completed",
+                      "turn_aborted": "interrupted", "task_failed": "interrupted",
+                      "exec_approval_request": "waiting",
+                      "apply_patch_approval_request": "waiting", "request_user_input": "waiting"}
+            if subtype in states:
+                turn, current_turn = payload.get("turn_id"), state.get("turn_id")
+                if subtype != "task_started" and turn and current_turn and turn != current_turn:
+                    return
+                state.update(status=states[subtype], state_at=stamp,
+                             event=subtype, turn_id=turn or current_turn)
+                if subtype == "task_started":
+                    state.pop("lifecycle_scan_incomplete", None)
+                    state["started_at"] = stamp
+                    state.pop("ended_at", None)
+                    state.pop("status_reason", None)
+                    pending.clear()
+                elif subtype in {"task_complete", "turn_aborted", "task_failed"}:
+                    state["ended_at"] = stamp
+                    if subtype != "task_complete":
+                        state["status_reason"] = payload.get("status_reason") or failure_reason(payload.get("error"), subtype)
+                    pending.clear()
+        elif kind == "response_item":
+            if subtype in {"function_call", "custom_tool_call"}:
+                if str(payload.get("name", "")).rsplit(".", 1)[-1] in {"request_user_input", "request_user_input_async"}:
+                    pending[str(payload.get("call_id"))] = stamp
+            elif subtype in {"function_call_output", "custom_tool_call_output"}:
+                pending.pop(str(payload.get("call_id")), None)
+                if not pending and state.get("event") == "request_user_input" and state.get("started_at"):
+                    state.update(status="running", event="task_started", state_at=state["started_at"])
+
+    @staticmethod
+    def _metadata(raw: bytes, start: int, skip_partial: bool | None = None) -> dict[int, dict]:
+        """Retain only small structural records, never prompts or tool output."""
+        records, offset = {}, start
+        for index, line in enumerate(raw.splitlines(keepends=True)):
+            position, offset = offset, offset + len(line)
+            if (index == 0 and (bool(start) if skip_partial is None else skip_partial)) or not line.endswith(b"\n") or len(line) > 65536:
+                continue
+            try:
+                event = json.loads(line)
+            except (ValueError, UnicodeError):
+                continue
+            if not isinstance(event, dict) or not isinstance(event.get("payload"), dict):
+                continue
+            kind, payload = event.get("type"), event["payload"]
+            subtype = payload.get("type")
+            if kind == "event_msg":
+                if subtype not in {"task_started", "task_complete", "turn_aborted", "task_failed",
+                                   "exec_approval_request", "apply_patch_approval_request", "request_user_input"}:
+                    continue
+            elif kind == "response_item":
+                if subtype in {"function_call", "custom_tool_call"}:
+                    if str(payload.get("name", "")).rsplit(".", 1)[-1] not in {"request_user_input", "request_user_input_async"}:
+                        continue
+                elif subtype not in {"function_call_output", "custom_tool_call_output"}:
+                    continue
+            else:
+                continue
+            metadata = {k: payload[k] for k in ("type", "turn_id", "call_id", "name") if k in payload}
+            if subtype in {"turn_aborted", "task_failed"}:
+                metadata["status_reason"] = failure_reason(payload.get("error"), subtype)
+            records[position] = {"type": kind, "timestamp": event.get("timestamp"), "payload": metadata}
+            if len(records) > CODEX_METADATA_LIMIT:
+                break  # The caller rejects an over-budget journal as unknown.
+        return records
+
+    def _backfill(self, key: str, stream, state: dict, pending: dict):
+        scan = self.backfills[key]
+        cursor = scan["cursor"]
+        # One older block per poll. Overlap recovers small lifecycle records
+        # crossing block boundaries; the complete read remains within 8 MiB.
+        overlap = min(65536, CODEX_SCAN_BYTES // 8)
+        start = max(0, cursor - CODEX_SCAN_BYTES + overlap * 2)
+        stream.seek(start)
+        raw = stream.read(cursor - start + overlap)
+        scan["events"].update(self._metadata(raw, start))
+        scan["cursor"] = start
+        if len(scan["events"]) > CODEX_METADATA_LIMIT:
+            self.backfills.pop(key)
+            return state, pending
+        starts = [offset for offset, event in scan["events"].items()
+                  if event["type"] == "event_msg" and event["payload"]["type"] == "task_started"]
+        if starts:
+            first = max(starts)
+            rebuilt, requests = {"updated_at": state.get("updated_at", 0)}, {}
+            for offset in sorted(scan["events"]):
+                if offset >= first:
+                    self._codex_event(rebuilt, requests, scan["events"][offset])
+            self.backfills.pop(key)
+            return rebuilt, requests
+        if not start:
+            self.backfills.pop(key)
+        return state, pending
 
     @staticmethod
     def _lines(raw: bytes, skip_partial: bool) -> list[bytes]:
@@ -152,11 +257,21 @@ class TailCache:
         # a recent file write. Cold reads remain bounded; warm reads are incremental.
         while True:
             found = False
-            for line in reversed(self._lines(raw, bool(start))):
-                if b"task_started" not in line:
+            cursor = len(raw)
+            while cursor:
+                marker = raw.rfind(b"task_started", 0, cursor)
+                if marker < 0:
+                    break
+                line_start = raw.rfind(b"\n", 0, marker) + 1
+                line_end = raw.find(b"\n", marker)
+                cursor = max(0, line_start - 1)
+                # Lifecycle metadata is small. Do not split/copy an entire
+                # expanding multi-MiB window just to inspect this one record.
+                if ((start and line_start == 0) or line_end < 0 or
+                        line_end - line_start > 65536):
                     continue
                 try:
-                    event = json.loads(line)
+                    event = json.loads(raw[line_start:line_end])
                 except (ValueError, UnicodeError):
                     continue
                 if (isinstance(event, dict) and event.get("type") == "event_msg"
@@ -176,13 +291,17 @@ class TailCache:
         try:
             stat = path.stat()
             signature = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
-            if key in self.entries and self.entries[key][0] == signature:
+            if key in self.entries and self.entries[key][0] == signature and key not in self.backfills:
                 return self.entries[key][1].copy()
             previous = self.entries.get(key)
             offset = self.offsets.get(key, 0)
             incremental = (app == "codex" and previous is not None
-                           and previous[0][0] == stat.st_ino and previous[0][1] < stat.st_size
+                           and previous[0][0] == stat.st_ino
+                           and (previous[0][1] < stat.st_size or previous[0] == signature)
                            and 0 <= stat.st_size - offset <= CODEX_SCAN_BYTES)
+            continuing_backfill = incremental and key in self.backfills
+            if not incremental:
+                self.backfills.pop(key, None)
             with path.open("rb") as stream:
                 if incremental:
                     start = offset
@@ -215,41 +334,7 @@ class TailCache:
                 state["updated_at"] = max(state["updated_at"], stamp)
                 kind = event.get("type")
                 if app == "codex":
-                    payload = event.get("payload")
-                    if not isinstance(payload, dict):
-                        continue
-                    subtype = payload.get("type")
-                    if kind == "event_msg":
-                        states = {"task_started": "running", "task_complete": "completed",
-                                  "turn_aborted": "interrupted", "task_failed": "interrupted",
-                                  "exec_approval_request": "waiting",
-                                  "apply_patch_approval_request": "waiting",
-                                  "request_user_input": "waiting"}
-                        if subtype in states:
-                            turn = payload.get("turn_id")
-                            current_turn = state.get("turn_id")
-                            if (subtype != "task_started" and turn and current_turn and turn != current_turn):
-                                continue  # A late old-turn abort cannot terminate the current turn.
-                            state.update(status=states[subtype], state_at=stamp,
-                                         event=subtype, turn_id=turn or current_turn)
-                            if subtype == "task_started":
-                                state.pop("lifecycle_scan_incomplete", None)
-                                state["started_at"] = stamp
-                                state.pop("ended_at", None)
-                                state.pop("status_reason", None)
-                                pending.clear()
-                            elif subtype in {"task_complete", "turn_aborted", "task_failed"}:
-                                state["ended_at"] = stamp
-                                if subtype != "task_complete":
-                                    state["status_reason"] = failure_reason(payload.get("error"), subtype)
-                                pending.clear()
-                    if kind == "response_item":
-                        if subtype in {"function_call", "custom_tool_call"}:
-                            name = str(payload.get("name", ""))
-                            if name.rsplit(".", 1)[-1] in {"request_user_input", "request_user_input_async"}:
-                                pending[str(payload.get("call_id"))] = stamp
-                        elif subtype in {"function_call_output", "custom_tool_call_output"}:
-                            pending.pop(str(payload.get("call_id")), None)
+                    self._codex_event(state, pending, event)
                 else:
                     if isinstance(event.get("cwd"), str):
                         state["project"] = event["cwd"]
@@ -266,6 +351,15 @@ class TailCache:
                     elif kind == "user" or (kind == "assistant" and stop == "tool_use"):
                         # A user message alone is not evidence of a live model run.
                         state.update(status="unknown", state_at=stamp, event=kind)
+            if app == "codex":
+                if not state.get("lifecycle_scan_incomplete"):
+                    self.backfills.pop(key, None)
+                elif key not in self.backfills and not incremental:
+                    self.backfills[key] = {"cursor": start, "events": self._metadata(complete, start)}
+                elif continuing_backfill:
+                    self.backfills[key]["events"].update(self._metadata(complete, start, skip_partial=False))
+                    with path.open("rb") as stream:
+                        state, pending = self._backfill(key, stream, state, pending)
             if pending:
                 pending_at = max(pending.values())
                 if pending_at >= state.get("state_at", 0):
@@ -275,6 +369,7 @@ class TailCache:
                 self.entries.pop(oldest)
                 self.offsets.pop(oldest, None)
                 self.pending.pop(oldest, None)
+                self.backfills.pop(oldest, None)
             self.pending[key] = pending
             self.entries[key] = (signature, state.copy())
             return state
@@ -372,7 +467,7 @@ class SessionCollector:
                     continue
                 self._last_db_error = type(error).__name__
                 return False
-            except (OSError, sqlite3.Error):
+            except (OSError, sqlite3.Error) as error:
                 self._last_db_error = type(error).__name__
                 return False
         return False
@@ -392,6 +487,8 @@ class SessionCollector:
             # LIMIT so background workers cannot evict visible conversations.
             main_tasks = (" AND (agent_path IS NULL OR agent_path='' OR agent_path='/root')"
                           if "agent_path" in columns else "")
+            if "thread_source" in columns:
+                main_tasks += " AND (thread_source IS NULL OR thread_source NOT IN ('subagent','guardian_review'))"
             rows = con.execute("SELECT " + ",".join(requested) +
                                " FROM threads WHERE archived=0" + main_tasks +
                                " ORDER BY updated_at DESC LIMIT ?",

@@ -52,6 +52,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var statusItem: NSStatusItem!
     private let store = MonitorStore()
     private let recoveryToast = ContinuationToast()
+    private var reminders: ReminderCoordinator?
     private var panelMotion: PanelMotion?
     private var motionTimer: Timer?
     private var motionAnchor = NSPoint.zero // control center X and panel top Y
@@ -97,19 +98,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                              y: savedY ?? screen.maxY - store.panelSize.height - 30)
         panel.setFrameOrigin(clamped(origin, size: panel.frame.size))
         store.onResize = { [weak self] expanded in self?.resize(expanded) }
-        store.onRecoveryNotice = { [weak self] notice in
-            guard let self = self else { return }
-            self.recoveryToast.show(notice, anchor: self.panel.frame,
-                                    cancel: { [weak self] in self?.store.cancelContinuation() },
-                                    permission: { [weak self] in self?.store.requestPermission() },
-                                    retry: { [weak self] sessionID, key in
-                                        self?.store.retryContinuation(sessionID: sessionID, key: key)
-                                    }, open: { [weak self] sessionID in
-                                        self?.store.openNoticeSession(sessionID: sessionID) ?? false
-                                    }, cancelRecovery: { [weak self] sessionID, key in
-                                        self?.store.cancelContinuation(sessionID: sessionID, key: key)
-                                    })
-        }
+        reminders = ReminderCoordinator(store: store, toast: recoveryToast,
+                                        anchor: { [weak self] in self?.panel.frame ?? .zero })
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
                                                object: nil, queue: .main) { [weak self] _ in
             self?.reclampPanelForScreenChange()
@@ -127,6 +117,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         RunLoop.main.add(timer, forMode: .common)
         if ProcessInfo.processInfo.arguments.contains(PermissionRestartPlan.recheckArgument) {
             store.beginPermissionRepair()
+        }
+        // An updater may preserve a user-paused monitor for this one launch.
+        // Consume before starting timers/collectors so no automatic action runs.
+        if UserDefaults.standard.bool(forKey: "restartPausedOnce.v1") {
+            UserDefaults.standard.removeObject(forKey: "restartPausedOnce.v1")
+            store.togglePause()
         }
         store.start()
         if ProcessInfo.processInfo.arguments.contains(PermissionRestartPlan.recheckArgument) {

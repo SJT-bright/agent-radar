@@ -32,7 +32,7 @@ private final class SupervisionHarness {
     init(marked: Set<String> = ["workbuddy:a"], mode: String = "rage", enabled: Bool = true,
          defaults: UserDefaults) {
         let c = clock, s = sender, j = judge, r = rules
-        controller = ContinuationController(bridge: s, judgeBridge: j, clock: { c.now }, countDefaults: defaults)
+        controller = ContinuationController(bridge: s, judgeBridge: j, clock: { c.now }, inputIdle: { 1000 }, countDefaults: defaults)
         r.value.completionMode = mode
         r.value.ragePrompt = "普通：继续优化"
         r.value.rageAlternateEvery = 3

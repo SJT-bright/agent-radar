@@ -51,12 +51,12 @@ import Foundation
         let suite = "local.agentradar.tests." + UUID().uuidString
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
-        let store = MonitorStore(defaults: defaults)
+        let store = MonitorStore(defaults: defaults, writeHealthDiagnostics: false)
         check(!store.autoContinueEnabled, "New installations default to reminders only")
         defaults.set(true, forKey: "autoContinueEnabled")
-        check(!MonitorStore(defaults: defaults).autoContinueEnabled, "Legacy default-on does not opt into draft replacement")
+        check(!MonitorStore(defaults: defaults, writeHealthDiagnostics: false).autoContinueEnabled, "Legacy default-on does not opt into draft replacement")
         store.setAutoContinue(true)
-        check(MonitorStore(defaults: defaults).autoContinueEnabled, "Explicit opt-in survives restart")
+        check(MonitorStore(defaults: defaults, writeHealthDiagnostics: false).autoContinueEnabled, "Explicit opt-in survives restart")
         store.setAutoContinue(false)
         let recovery = ContinuationController()
         var notices: [ContinuationNotice] = []
@@ -118,6 +118,24 @@ import Foundation
         check(store.sessions.contains(where: { $0.id == "test" }), "Unreadable tasks remain monitored in the background")
         store.sessions = [active, latest]
         check(store.displaySessions.isEmpty, "A newer unreadable task must not be replaced by an old completed task")
+        var uncertainCodex = active
+        uncertainCodex.app_id = "codex"
+        uncertainCodex.app_name = "Codex"
+        uncertainCodex.id = "codex:f9160256-f9b4-5a49-b6a2-1c558250176b"
+        uncertainCodex.target = "codex://threads/f9160256-f9b4-5a49-b6a2-1c558250176b"
+        uncertainCodex.project = "/projects/long-conversation"
+        store.apps.append(AppRecord(id: "codex", name: "Codex", bundleID: "com.openai.codex", pid: 43, path: ""))
+        store.sessions = [uncertainCodex]
+        check(store.displaySessions.map(\.id) == [uncertainCodex.id], "Verified Codex identity remains visible while lifecycle is unknown")
+        check(store.activeCount == 0 && store.ongoingSessions.isEmpty && !uncertainCodex.isReadable,
+              "Visible uncertainty cannot grant automation or invent an active task")
+        check(uncertainCodex.statusLabel == "待确认", "Unknown lifecycle must be stated explicitly")
+        store.removeSession(uncertainCodex)
+        check(store.displaySessions.isEmpty, "Unknown Codex respects explicit removal")
+        store.restoreSession(RemovedSession.key(for: uncertainCodex))
+        uncertainCodex.target = "codex://threads/different"
+        store.sessions = [uncertainCodex]
+        check(store.displaySessions.isEmpty, "Mismatched Codex identity cannot be displayed as verified")
         var unnamed = active
         unnamed.status = "running"
         unnamed.title = "Test · 会话待识别"
@@ -135,7 +153,7 @@ import Foundation
         check(store.visibleSessions.allSatisfy { $0.id != latest.id }, "Removal applies to alternate list too")
         check(store.sessions.contains(latest), "Removal preserves the observed source record")
         check(store.undoRemovalKey != nil, "Removal offers inline undo")
-        let reloaded = MonitorStore(defaults: defaults)
+        let reloaded = MonitorStore(defaults: defaults, writeHealthDiagnostics: false)
         reloaded.apps = store.apps
         reloaded.sessions = store.sessions
         check(reloaded.displaySessions.isEmpty && reloaded.isRemoved(latest), "Exclusion survives app restart")
@@ -146,7 +164,7 @@ import Foundation
         check(reloaded.isRemoved(renamed), "Stable source ID survives title/status changes")
         store.undoRemoval()
         check(store.displaySessions.map(\.id) == [latest.id] && store.undoRemovalKey == nil, "Undo restores the current record")
-        check(MonitorStore(defaults: defaults).removedSessions.isEmpty, "Restore persists immediately")
+        check(MonitorStore(defaults: defaults, writeHealthDiagnostics: false).removedSessions.isEmpty, "Restore persists immediately")
         active.status = "running"
         store.sessions = [active, secondActive]
         store.removeSession(active)

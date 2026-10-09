@@ -41,7 +41,7 @@ private final class FastCompletedJudge: ContinuationSending {
             var now = 10_000.0
             let bridge = FastFailureBridge(clock: { now })
             let defaults = freshDefaults()
-            let controller = ContinuationController(bridge: bridge, judgeBridge: FastCompletedJudge(), clock: { now }, countDefaults: defaults)
+            let controller = ContinuationController(bridge: bridge, judgeBridge: FastCompletedJudge(), clock: { now }, inputIdle: { 1000 }, countDefaults: defaults)
             var rules = PromptRules(); rules.completionMode = "rage"; rules.ragePrompt = "优化项目并验证"
             rules.interruptText = "不应被使用的自定义文本"
             controller.rulesProvider = { rules }
@@ -125,7 +125,7 @@ private final class FastCompletedJudge: ContinuationSending {
                 }
             }
             let bridge = FlakyRouteBridge(clock: { now }, failures: 2)
-            let controller = ContinuationController(bridge: bridge, judgeBridge: FastCompletedJudge(), clock: { now }, countDefaults: freshDefaults())
+            let controller = ContinuationController(bridge: bridge, judgeBridge: FastCompletedJudge(), clock: { now }, inputIdle: { 1000 }, countDefaults: freshDefaults())
             var rules = PromptRules(); rules.completionMode = "rage"
             controller.rulesProvider = { rules }
             controller.configure(enabled: true, paused: false)
@@ -148,7 +148,7 @@ private final class FastCompletedJudge: ContinuationSending {
             check(bridge.failuresLeft == 0, "route retries consumed transient failures")
 
             let stubborn = FlakyRouteBridge(clock: { now }, failures: 99)
-            let controller2 = ContinuationController(bridge: stubborn, judgeBridge: FastCompletedJudge(), clock: { now }, countDefaults: freshDefaults())
+            let controller2 = ContinuationController(bridge: stubborn, judgeBridge: FastCompletedJudge(), clock: { now }, inputIdle: { 1000 }, countDefaults: freshDefaults())
             controller2.rulesProvider = { rules }
             controller2.configure(enabled: true, paused: false)
             controller2.setSupervisedIDs(["grok:stubborn"])

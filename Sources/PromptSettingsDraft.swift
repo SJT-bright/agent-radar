@@ -2,9 +2,11 @@ import Foundation
 
 /// 全局设置页的待保存字段；即时生效的模式、会话规则由 MonitorStore 持有。
 struct PromptSettingsDraft: Equatable {
+    var reminderPopupEnabled: Bool
+    var reminderSoundEnabled: Bool
     var interruptText: String
     var rateLimitWakeEnabled: Bool
-    var rateLimitWaitMinutes: Int
+    var rateLimitWaitSeconds: Int
     var rateLimitText: String
     var ragePrompt: String
     var appRagePrompts: [String: String]
@@ -12,10 +14,12 @@ struct PromptSettingsDraft: Equatable {
     var rageAlternateEvery: Int
     var rageAlternatePrompt: String
 
-    init(rules: PromptRules) {
+    init(rules: PromptRules, reminderPopupEnabled: Bool = true, reminderSoundEnabled: Bool = true) {
+        self.reminderPopupEnabled = reminderPopupEnabled
+        self.reminderSoundEnabled = reminderSoundEnabled
         interruptText = rules.interruptText
         rateLimitWakeEnabled = rules.rateLimitWakeEnabled
-        rateLimitWaitMinutes = rules.rateLimitWaitMinutes
+        rateLimitWaitSeconds = rules.rateLimitWaitSeconds
         rateLimitText = rules.rateLimitText
         ragePrompt = rules.ragePrompt
         // 原样复制 override 字典：草稿只承载显式自定义，留空表示用通用。
@@ -25,12 +29,16 @@ struct PromptSettingsDraft: Equatable {
         rageAlternatePrompt = rules.rageAlternatePrompt
     }
 
-    func hasChanges(comparedTo rules: PromptRules) -> Bool {
+    func hasChanges(comparedTo rules: PromptRules, reminderPopupEnabled: Bool = true,
+                    reminderSoundEnabled: Bool = true) -> Bool {
+        if self.reminderPopupEnabled != reminderPopupEnabled || self.reminderSoundEnabled != reminderSoundEnabled {
+            return true
+        }
         // 标量字段比较编辑值（空白/控制字符等未保存修改保持可见）；
         // 字典键只比较本窗口显示/编辑过的应用——别的应用新出现的 override
         // 不会被保存抹掉，也就不该把未编辑的草稿标脏。
         if interruptText != rules.interruptText || rateLimitWakeEnabled != rules.rateLimitWakeEnabled ||
-            rateLimitWaitMinutes != rules.rateLimitWaitMinutes || rateLimitText != rules.rateLimitText ||
+            rateLimitWaitSeconds != rules.rateLimitWaitSeconds || rateLimitText != rules.rateLimitText ||
             ragePrompt != rules.ragePrompt || rageAlternateEvery != rules.rageAlternateEvery ||
             rageAlternatePrompt != rules.rageAlternatePrompt {
             return true
@@ -54,7 +62,7 @@ struct PromptSettingsDraft: Equatable {
         var result = current
         result.interruptText = interruptText
         result.rateLimitWakeEnabled = rateLimitWakeEnabled
-        result.rateLimitWaitMinutes = rateLimitWaitMinutes
+        result.rateLimitWaitSeconds = rateLimitWaitSeconds
         result.rateLimitText = rateLimitText
         result.ragePrompt = ragePrompt
         // 合并语义：草稿只承载用户在该窗口碰过的应用；未涉及的键原样保留，
@@ -97,8 +105,8 @@ struct PromptSettingsDraft: Equatable {
                 messages.append("\(prompt.label)为空或清理后为空，保存时会使用默认提示词。")
             }
         }
-        if !(1...60).contains(rateLimitWaitMinutes) {
-            messages.append("限流等待时间须为 1–60 分钟，保存时会调整到此范围。")
+        if !(1...10).contains(rateLimitWaitSeconds) {
+            messages.append("限流等待时间须为 1–10 秒，保存时会调整到此范围。")
         }
         if !(2...100).contains(rageAlternateEvery) {
             messages.append("特别提示词间隔须为 2–100 次，保存时会调整到此范围。")

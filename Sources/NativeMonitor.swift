@@ -33,6 +33,8 @@ final class NativeMonitor {
         "com.anthropic.claude": .init(id: "claude", name: "Claude"),
         "com.todesktop.230313mzl4w4u92": .init(id: "cursor", name: "Cursor"),
         "com.google.antigravity": .init(id: "antigravity", name: "Antigravity"),
+        // Google's native macOS app uses GeminiMacOS, not a browser/PWA id.
+        "com.google.geminimacos": .init(id: "gemini", name: "Gemini"),
         "cn.trae.solo.app": .init(id: "trae-solo-cn", name: "TRAE SOLO CN"),
         "com.trae.app": .init(id: "trae", name: "TRAE"),
         "cn.trae.app": .init(id: "trae-cn", name: "TRAE CN"),
@@ -77,6 +79,13 @@ final class NativeMonitor {
 
     private static let localAdapterIDs: Set<String> = ["codex", "zcode", "workbuddy", "workbuddy-ai", "autoclaw", "grok", "qoder", "qoder-cn", "cline"]
 
+    /// Exact bundle definitions take precedence over a localized application
+    /// name. Recognition discovers an app; it grants no conversation status.
+    static func knownApplication(bundleID: String, name: String) -> (id: String, name: String)? {
+        let definition = definitions[bundleID.lowercased()] ?? knownNames[name.lowercased()]
+        return definition.map { ($0.id, $0.name) }
+    }
+
     /// Metadata is a discovery hint only, never proof of an active conversation.
     static func hasAIMetadata(bundleID: String, name: String) -> Bool {
         guard !bundleID.lowercased().hasPrefix("com.apple.") else { return false }
@@ -115,7 +124,7 @@ final class NativeMonitor {
         // Reserve a small budget so existing integrations cannot starve discovery.
         let known = running.filter { application in
             let key = (application.bundleIdentifier ?? "").lowercased()
-            return Self.definitions[key] != nil || Self.knownNames[(application.localizedName ?? "").lowercased()] != nil
+            return Self.knownApplication(bundleID: key, name: application.localizedName ?? "") != nil
                 || Self.browserIDs.contains(key) || extras.contains(key) || discoveredBundles.contains(key)
                 || (application.activationPolicy == .regular && Self.hasAIMetadata(bundleID: key, name: application.localizedName ?? ""))
         }
@@ -132,15 +141,14 @@ final class NativeMonitor {
         for application in known + probes {
             guard let bundleID = application.bundleIdentifier, !bundleID.isEmpty else { continue }
             let bundleKey = bundleID.lowercased()
-            let nativeDefinition = Self.definitions[bundleKey]
-                ?? Self.knownNames[(application.localizedName ?? "").lowercased()]
+            let nativeDefinition = Self.knownApplication(bundleID: bundleKey, name: application.localizedName ?? "")
             let browser = Self.browserIDs.contains(bundleKey)
             let manuallyAdded = extras.contains(bundleKey)
             let probing = probeIDs.contains(bundleKey)
             // Helpers are not registered as separate AI applications unless explicitly added.
             guard application.activationPolicy != .prohibited || manuallyAdded else { continue }
 
-            let definition = nativeDefinition ?? Definition(
+            let definition = nativeDefinition.map { Definition(id: $0.id, name: $0.name) } ?? Definition(
                 id: browser ? "browser-\(bundleKey)" : "custom-\(bundleKey)",
                 name: application.localizedName ?? bundleID
             )
@@ -246,8 +254,7 @@ final class NativeMonitor {
         let candidates = NSWorkspace.shared.runningApplications
         let matchesApp: (NSRunningApplication) -> Bool = { app in
                 guard let bundle = app.bundleIdentifier else { return false }
-                return Self.definitions[bundle.lowercased()]?.id == session.app_id
-                    || Self.knownNames[(app.localizedName ?? "").lowercased()]?.id == session.app_id
+                return Self.knownApplication(bundleID: bundle, name: app.localizedName ?? "")?.id == session.app_id
                     || "custom-\(bundle.lowercased())" == session.app_id
                     || "browser-\(bundle.lowercased())" == session.app_id
                     || (session.app_id.hasPrefix("web-") && Self.browserIDs.contains(bundle.lowercased()))

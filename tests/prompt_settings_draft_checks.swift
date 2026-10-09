@@ -19,6 +19,23 @@ import Foundation
               "saving an unchanged draft does not create an override or cancel pending work")
         check(untouched.appRagePrompts["grok"] == nil,
               "an absent override is not shown as a filled field")
+        check(untouched.reminderPopupEnabled && untouched.reminderSoundEnabled,
+              "old settings drafts default to both popup and sound enabled")
+        let disabledReminders = PromptSettingsDraft(rules: original, reminderPopupEnabled: false,
+                                                   reminderSoundEnabled: false)
+        check(!disabledReminders.hasChanges(comparedTo: original, reminderPopupEnabled: false,
+                                           reminderSoundEnabled: false),
+              "loading saved disabled reminders does not mark the draft dirty")
+        check(disabledReminders.applying(to: original) == original,
+              "reminder preferences do not become continuation execution rules")
+        var soundOnly = disabledReminders
+        soundOnly.reminderSoundEnabled = true
+        check(soundOnly.hasChanges(comparedTo: original, reminderPopupEnabled: false,
+                                   reminderSoundEnabled: false) && !soundOnly.reminderPopupEnabled,
+              "sound can be enabled independently while popups remain disabled")
+        check(!soundOnly.hasChanges(comparedTo: original, reminderPopupEnabled: false,
+                                    reminderSoundEnabled: true),
+              "reloading a saved sound-only preference clears dirty state")
 
         var latest = original
         latest.completionMode = "rage"
@@ -48,9 +65,11 @@ import Foundation
         check(withResume.hasChanges(comparedTo: latest), "a per-app resume override is detected")
 
         let changes: [(String, (inout PromptSettingsDraft) -> Void)] = [
+            ("reminder popup", { $0.reminderPopupEnabled.toggle() }),
+            ("reminder sound", { $0.reminderSoundEnabled.toggle() }),
             ("interrupt text", { $0.interruptText = "新的中断提示词" }),
             ("rate-limit enabled", { $0.rateLimitWakeEnabled.toggle() }),
-            ("wait minutes", { $0.rateLimitWaitMinutes = 12 }),
+            ("wait seconds", { $0.rateLimitWaitSeconds = 8 }),
             ("rate-limit text", { $0.rateLimitText = "新的限流提示词" }),
             ("normal prompt", { $0.ragePrompt = "新的普通提示词" }),
             ("Grok prompt", { $0.appRagePrompts["grok"] = "新的 Grok 提示词" }),
@@ -70,7 +89,7 @@ import Foundation
         var edited = untouched
         edited.interruptText = "  恢复\u{0}工作  "
         edited.rateLimitWakeEnabled = true
-        edited.rateLimitWaitMinutes = 12
+        edited.rateLimitWaitSeconds = 8
         edited.rateLimitText = "稍后继续"
         edited.ragePrompt = "完成当前改进"
         edited.appRagePrompts = ["grok": "Grok 继续工作"]
@@ -86,7 +105,7 @@ import Foundation
         check(saved.appResumeTexts.isEmpty, "resume overrides absent from the draft stay absent on save")
         check(saved.interruptText == "恢复工作" && saved.rateLimitText == "稍后继续",
               "save normalizes edited interruption prompts")
-        check(saved.rateLimitWakeEnabled && saved.rateLimitWaitMinutes == 12,
+        check(saved.rateLimitWakeEnabled && saved.rateLimitWaitSeconds == 8,
               "save applies rate-limit controls")
         check(saved.ragePrompt == "完成当前改进" && saved.rageAlternateEvery == 5 &&
               saved.rageAlternatePrompt == "从用户角度走查", "save applies continuation settings")
@@ -160,14 +179,14 @@ import Foundation
               "an unkeepable grapheme uses the same normalized fallback as PromptRules")
 
         var bounds = untouched
-        bounds.rateLimitWaitMinutes = 0
+        bounds.rateLimitWaitSeconds = 0
         bounds.rageAlternateEvery = 1
         check(bounds.validationMessages.count == 2, "out-of-range numeric controls explain normalization")
-        check(bounds.applying(to: original).rateLimitWaitMinutes == 1 &&
+        check(bounds.applying(to: original).rateLimitWaitSeconds == 1 &&
               bounds.applying(to: original).rageAlternateEvery == 2, "numeric lower bounds match persisted rules")
-        bounds.rateLimitWaitMinutes = 61
+        bounds.rateLimitWaitSeconds = 61
         bounds.rageAlternateEvery = 101
-        check(bounds.applying(to: original).rateLimitWaitMinutes == 60 &&
+        check(bounds.applying(to: original).rateLimitWaitSeconds == 10 &&
               bounds.applying(to: original).rageAlternateEvery == 100, "numeric upper bounds match persisted rules")
 
         print("Prompt settings draft checks: \(count) passed")
