@@ -93,9 +93,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.contentView = NSHostingView(rootView: RadarView(store: store))
         let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let savedY = UserDefaults.standard.object(forKey: "panelY") as? Double
+        let savedTop = UserDefaults.standard.object(forKey: "panelTop.v1") as? Double
         // 胶囊与展开面板都贴屏幕最右缘：每次启动把右缘对齐可见区右缘。
         let origin = NSPoint(x: screen.maxX - store.panelSize.width,
-                             y: savedY ?? screen.maxY - store.panelSize.height - 30)
+                             y: savedTop.map { $0 - store.panelSize.height } ?? savedY ?? screen.maxY - store.panelSize.height - 30)
         panel.setFrameOrigin(clamped(origin, size: panel.frame.size))
         store.onResize = { [weak self] expanded in self?.resize(expanded) }
         reminders = ReminderCoordinator(store: store, toast: recoveryToast,
@@ -242,6 +243,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func savePosition() {
         UserDefaults.standard.set(panel.frame.origin.x, forKey: "panelX")
         UserDefaults.standard.set(panel.frame.origin.y, forKey: "panelY")
+        // A presentation-independent anchor prevents an expanded exit from
+        // shifting the compact window downward on the next launch.
+        UserDefaults.standard.set(panel.frame.maxY, forKey: "panelTop.v1")
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         showPanel()

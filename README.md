@@ -1,12 +1,12 @@
 # 任务雷达（Agent Radar）
 
-原生 macOS AI 任务悬浮窗。当前公开源码对应 **1.8.18（build 72）**。它从本机可读取的会话状态和窗口信息中显示当前对话、运行时间、完成与中断状态，不需要 AI API Key。
+原生 macOS AI 任务悬浮窗。当前公开源码对应 **1.8.19（build 73）**。它从本机可读取的会话状态和窗口信息中显示当前对话、运行时间、完成与中断状态，不需要 AI API Key。
 
 ## 下载
 
 [下载最新版 macOS 应用](https://github.com/SJT-bright/agent-radar/releases/latest)。将 ZIP 中的“任务雷达.app”放入 Applications，启动后按浮窗指引完成辅助功能授权，再点击“查询”复查。应用包面向 Apple Silicon、macOS 13+，使用本地代码签名，未做 Apple 公证。
 
-本版包含 Codex 长对话分块回溯与“待确认”显示、Gemini 原生应用发现、三点菜单悬停展开与离开收起，以及慢采集来源隔离和界面重复刷新优化。[更新记录](CHANGELOG.md) · [发布验证](docs/release-validation.md)
+1.8.19 修复展开浮窗退出后重启位置下移的问题，统一保存顶部锚点。当前版本包含 Codex 长对话分块回溯与“待确认”显示、Gemini 原生应用发现、三点菜单悬停展开与离开收起，以及慢采集来源隔离和界面重复刷新优化。[更新记录](CHANGELOG.md) · [发布验证](docs/release-validation.md)
 
 ## 功能
 
