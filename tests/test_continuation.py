@@ -141,6 +141,36 @@ class ContinuationTests(unittest.TestCase):
         with self.assertRaisesRegex(Blocked, 'already_attempted'):
             self.run_request()
 
+    def test_codex_empty_morph_control_prepares_then_requires_real_send(self):
+        self.request['app_id'] = 'codex'
+        original = self.backend.snapshot
+        def snapshot():
+            current = original()
+            current.update(send_exists=self.backend.writes > 0,
+                           send_enabled=self.backend.writes > 0,
+                           send_deferred=self.backend.writes == 0)
+            return current
+        self.backend.snapshot = snapshot
+        self.request['mode'] = 'check'
+        result = self.run_request()
+        self.assertTrue(result['send_deferred'])
+        self.assertEqual((self.backend.writes, self.backend.sends), (0, 0))
+        self.request['mode'] = 'send'
+        self.assertEqual(self.run_request()['code'], 'sent_pending_confirmation')
+        self.assertEqual((self.backend.writes, self.backend.sends), (1, 1))
+
+    def test_deferred_button_never_permits_send_without_enabled_control(self):
+        self.request['app_id'] = 'codex'
+        original = self.backend.snapshot
+        def snapshot():
+            current = original()
+            current.update(send_exists=False, send_enabled=False, send_deferred=True)
+            return current
+        self.backend.snapshot = snapshot
+        self.assertEqual(self.run_code()['code'], 'send_unavailable')
+        self.assertEqual((self.backend.writes, self.backend.sends), (1, 0))
+        self.assertEqual(self.run_code()['code'], 'already_attempted')
+
     def test_custom_text_replaces_message_for_write_and_readback(self):
         self.request['text'] = '  请从中断的那一步继续  '
         result = self.run_request()
@@ -1077,6 +1107,32 @@ class AXSelectionTests(unittest.TestCase):
         self.assertLess(now[0], 2.7)  # Two-second budget plus one in-flight AX read.
         self.assertEqual(len(cleared), 4)  # Clipboard restored even on timeout.
 
+    def test_codex_paste_waits_for_morph_and_accepts_only_equivalent_newlines(self):
+        b = self.backend('codex')
+        b.guard = lambda **_: None
+        b.inject = SimpleNamespace(hotkey=lambda _: None)
+        cleared = []
+        board = SimpleNamespace(pasteboardItems=lambda: [], clearContents=lambda: cleared.append(True),
+                                setString_forType_=lambda *_: None, changeCount=lambda: 1)
+        b.AppKit = SimpleNamespace(NSPasteboard=SimpleNamespace(generalPasteboard=lambda: board),
+                                   NSPasteboardTypeString='public.utf8-plain-text')
+        def snap(value, enabled):
+            return dict(identity=True, busy=False, input_count=1, value=value, send_enabled=enabled)
+        b.snapshot = Mock(side_effect=[snap('first\r\nsecond', False), snap('first\r\nsecond', True)])
+        with patch('supervisor.bridge.time.sleep'):
+            b.paste_verified('first\nsecond')
+        self.assertEqual(b.snapshot.call_count, 2)
+        self.assertEqual(len(cleared), 2)
+        # Readback succeeded but a disabled/missing send button never sends;
+        # this is a send-control failure, not a falsely reported paste failure.
+        now = [0.0]
+        b.snapshot = lambda: snap('first\nsecond', False)
+        with patch('supervisor.bridge.time.monotonic', side_effect=lambda: now[0]), \
+             patch('supervisor.bridge.time.sleep', side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds)):
+            with self.assertRaisesRegex(Blocked, 'send_unavailable'):
+                b.paste_verified('first\nsecond')
+        self.assertEqual(len(cleared), 4)
+
     def test_current_header_cannot_be_sidebar_or_transcript(self):
         b = self.backend()
         def heading(rect, label='正确会话'):
@@ -1102,6 +1158,81 @@ class AXSelectionTests(unittest.TestCase):
         self.assertEqual(b.snapshot()['value'], '输入“@”使用技能')
         nodes.append(send)
         self.assertFalse(b.snapshot()['send_exists'])
+
+    def test_codex_resume_or_voice_empty_composer_defers_without_pressing(self):
+        b = self.backend('codex')
+        layout = dict(role='AXGroup', rect=(310, 630, 900, 770),
+                      AXDOMClassList=['_ComposerLayoutBody_build_2'])
+        box = dict(role='AXTextArea', rect=(320, 650, 880, 710), AXValue='',
+                   AXDescription='与 Codex 协作', AXDOMClassList=['ProseMirror'], AXParent=layout)
+        header = dict(role='AXHeading', rect=(310, 70, 450, 100), AXValue=1, label=b.title)
+        control = dict(role='AXButton', rect=(850, 730, 880, 760), label='继续', AXParent=layout)
+        nodes = [(header, 'AXHeading'), (box, 'AXTextArea'), (control, 'AXButton')]
+        b.nodes = lambda: nodes
+        for label in ('继续', '开始语音聊天', 'Resume', 'Start voice chat'):
+            control['label'] = label
+            snap = b.snapshot()
+            self.assertTrue(snap['identity'])
+            self.assertTrue(snap['send_deferred'])
+            self.assertFalse(snap['send_exists'])
+        # A historical widget or side pane cannot provide the send/stop control.
+        outsider = dict(role='AXButton', rect=(850, 500, 880, 530), label='发送')
+        nodes.append((outsider, 'AXButton'))
+        self.assertTrue(b.snapshot()['send_deferred'])
+        outsider['label'] = '停止'
+        self.assertFalse(b.snapshot()['busy'])
+        nodes.pop()
+        secondary = dict(box, AXDescription='或自行撰写回复', AXParent=dict(layout,
+                         AXDOMClassList=['@container/request-card']))
+        nodes.append((secondary, 'AXTextArea'))
+        self.assertEqual(b.snapshot()['input_count'], 1)
+        self.assertTrue(b.snapshot()['send_deferred'])
+        nodes.pop()
+        # A draft, unknown editor signature, duplicate composer or ambiguous
+        # send controls cannot use this empty-editor compatibility path.
+        box['AXValue'] = 'private draft'
+        self.assertFalse(b.snapshot()['send_deferred'])
+        box['AXValue'] = ''
+        box['AXDOMClassList'] = ['unknown']
+        self.assertFalse(b.snapshot()['send_deferred'])
+        self.assertEqual(b.snapshot()['input_count'], 0)
+        box['AXDOMClassList'] = ['ProseMirror']
+        nodes.append((dict(box), 'AXTextArea'))
+        self.assertFalse(b.snapshot()['send_deferred'])
+        nodes.pop()
+        control['label'] = '发送'
+        nodes.append((dict(control), 'AXButton'))
+        self.assertFalse(b.snapshot()['send_deferred'])
+        self.assertFalse(b.snapshot()['send_exists'])
+
+    def test_codex_native_paste_updates_editor_without_axvalue(self):
+        b = self.backend('codex')
+        b.request['overwrite_draft'] = True
+        b.box = {'AXFocused': True}
+        b.guard = lambda **_: None
+        b.ax.set_attr = lambda *_: self.fail('Codex must use native editor paste')
+        value = ['original draft']
+        b.snapshot = lambda: dict(identity=True, busy=False, input_count=1,
+                                  value=value[0], send_enabled=value[0] == MESSAGE)
+        b.focus_composer = lambda: None
+        actions = []
+        b.inject = SimpleNamespace(hotkey=lambda key: actions.append(key))
+        b.paste_verified = lambda text: value.__setitem__(0, text)
+        b.write(MESSAGE)
+        self.assertEqual(value[0], MESSAGE)
+        self.assertEqual(actions, [0])
+
+    def test_codex_editor_replacement_cannot_fall_back_to_foreign_send(self):
+        b = self.backend('codex')
+        box = dict(role='AXTextArea', rect=(320, 650, 880, 710), AXValue='')
+        foreign = dict(role='AXButton', rect=(850, 500, 880, 530), label='发送')
+        b.nodes = lambda: [(box, 'AXTextArea'), (foreign, 'AXButton')]
+        b.codex_primary_composer = Mock(side_effect=[True, False])
+        snap = b.snapshot()
+        self.assertEqual(snap['input_count'], 0)
+        self.assertIsNone(snap['value'])
+        self.assertFalse(snap['send_exists'])
+        self.assertFalse(snap['send_deferred'])
 
     def test_workbuddy_replaces_draft_without_axvalue(self):
         b = self.backend('workbuddy-ai')

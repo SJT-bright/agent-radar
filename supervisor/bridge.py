@@ -32,6 +32,7 @@ GROK_SIDEBAR_AGE = re.compile(r'\s+(?:刚刚|现在|\d+\s*(?:秒钟|秒|分钟|�
 QODER_IDS = ('qoder', 'qoder-cn')
 CHAT_COMPOSER_HINTS = {'grok': {'消息输入框', '随心输入'},
                        'qoder': {'发送任务消息'}, 'qoder-cn': {'发送任务消息'}}
+CODEX_COMPOSER_HINTS = {'与 Codex 协作', 'Work with Codex'}
 ZCODE_SEARCH_PLACEHOLDERS = {'搜索操作、任务或文件', 'Search actions, tasks, or files'}
 ZCODE_COMPOSER_HINTS = {'提出后续修改要求', '继续输入以排队后续修改',
                         'Ask for follow-up changes', 'Keep typing to queue follow-up changes'}
@@ -234,9 +235,12 @@ def validate_snapshot(snapshot, expected=MESSAGE):
         raise Blocked('composer_unreadable')
     if expected is not None:
         # 回读侧统一换行归一化：部分 contenteditable 以 \r\n 报告 AXValue。
-        canon = lambda value: value.replace('\r\n', '\n').replace('\r', '\n')
-        if canon(snapshot['value']) != canon(expected):
+        if canonical_text(snapshot['value']) != canonical_text(expected):
             raise Blocked('draft_present' if not expected else 'input_changed')
+
+
+def canonical_text(value):
+    return value.replace('\r\n', '\n').replace('\r', '\n')
 
 
 def perform(request, backend, journal):
@@ -251,11 +255,14 @@ def perform(request, backend, journal):
     backend.guard(fresh=True)
     snapshot = backend.snapshot()
     validate_snapshot(snapshot, None if request.get('overwrite_draft') is True else '')
-    # Require the actual send control even before it becomes enabled.
-    if not snapshot.get('send_exists'):
+    # Codex replaces its empty composer's send control with Resume/voice.
+    # Only the known, empty primary editor may defer this check until paste.
+    deferred = request.get('app_id') == 'codex' and snapshot.get('send_deferred')
+    if not snapshot.get('send_exists') and not deferred:
         raise Blocked('send_unavailable')
     if request.get('mode') == 'check':
-        return {'code': 'ready', 'attempted': False}
+        return {'code': 'ready', 'attempted': False,
+                'send_deferred': bool(deferred)}
     backend.guard(fresh=True)
     # Guard and snapshot are repeated immediately before the first write.
     validate_snapshot(backend.snapshot(), snapshot['value'])
@@ -657,12 +664,13 @@ class MacBackend:
         current = self.snapshot()
         try:
             validate_snapshot(current, None)
-            code = 'ready' if current.get('send_exists') else 'send_unavailable'
+            code = 'ready' if current.get('send_exists') or current.get('send_deferred') else 'send_unavailable'
         except Blocked as error:
             code = str(error)
         return dict(code=code, attempted=False, identity=current['identity'],
                     input_count=current['input_count'], busy=current['busy'],
                     send_exists=current['send_exists'], send_enabled=current['send_enabled'],
+                    send_deferred=bool(current.get('send_deferred')),
                     empty_composer=current['value'] == '')
 
     def route(self):
@@ -681,7 +689,7 @@ class MacBackend:
                 raise Blocked('target_unverified')
             self.guard()
             self.AppKit.NSWorkspace.sharedWorkspace().openURL_(url)
-            nodes = self.navigation_nodes(0.6)
+            nodes = self.navigation_nodes(1.5 if self.request['app_id'] == 'codex' else 0.6)
         elif self.request['app_id'] == 'zcode':
             nodes = self.nodes()
             search_open = bool(self.search_boxes(nodes))
@@ -1012,12 +1020,13 @@ class MacBackend:
             nodes = self.nodes()
             remaining = deadline - time.monotonic()
             ready = self.current_identity(nodes)
-            if ready and self.request['app_id'] == 'zcode':
-                # ZCode renders the new header before its editor mounts.
+            if ready and self.request['app_id'] in ('zcode', 'codex'):
+                # Navigation may render a new header before its editor mounts.
                 # A matching title alone must not end the navigation wait.
                 current = self.snapshot(nodes)
                 ready = (current['identity'] and current['input_count'] == 1
-                         and current['value'] is not None and current['send_exists'])
+                         and current['value'] is not None
+                         and (current['send_exists'] or current.get('send_deferred')))
             if ready or remaining <= 0:
                 return nodes
             time.sleep(min(0.05, remaining))
@@ -1056,6 +1065,8 @@ class MacBackend:
                 if name in SEND_NAMES:
                     buttons.append(node)
             elif role in ('AXTextArea', 'AXTextField') or (role == 'AXGroup' and ax.role_description(node) in ('文本输入区', '文本编辑区', 'text entry area')):
+                if self.request['app_id'] == 'codex' and not self.codex_primary_composer(node):
+                    continue
                 if self.request['app_id'] == 'autoclaw' and not self.autoclaw_composer(node):
                     continue
                 if self.request['app_id'] == 'zcode' and not ZCODE_COMPOSER_HINTS.intersection(self.composer_hints(node)):
@@ -1067,6 +1078,18 @@ class MacBackend:
                     boxes.append(node)
         value = None
         self.box = boxes[0] if len(boxes) == 1 else None
+        codex_primary = (self.request['app_id'] == 'codex' and self.box is not None
+                         and self.codex_primary_composer(self.box))
+        if self.request['app_id'] == 'codex' and not codex_primary:
+            # A renderer replacement between reads invalidates the editor;
+            # never fall back to buttons elsewhere in the window.
+            boxes, buttons, self.box = [], [], None
+        if codex_primary:
+            layout = ax.get_attr(self.box, 'AXParent')
+            buttons = [node for node in buttons if self.in_codex_layout(node, layout)]
+            busy = any(role == 'AXButton' and self.label(node).lower() in STOP_NAMES
+                       and ax.enabled(node) and self.in_codex_layout(node, layout)
+                       for node, role in nodes)
         self.send_button = buttons[0] if len(buttons) == 1 else None
         if self.box is not None:
             err, raw = ax.get(self.box, 'AXValue')
@@ -1077,9 +1100,48 @@ class MacBackend:
                 placeholder = ax.placeholder(self.box)
                 if placeholder and value == placeholder:
                     value = ''
+        deferred = bool(codex_primary and value == '' and not buttons)
         return dict(identity=self.current_identity(nodes), input_count=len(boxes), value=value,
                     busy=busy, send_exists=self.send_button is not None,
+                    send_deferred=deferred,
                     send_enabled=self.send_button is not None and ax.enabled(self.send_button))
+
+    def in_codex_layout(self, node, layout):
+        # Scope submit/stop controls to this primary composer, not a transcript
+        # widget, another pane or a queued message's action.
+        rect = self.ax.rect_of(node)
+        if not rect or rect[2] - rect[0] < 10 or rect[3] - rect[1] < 10:
+            return False
+        for _ in range(8):
+            node = self.ax.get_attr(node, 'AXParent')
+            if node is None:
+                return False
+            if node == layout:
+                return True
+        return False
+
+    def codex_primary_composer(self, node):
+        # Observed native AX signature, bounded to the editor's direct layout
+        # parent. Never use a search/comment editor or an arbitrary empty field.
+        ax = self.ax
+        classes = ax.get_attr(node, 'AXDOMClassList', []) or []
+        if (ax.role(node) != 'AXTextArea' or isinstance(classes, str)
+                or 'ProseMirror' not in classes
+                or not CODEX_COMPOSER_HINTS.intersection(self.composer_hints(node))):
+            return False
+        parent = ax.get_attr(node, 'AXParent')
+        if parent is None or ax.role(parent) != 'AXGroup':
+            return False
+        parent_classes = ax.get_attr(parent, 'AXDOMClassList', []) or []
+        editor_rect, parent_rect = ax.rect_of(node), ax.rect_of(parent)
+        left, top, right, bottom = self.window.rect
+        return (not isinstance(parent_classes, str)
+                and any(str(c).startswith('_ComposerLayoutBody_') for c in parent_classes)
+                and editor_rect is not None and parent_rect is not None
+                and left <= parent_rect[0] < parent_rect[2] <= right
+                and top <= parent_rect[1] < parent_rect[3] <= bottom
+                and parent_rect[0] <= editor_rect[0] < editor_rect[2] <= parent_rect[2]
+                and parent_rect[1] <= editor_rect[1] < editor_rect[3] <= parent_rect[3])
 
     def autoclaw_composer(self, node):
         # Goal review forms can expose many editable textareas. Only the actual
@@ -1100,22 +1162,17 @@ class MacBackend:
         self.did_write = True
         # WorkBuddy's contenteditable accepts AXValue visually but does not
         # notify its editor model. Always use real paste for these editions.
-        if self.request.get('app_id') not in ('workbuddy', 'workbuddy-ai', 'grok', 'zcode'):
+        if self.request.get('app_id') not in ('codex', 'workbuddy', 'workbuddy-ai', 'grok', 'zcode'):
             self.ax.set_attr(self.box, 'AXValue', message)
             time.sleep(0.2)
         snapshot = self.snapshot()
         validate_snapshot(snapshot, None)
 
-        def normalized(text):
-            # 部分 contenteditable 以 \r\n 回读；两侧归一化后再比较，
-            # 不影响防篡改语义（其余差异仍然失败）。
-            return text.replace('\r\n', '\n').replace('\r', '\n')
-
-        if normalized(snapshot['value']) == normalized(message) and snapshot.get('send_enabled'):
+        if canonical_text(snapshot['value']) == canonical_text(message) and snapshot.get('send_enabled'):
             return
         # Electron editors may reject AXValue or accept it without updating
         # React state. Replace the verified editor selection using native paste.
-        if normalized(snapshot['value']) not in (normalized(original['value']), normalized(message)):
+        if canonical_text(snapshot['value']) not in (canonical_text(original['value']), canonical_text(message)):
             raise Blocked('input_changed')
         self.guard(fresh=True, after_write=True)
         self.focus_composer()
@@ -1162,11 +1219,12 @@ class MacBackend:
                 self.guard(after_write=True)
                 current = self.snapshot()
                 validate_snapshot(current, None)
-                if current['value'] == message and current.get('send_enabled'):
+                matched = canonical_text(current['value']) == canonical_text(message)
+                if matched and current.get('send_enabled'):
                     return
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise Blocked('input_failed')
+                    raise Blocked('send_unavailable' if matched else 'input_failed')
                 time.sleep(min(0.05, remaining))
         finally:
             if pb.changeCount() == count:
