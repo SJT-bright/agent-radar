@@ -1100,6 +1100,8 @@ class MacBackend:
                 placeholder = ax.placeholder(self.box)
                 if placeholder and value == placeholder:
                     value = ''
+                elif codex_primary and self.codex_exported_placeholder(self.box, value):
+                    value = ''
         deferred = bool(codex_primary and value == '' and not buttons)
         return dict(identity=self.current_identity(nodes), input_count=len(boxes), value=value,
                     busy=busy, send_exists=self.send_button is not None,
@@ -1118,6 +1120,30 @@ class MacBackend:
                 return False
             if node == layout:
                 return True
+        return False
+
+    def codex_exported_placeholder(self, node, value):
+        # Codex's empty ProseMirror exports its placeholder text plus a newline
+        # as AXValue, without AXPlaceholderValue. Require the observed empty
+        # child tree so a real draft containing the same words stays a draft.
+        hint = str(self.ax.get_attr(node, 'AXDescription', '') or '').strip()
+        if hint not in CODEX_COMPOSER_HINTS or canonical_text(value) not in (hint, hint + '\n'):
+            return False
+        children = self.ax.get_attr(node, 'AXChildren', []) or []
+        for depth, role in enumerate(('AXGroup', 'AXGroup', 'AXStaticText')):
+            if len(children) != 1:
+                return False
+            child = children[0]
+            if self.ax.role(child) != role:
+                return False
+            if depth == 0:
+                classes = self.ax.get_attr(child, 'AXDOMClassList', []) or []
+                if isinstance(classes, str) or 'placeholder' not in classes:
+                    return False
+            if depth == 2:
+                return (self.ax.get_attr(child, 'AXValue') == hint
+                        and not self.ax.get_attr(child, 'AXChildren', []))
+            children = self.ax.get_attr(child, 'AXChildren', []) or []
         return False
 
     def codex_primary_composer(self, node):

@@ -1205,6 +1205,46 @@ class AXSelectionTests(unittest.TestCase):
         self.assertFalse(b.snapshot()['send_deferred'])
         self.assertFalse(b.snapshot()['send_exists'])
 
+    def test_codex_exported_placeholder_requires_empty_dom_structure(self):
+        b = self.backend('codex')
+        layout = dict(role='AXGroup', rect=(310, 630, 900, 770),
+                      AXDOMClassList=['_ComposerLayoutBody_build_2'])
+        leaf = dict(role='AXStaticText', AXValue='与 Codex 协作')
+        middle = dict(role='AXGroup', AXChildren=[leaf])
+        placeholder = dict(role='AXGroup', AXDOMClassList=['placeholder'], AXChildren=[middle])
+        box = dict(role='AXTextArea', rect=(320, 650, 880, 710), AXValue='与 Codex 协作\n',
+                   AXDescription='与 Codex 协作', AXDOMClassList=['ProseMirror'],
+                   AXParent=layout, AXChildren=[placeholder])
+        header = dict(role='AXHeading', rect=(310, 70, 450, 100), AXValue=1, label=b.title)
+        b.nodes = lambda: [(header, 'AXHeading'), (box, 'AXTextArea')]
+        for hint in ('与 Codex 协作', 'Work with Codex'):
+            box['AXDescription'] = leaf['AXValue'] = hint
+            for ending in ('', '\n', '\r\n'):
+                box['AXValue'] = hint + ending
+                snap = b.snapshot()
+                self.assertEqual(snap['value'], '')
+                self.assertTrue(snap['send_deferred'])
+        # Matching text alone is not evidence that the editor is empty.
+        box['AXChildren'] = []
+        self.assertEqual(b.snapshot()['value'], 'Work with Codex\r\n')
+        self.assertFalse(b.snapshot()['send_deferred'])
+        box['AXChildren'] = [placeholder]
+        for classes in ([], ['draft'], 'placeholder'):
+            placeholder['AXDOMClassList'] = classes
+            self.assertFalse(b.snapshot()['send_deferred'])
+        placeholder['AXDOMClassList'] = ['placeholder']
+        for target in (box, placeholder, middle):
+            original = target['AXChildren']
+            target['AXChildren'] = original + [dict(role='AXStaticText', AXValue='draft')]
+            self.assertFalse(b.snapshot()['send_deferred'])
+            target['AXChildren'] = original
+        leaf['AXValue'] = 'draft'
+        self.assertFalse(b.snapshot()['send_deferred'])
+        leaf['AXValue'] = 'Work with Codex'
+        for value in ('Work with Codex\nmore', 'Work with Codex\n\n', ' Work with Codex\n'):
+            box['AXValue'] = value
+            self.assertFalse(b.snapshot()['send_deferred'])
+
     def test_codex_native_paste_updates_editor_without_axvalue(self):
         b = self.backend('codex')
         b.request['overwrite_draft'] = True
