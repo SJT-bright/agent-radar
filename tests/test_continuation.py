@@ -234,13 +234,13 @@ class ContinuationTests(unittest.TestCase):
             self.assertEqual(self.backend.value, MESSAGE)
             self.assertEqual((self.backend.writes, self.backend.sends), (1, 1))
 
-    def test_new_queue_promotion_is_a_successful_single_send(self):
+    def test_send_receipt_never_reports_queue_promotion(self):
         original_send = self.backend.send
         def promoted_send():
             original_send()
             self.backend.queue_promoted = True
         self.backend.send = promoted_send
-        self.assertEqual(self.run_request(), {'code': 'sent_queued_promoted', 'attempted': True})
+        self.assertEqual(self.run_request(), {'code': 'sent_pending_confirmation', 'attempted': True})
         self.assertEqual(self.backend.sends, 1)
         with self.assertRaisesRegex(Blocked, 'already_attempted'):
             self.run_request()
@@ -995,7 +995,7 @@ class AXSelectionTests(unittest.TestCase):
         self.assertEqual(actions.count(9), 1)
         self.assertEqual(actions[-1], ('restore', True))
 
-    def test_send_promotes_only_one_new_queue_control(self):
+    def test_send_leaves_a_new_queue_control_in_arrival_order(self):
         b = self.backend('zcode')
         presses = []
         b.send_button = {'label': '发送'}
@@ -1007,8 +1007,8 @@ class AXSelectionTests(unittest.TestCase):
         calls = [before, after]
         b.nodes = lambda: calls.pop(0)
         b.send()
-        self.assertEqual(presses, ['发送', '插队'])
-        self.assertTrue(b.queue_promoted)
+        self.assertEqual(presses, ['发送'])
+        self.assertFalse(b.queue_promoted)
 
     def test_send_leaves_existing_or_ambiguous_queue_untouched(self):
         for before, after in [

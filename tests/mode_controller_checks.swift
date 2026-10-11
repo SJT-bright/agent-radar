@@ -199,21 +199,24 @@ final class CompletedAnswerJudge: ContinuationSending {
                 && notices.last?.cancellable == false, "queued manual exits busy on " + cancellation)
         }
         do {
-            // An unconfirmed send must never block a different interrupted chat.
+            // The desktop lane stays with the first item through confirmation.
             let (c, b) = setup()
             let running = [row("0"), row("1"), row("2")]
             c.observe(running, fresh: true)
             let stopped = [row("0", "interrupted"), row("1", "interrupted"), row("2", "interrupted")]
             c.observe(stopped, fresh: true)
             for _ in 0..<3 { now += 1; c.tick() }
-            check(b.requests.count == 3, "three interruptions dispatch within three seconds without confirmation blocking")
-            check(c.pendingSessionIDs.count == 3, "three sent rounds confirm independently")
+            check(b.requests.count == 1, "later interruptions wait for the first response")
+            check(c.pendingSessionIDs.count == 3, "confirmation and queued rounds remain visible")
             var refreshed = stopped
             refreshed[0] = row("0", "running", start: now)
             c.observe(refreshed, fresh: true)
+            check(b.requests.count == 2 && b.requests.last?["id"] as? String == "workbuddy:1", "response releases exactly the next FIFO item")
             check(c.pendingSessionIDs == ["workbuddy:1", "workbuddy:2"], "new-round receipt clears only its own confirmation")
             c.cancelCurrent(sessionID: "workbuddy:1", key: ContinuationPolicy.key(stopped[1]))
             check(c.pendingSessionIDs == ["workbuddy:2"], "targeted cancel preserves other confirmations")
+            c.tick()
+            check(b.requests.count == 3 && b.requests.last?["id"] as? String == "workbuddy:2", "cancelled confirmation releases its lane")
             c.configure(enabled: false, paused: false)
             check(c.pendingSessionIDs.isEmpty && b.requests.count == 3, "configuration clears pending confirmations without resending")
         }
@@ -225,9 +228,11 @@ final class CompletedAnswerJudge: ContinuationSending {
             now += 4
             c.observe([row("0", "completed"), row("1", "interrupted")], fresh: true)
             now += 1; c.tick()
-            check(b.requests.count == 1 && b.requests[0]["id"] as? String == "workbuddy:1", "ready interruption precedes older completed optimization")
+            check(b.requests.count == 1 && b.requests[0]["id"] as? String == "workbuddy:0", "older completion keeps its position before an interruption")
             now += 1; c.tick()
-            check(b.requests.count == 2 && b.requests[1]["id"] as? String == "workbuddy:0", "optimization follows without waiting for interruption receipt")
+            check(b.requests.count == 1, "later interruption waits for completion send receipt")
+            c.observe([row("0", "running", start: now), row("1", "interrupted")], fresh: true)
+            check(b.requests.count == 2 && b.requests[1]["id"] as? String == "workbuddy:1", "confirmed response releases the later interruption")
         }
         do {
             let (c, b) = setup()

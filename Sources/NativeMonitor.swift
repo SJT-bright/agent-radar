@@ -264,9 +264,9 @@ final class NativeMonitor {
             ?? (session.app_id.hasPrefix("web-") ? nil : candidates.first(where: matchesApp))
         guard let application else { completion?(.unavailable); return }
         let activated = application.activate(options: [.activateAllWindows])
-        completion?(activated ? .application : .unavailable)
-        guard AXIsProcessTrusted() else { return }
+        guard AXIsProcessTrusted() else { completion?(activated ? .application : .unavailable); return }
         DispatchQueue.global(qos: .userInitiated).async { [self] in
+            defer { DispatchQueue.main.async { completion?(activated ? .application : .unavailable) } }
             let axApplication = AXUIElementCreateApplication(application.processIdentifier)
             AXUIElementSetMessagingTimeout(axApplication, 0.06)
             let budget = Budget(end: ProcessInfo.processInfo.systemUptime + 0.45)

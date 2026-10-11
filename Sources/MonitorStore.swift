@@ -36,7 +36,7 @@ final class MonitorStore: ObservableObject {
     private var messageGeneration = UUID()
     @Published var paused = false
     @Published var autoContinueEnabled: Bool
-    @Published var autoQueueInsertionEnabled: Bool
+    let autoQueueInsertionEnabled = false
     @Published private(set) var reminderPopupEnabled: Bool
     @Published private(set) var reminderSoundEnabled: Bool
     static let reminderPopupDefaultsKey = "reminderPopupEnabled.v1"
@@ -58,7 +58,6 @@ final class MonitorStore: ObservableObject {
     private var workspaceConflictTracker = WorkspaceConflictTracker()
     var onWorkspaceConflictsChanged: ((Set<String>) -> Void)?
     private let continuation: ContinuationController
-    private let queueInsertion = QueueInsertionController()
     @Published var expanded = false
     // The settings popover extends the floating panel’s hover region.
     var settingsMenuTracking = false
@@ -115,7 +114,8 @@ final class MonitorStore: ObservableObject {
         removedSessions = defaults.data(forKey: "removedSessions.v1")
             .flatMap { try? JSONDecoder().decode([RemovedSession].self, from: $0) } ?? []
         autoContinueEnabled = defaults.bool(forKey: "autoContinueOptIn.v2")
-        autoQueueInsertionEnabled = defaults.object(forKey: "autoQueueInsertion.v1") as? Bool ?? true
+        // Retire the old opt-in: every desktop request now respects FIFO.
+        defaults.set(false, forKey: "autoQueueInsertion.v1")
         reminderPopupEnabled = defaults.object(forKey: Self.reminderPopupDefaultsKey) as? Bool ?? true
         reminderSoundEnabled = defaults.object(forKey: Self.reminderSoundDefaultsKey) as? Bool ?? true
         keepAwakeEnabled = defaults.bool(forKey: "keepAwakeEnabled.v1")
@@ -140,8 +140,6 @@ final class MonitorStore: ObservableObject {
 
     func start() {
         keepAwake.setEnabled(keepAwakeEnabled)
-        queueInsertion.onResult = { [weak self] in self?.showMessage($0) }
-        queueInsertion.start(enabled: autoQueueInsertionEnabled)
         continuation.onSummary = { [weak self] in self?.recoverySummary = $0 }
         continuation.onNotice = { [weak self] in self?.onRecoveryNotice?($0) }
         continuation.start(enabled: autoContinueEnabled && !permissionRepairActive)
@@ -163,7 +161,6 @@ final class MonitorStore: ObservableObject {
     func stop() {
         onSessionsObserved?([], false)
         keepAwake.stop()
-        queueInsertion.stop()
         continuation.stop()
         permissionQueryGeneration += 1
         permissionHealthBridge.cancel()
@@ -176,7 +173,6 @@ final class MonitorStore: ObservableObject {
 
     func togglePause() {
         paused.toggle()
-        queueInsertion.configure(enabled: autoQueueInsertionEnabled, paused: paused)
         pausedAt = paused ? Date() : nil
         continuation.configure(enabled: autoContinueEnabled && !permissionRepairActive, paused: paused)
         if paused {
@@ -545,8 +541,14 @@ final class MonitorStore: ObservableObject {
         UserDefaults.standard.set(labels, forKey: "projectLabels")
     }
     func openSession(_ session: SessionRecord) {
+        guard !continuation.isOperatingDesktop else {
+            showMessage("正在处理前一条对话，请等待操作结束后再打开会话")
+            return
+        }
+        continuation.setDesktopNavigationBusy(true)
         monitor.activate(session) { [weak self] result in
             guard let self = self else { return }
+            self.continuation.setDesktopNavigationBusy(false)
             switch result {
             case .unavailable:
                 self.showMessage(session.app_id == "claude-code" ? "未找到承载应用，请手动前往 CLI 会话" : "应用未运行或无法定位，请先打开对应应用")
@@ -748,14 +750,6 @@ final class MonitorStore: ObservableObject {
 
     func toggleAutoContinue() {
         setAutoContinue(!autoContinueEnabled)
-    }
-
-    func toggleAutoQueueInsertion() {
-        autoQueueInsertionEnabled.toggle()
-        removalDefaults.set(autoQueueInsertionEnabled, forKey: "autoQueueInsertion.v1")
-        queueInsertion.configure(enabled: autoQueueInsertionEnabled, paused: paused)
-        showMessage(autoQueueInsertionEnabled ? "新排队消息自动插队已开启" : "新排队消息自动插队已关闭")
-        writeDiagnostic()
     }
 
     func setAutoContinue(_ enabled: Bool) {
@@ -1070,6 +1064,7 @@ final class MonitorStore: ObservableObject {
                                   "frost_level": frostLevel.label,
                                   "auto_continue_enabled": autoContinueEnabled,
                                   "auto_queue_insertion_enabled": autoQueueInsertionEnabled,
+                                  "desktop_queue_policy": "fifo",
                                   "reminder_popup_enabled": reminderPopupEnabled,
                                   "reminder_sound_enabled": reminderSoundEnabled,
                                   "collector_restarts": collectorRestarts,

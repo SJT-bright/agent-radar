@@ -215,6 +215,7 @@ private final class SupervisionHarness {
         do {
             let h = harness(marked: ["workbuddy:a", "workbuddy:b"])
             h.finish("a"); h.advance()
+            h.controller.observe([h.row("a", start: h.clock.now)], fresh: true)
             h.finish("b", start: 10001); h.advance()
             check(h.sender.requests.count == 2 && h.sender.requests.allSatisfy { $0["text"] as? String == h.rules.value.ragePrompt },
                   "each conversation has an independent cadence counter")
@@ -270,10 +271,18 @@ private final class SupervisionHarness {
                     h.clock.now += 10
                 }
                 let interrupted = turn % 7 == 0
-                let rows = ids.map { h.row($0, status: interrupted ? "interrupted" : "completed", start: start) }
+                var rows = ids.map { h.row($0, status: interrupted ? "interrupted" : "completed", start: start) }
                 h.controller.observe(rows, fresh: true)
                 for _ in 0..<10 {
                     h.clock.now += 1; h.controller.observe(rows, fresh: true)
+                    // Simulate an actual same-session acknowledgement for each
+                    // click. The next desktop request must await this evidence.
+                    for request in h.sender.requests.dropFirst(turn * ids.count) {
+                        if let index = rows.firstIndex(where: { $0.id == request["id"] as? String }), rows[index].status != "running" {
+                            rows[index].status = "running"
+                            rows[index].started_at = h.clock.now
+                        }
+                    }
                 }
                 check(h.sender.requests.count == (turn + 1) * ids.count,
                       "all marked sessions continue at turn \(turn)")
@@ -281,7 +290,7 @@ private final class SupervisionHarness {
             check(h.clock.now == 53_200, "twelve simulated hours elapsed")
             let keys = h.sender.requests.compactMap { $0["key"] as? String }
             check(Set(keys).count == 2160, "2160 sends have unique session-round keys")
-            check(h.controller.pendingSessionIDs.count == 3, "only current receipts remain pending")
+            check(h.controller.pendingSessionIDs.isEmpty, "all simulated response receipts were confirmed in order")
             check(h.sender.requests.allSatisfy { $0["project"] as? String != nil },
                   "every send carries project provenance")
             // 中断轮使用按软件恢复提示词；所有成功自动发送参与次数周期。

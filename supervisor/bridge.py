@@ -268,8 +268,7 @@ def perform(request, backend, journal):
     if not snapshot.get('send_enabled'):
         raise Blocked('send_unavailable')
     backend.send()  # At most one press. No blind Enter or retry after ambiguity.
-    return {'code': 'sent_queued_promoted' if getattr(backend, 'queue_promoted', False)
-            else 'sent_pending_confirmation', 'attempted': True}
+    return {'code': 'sent_pending_confirmation', 'attempted': True}
 
 
 def grok_title_variants(title):
@@ -435,7 +434,6 @@ class MacBackend:
         self.title = request.get('navigation_title') or request['title']
         self.window = self.root = self.box = self.send_button = None
         self.did_write = False
-        self.queue_promoted = False
         self.stage = 'preflight'
         self.grok_identity = grok_target(request) if request['app_id'] == 'grok' else None
         self.zcode_identity = zcode_target(request) if request['app_id'] == 'zcode' else None
@@ -1177,38 +1175,11 @@ class MacBackend:
                     pb.writeObjects_(saved)
 
     def send(self):
-        before = self.insert_buttons()
         self.stage = 'send'
         if self.winops.frontmost_pid() != self.window.pid or not self.ax.press(self.send_button):
             raise Blocked('send_unconfirmed')
-        # A newly queued copy of our message may appear after the send click.
-        # Only a unique newly exposed control in the same verified conversation
-        # can be promoted; an old queue control is never touched.
-        if before:
-            return
-        deadline = time.monotonic() + 1.5
-        while time.monotonic() < deadline:
-            if self.winops.frontmost_pid() != self.window.pid:
-                return
-            try:
-                nodes = self.nodes()
-                if not self.current_identity(nodes):
-                    return
-                buttons = self.insert_buttons(nodes)
-                if len(buttons) == 1:
-                    self.stage = 'insert_queue'
-                    self.queue_promoted = bool(self.ax.press(buttons[0]))
-                    return
-                if len(buttons) > 1:
-                    return
-            except Blocked:
-                return
-            time.sleep(0.05)
-
-    def insert_buttons(self, nodes=None):
-        nodes = self.nodes() if nodes is None else nodes
-        return [node for node, role in nodes if role == 'AXButton' and
-                self.label(node) == '插队' and self.ax.enabled(node)]
+        # One send press only. Leave the application's conversation/message
+        # queue in arrival order, including any newly exposed insert control.
 
 
 def main():

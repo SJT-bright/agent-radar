@@ -73,6 +73,19 @@ private final class SettingsStoreHarness {
         // All preferences use a unique suite, and no store/controller is started.
         // Exercise the same combined draft-save path as the settings window.
         do {
+            let suite = "agentradar.fifo-migration." + UUID().uuidString
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.set(true, forKey: "autoQueueInsertion.v1")
+            defaults.set(true, forKey: "autoContinueOptIn.v2")
+            defaults.set(["workbuddy"], forKey: MonitorStore.appSupervisionDefaultsKey)
+            let store = MonitorStore(defaults: defaults, writeHealthDiagnostics: false)
+            check(!store.autoQueueInsertionEnabled && !defaults.bool(forKey: "autoQueueInsertion.v1"),
+                  "legacy automatic insertion is retired even when previously enabled")
+            check(store.autoContinueEnabled && store.supervisedAppIDs == ["workbuddy"],
+                  "FIFO migration preserves automatic-send authorization and supervision scope")
+        }
+        do {
             let h = SettingsStoreHarness()
             check(h.store.reminderPopupEnabled && h.store.reminderSoundEnabled,
                   "legacy settings without reminder keys default popup and sound to enabled")

@@ -139,6 +139,8 @@ final class ContinuationController {
     private let clock: () -> Double
     private let inputIdle: () -> Double
     private var operationBeganAt: Double?
+    private var preparationBeganAt: Double?
+    private var desktopNavigationBusy = false
     private var reportedTiming: [String: RecoveryTiming] = [:]
     private var rows: [SessionRecord] = []
     private var excludedIDs = Set<String>()
@@ -157,6 +159,9 @@ final class ContinuationController {
     private var generation = 0
     private var rules: PromptRules { rulesProvider?() ?? PromptRules() }
     private var fresh: Bool { lastFresh.map { clock() - $0 <= 15 } ?? false }
+    private var awaitingResponse: Bool { confirmations.values.contains { !$0.delayReported } }
+    var isOperatingDesktop: Bool { desktopNavigationBusy || executing || bridge.isRunning || awaitingResponse }
+    func setDesktopNavigationBusy(_ busy: Bool) { desktopNavigationBusy = busy }
 
     init(bridge: ContinuationSending = ContinuationBridge(), judgeBridge: ContinuationSending = ContinuationBridge(), clock: @escaping () -> Double = { Date().timeIntervalSince1970 }, inputIdle: @escaping () -> Double = { HardwareInputIdle.seconds }, countDefaults: UserDefaults = .standard) {
         // Keep judgeBridge in the initializer for existing callers, but never run answer judgement.
@@ -168,7 +173,7 @@ final class ContinuationController {
         }
     }
     var diagnostic: String {
-        "运行模式：\(rules.completionMode == "rage" ? "狂暴模式" : "协作模式")\n自动发送：\(enabled ? "开启" : "关闭")\n输入组件：\(helperPermission ? "辅助功能可用" : "等待授权或检查")\n监督标记：\(supervisedIDs.count)\n排队：\(queue.count)\n每轮只尝试一次；狂暴完成轮次间隔至少 5 秒，可核验意外中断在发现后 1 秒排定，优先争取 10 秒内发送；权限、限流、用户操作或其他输入仍可能阻碍。发送后独立核验新轮次。关闭、暂停或修改规则立即取消旧任务。\n最近结果：\(lastResult)"
+        "运行模式：\(rules.completionMode == "rage" ? "狂暴模式" : "协作模式")\n自动发送：\(enabled ? "开启" : "关闭")\n输入组件：\(helperPermission ? "辅助功能可用" : "等待授权或检查")\n监督标记：\(supervisedIDs.count)\n排队：\(queue.count)\n按入队顺序逐条定位、核验和发送；重试保留原位，手动请求与中断不插队。发送后等待原会话响应，最多 30 秒；超时明确提醒后处理下一条，继续只读观察，不重复发送。排队时长不计入单条操作的等待时限。关闭、暂停或修改规则立即取消旧任务。\n最近结果：\(lastResult)"
     }
     func start(enabled: Bool) {
         self.enabled = enabled
@@ -312,7 +317,7 @@ final class ContinuationController {
     func requestManualRetry(sessionID: String, key: String) {
         guard let row = rows.first(where: { $0.id == sessionID }) else { return }
         let completed = row.status == "completed"
-        var event = ContinuationEvent(session: row, key: key, detectedAt: clock(), canContinue: true,
+        var event = ContinuationEvent(session: row, key: key, detectedAt: queue.first(where: { $0.key == key })?.detectedAt ?? clock(), canContinue: true,
                                       explanation: completed ? "手动继续当前会话" : "手动恢复当前会话",
                                       kind: completed ? "followup" : "interrupt",
                                       text: completed ? ContinuationPolicy.manualContinueText :
@@ -329,8 +334,13 @@ final class ContinuationController {
         }
         guard !attemptedKeys.contains(key) else { notice(event, Self.explain("already_attempted"), cancellable: false); return }
         guard active?.key != key, !queue.contains(where: { $0.key == key && $0.manual }) else { return }
-        queue.removeAll { $0.key == key }
-        enqueue(event)
+        if let index = queue.firstIndex(where: { $0.key == key }) {
+            // Manual authorization changes this item, never its FIFO position.
+            event.notBefore = queue[index].notBefore
+            event.waitMessage = "已排定手动恢复，保留原排队位置"
+            queue[index] = event
+            notice(event, event.waitMessage)
+        } else { enqueue(event) }
         tick()
     }
     func cancelCurrent(sessionID: String, key: String) {
@@ -348,7 +358,7 @@ final class ContinuationController {
         generation += 1
         let cancelled = active
         if executing, let event = active { attemptedKeys.insert(event.key) }
-        bridge.cancel(); executing = false; active = nil
+        bridge.cancel(); executing = false; active = nil; preparationBeganAt = nil
         if let event = cancelled { notice(event, "已取消本轮恢复；若已点击发送，不会撤回消息", cancellable: false) }
     }
     private func unique(_ row: SessionRecord) -> Bool {
@@ -405,7 +415,8 @@ final class ContinuationController {
         if let pending = confirmations[event.key] { return RecoveryTiming(phase: .confirming, deadline: pending.until) }
         if active?.key == event.key, executing { return RecoveryTiming(phase: .operating, deadline: operationBeganAt ?? clock()) }
         guard let scheduled = queue.first(where: { $0.key == event.key }) ?? (active?.key == event.key ? active : nil) else { return nil }
-        let busy = (executing && active?.key != event.key) || bridge.isRunning
+        let busy = desktopNavigationBusy || awaitingResponse || bridge.isRunning || (active != nil && active?.key != event.key)
+            || (active == nil && queue.first?.key != event.key)
         let phase: RecoveryTiming.Phase = busy ? .queue : (scheduled.notBefore <= clock() && HardwareInputIdle.remaining(inputIdle()) > 0 ? .inputIdle : (scheduled.bypassRestriction ? .rateLimited : .scheduled))
         return RecoveryTiming(phase: phase, deadline: scheduled.notBefore)
     }
@@ -446,19 +457,13 @@ final class ContinuationController {
                 // Keep one receipt per pending session so that terminal turn can
                 // still be observed; this never retries the original send.
                 confirmations[event.key]?.delayReported = true
-                notice(event, "已点击发送，30 秒内尚未观察到新轮次；继续观察，不重复发送")
+                notice(event, "已点击发送，30 秒内尚未观察到新轮次；处理下一条，继续观察，不重复发送")
             }
         }
     }
     private func nextReadyIndex(at now: Double) -> Int? {
-        queue.indices.filter { queue[$0].notBefore <= now && (enabled || queue[$0].manual) }.min {
-            let lhs = queue[$0], rhs = queue[$1]
-            func priority(_ event: ContinuationEvent) -> Int {
-                event.manual ? 0 : (event.kind == "interrupt" ? 1 : 2)
-            }
-            if priority(lhs) != priority(rhs) { return priority(lhs) < priority(rhs) }
-            return lhs.detectedAt < rhs.detectedAt
-        }
+        guard let first = queue.first, first.notBefore <= now, enabled || first.manual else { return nil }
+        return queue.startIndex
     }
     private func reportRecoveryDelays(at now: Double) {
         func overdue(_ event: ContinuationEvent) -> Bool {
@@ -486,10 +491,10 @@ final class ContinuationController {
         confirmNewRound()
         reportRecoveryDelays(at: now)
         updateWaitingNotices()
-        guard !executing else { return }
-        discardQueued({ now - $0.detectedAt > $0.patience }, message: "等待超过时限，本轮恢复已取消")
+        guard !executing, !awaitingResponse, !desktopNavigationBusy else { return }
         if active == nil, !bridge.isRunning, let index = nextReadyIndex(at: now) {
             active = queue.remove(at: index)
+            preparationBeganAt = now
         }
         guard var event = active else { return }
         guard enabled || event.manual else { cancelActiveSend(); return }
@@ -505,7 +510,8 @@ final class ContinuationController {
         let restriction = event.kind == "followup" ? ContinuationPolicy.followupRestriction(current)
             : ContinuationPolicy.restriction(current, allowRateLimit: event.bypassRestriction && ContinuationPolicy.isRateLimited(current), manual: event.manual)
         if let reason = restriction { finish(event, reason); return }
-        if now - event.detectedAt > event.patience { finish(event, "等待超过时限，本轮恢复已取消"); return }
+        if now - (preparationBeganAt ?? now) > event.patience { finish(event, "本条操作等待超过时限，已取消恢复"); return }
+        guard now >= event.notBefore else { return }
         guard !bridge.isRunning else { return }
         guard HardwareInputIdle.remaining(inputIdle()) == 0 else { updateWaitingNotices(); return }
         if isAutomaticRageSend(event) {
@@ -535,21 +541,20 @@ final class ContinuationController {
             guard let self = self, self.generation == token, self.active?.key == event.key else { return }
             self.executing = false
             if code == "permission_required" { self.helperPermission = false }
-            if attempted || code == "already_attempted" || code == "sent_pending_confirmation" || code == "sent_queued_promoted" {
+            if attempted || code == "already_attempted" || code == "sent_pending_confirmation" {
                 self.attemptedKeys.insert(event.key)
                 self.policy.recordAttempt(current, now: self.clock())
             }
-            if code == "sent_pending_confirmation" || code == "sent_queued_promoted" {
+            if code == "sent_pending_confirmation" {
                 if self.isAutomaticRageSend(event) {
                     self.recordSuccessfulRageSend(for: current.id)
                 }
                 self.helperPermission = true
                 self.confirmations[event.key] = (event, self.clock() + 30, false)
                 self.active = nil
+                self.preparationBeganAt = nil
                 let elapsed = max(0, Int(self.clock() - event.detectedAt))
-                self.notice(event, code == "sent_queued_promoted"
-                    ? "已点击发送和插队（发现后 \(elapsed) 秒），正在确认原会话的新轮次…"
-                    : "已点击发送（发现后 \(elapsed) 秒），正在确认原会话的新轮次…")
+                self.notice(event, "已点击发送（发现后 \(elapsed) 秒），正在确认原会话的新轮次…")
             } else if !attempted && code == "cooldown" && event.automationMode != "rage" {
                 self.finish(event, Self.explain(code))
             } else if !attempted && ["user_active", "locked", "permission_required", "focus_changed", "another_recovery", "cooldown"].contains(code) {
@@ -568,7 +573,7 @@ final class ContinuationController {
                         return
                     }
                     deferred.waitMessage = Self.explain(code)
-                    self.active = nil; self.queue.append(deferred)
+                    self.active = deferred
                     self.notice(deferred, deferred.waitMessage, permission: code == "permission_required")
                 }
             } else if !attempted && !event.manual && event.routeRetries < 3
@@ -582,7 +587,7 @@ final class ContinuationController {
                 let fallback: Double = code == "app_unavailable" ? 20 : (fastInterrupt ? 1 : 5)
                 deferred.notBefore = self.clock() + max(1, Self.preparationDelay(retryAfter ?? fallback))
                 deferred.waitMessage = Self.explain(code) + "；稍后自动重试（\(deferred.routeRetries)/3）"
-                self.active = nil; self.queue.append(deferred)
+                self.active = deferred
                 self.notice(deferred, deferred.waitMessage)
             } else { self.finish(event, code == "user_active" && attempted
                 ? "已输入文字后检测到键鼠操作，本轮已停止。请检查原会话；为避免重复发送，不自动重试"
@@ -590,7 +595,7 @@ final class ContinuationController {
         }
     }
     private func finish(_ event: ContinuationEvent, _ message: String) {
-        active = nil; executing = false
+        active = nil; executing = false; preparationBeganAt = nil
         notice(event, message, cancellable: false, permission: message == Self.explain("permission_required"))
     }
 

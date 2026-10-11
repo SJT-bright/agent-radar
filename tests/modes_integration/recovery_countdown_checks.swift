@@ -58,7 +58,10 @@ private final class CountdownSender: ContinuationSending {
         sender.finish("sent_pending_confirmation", true)
         check(notices[first.id]?.timing?.phase == .confirming, "confirmation is distinct from pending operation")
         controller.tick()
-        check(sender.requests.count == 3, "next independent session proceeds")
+        check(sender.requests.count == 2, "next session waits for the prior response")
+        first.status = "running"; first.started_at = now + 0.1
+        controller.observe([first, second], fresh: true)
+        check(sender.requests.count == 3, "verified response releases next FIFO session")
         sender.finish("user_active", true)
         check(notices[second.id]?.timing == nil, "after-write interruption has no false automatic countdown")
         check(notices[second.id]?.message.contains("不自动重试") == true, "after-write stop explained")
