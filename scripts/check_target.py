@@ -21,12 +21,13 @@ def main():
     if args.app == 'autoclaw':
         from collector.autoclaw_adapter import collect
     elif args.app == 'codex':
-        from collector.codex_adapter import collect
+        from collector.codex_adapter import collect_session
     elif args.app in ('grok', 'qoder-cn', 'qoder'):
         from collector.extended_adapters import collect
     else:
         from collector.desktop_adapters import collect
-    rows = [row for row in collect() if row['app_id'] == args.app and row['id'] == args.session_id]
+    rows = ([row] if (row := collect_session(args.session_id)) else []) if args.app == 'codex' else [
+        row for row in collect() if row['app_id'] == args.app and row['id'] == args.session_id]
     try:
         if len(rows) != 1:
             raise Blocked('target_unverified')

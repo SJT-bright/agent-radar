@@ -43,13 +43,20 @@ struct PromptSettingsDraft: Equatable {
             rageAlternatePrompt != rules.rageAlternatePrompt {
             return true
         }
-        // 空白 override 等同于「无 override，回到通用」，不参与标脏判定。
-        for (appID, text) in appRagePrompts
-            where !text.trimmingCharacters(in: .whitespaces).isEmpty &&
-                  text != rules.ragePrompt(forApp: appID) { return true }
-        for (appID, text) in appResumeTexts
-            where !text.trimmingCharacters(in: .whitespaces).isEmpty &&
-                  text != (rules.appResumeTexts[appID] ?? "") { return true }
+        // 新增空白键不产生覆盖；清空已有专属文字则是待保存的删除，
+        // 必须标脏，才能保存并触发关窗时的草稿保护。
+        for (appID, text) in appRagePrompts {
+            if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if let saved = rules.appRagePrompts[appID],
+                   !saved.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+            } else if text != rules.ragePrompt(forApp: appID) { return true }
+        }
+        for (appID, text) in appResumeTexts {
+            if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if let saved = rules.appResumeTexts[appID],
+                   !saved.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+            } else if text != (rules.appResumeTexts[appID] ?? "") { return true }
+        }
         return false
     }
 

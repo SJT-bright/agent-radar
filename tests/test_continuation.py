@@ -270,7 +270,8 @@ class ContinuationTests(unittest.TestCase):
             original_send()
             self.backend.queue_promoted = True
         self.backend.send = promoted_send
-        self.assertEqual(self.run_request(), {'code': 'sent_pending_confirmation', 'attempted': True})
+        with patch('supervisor.bridge.time.time', return_value=1234.5):
+            self.assertEqual(self.run_request(), {'code': 'sent_pending_confirmation', 'attempted': True, 'sent_at': 1234.5})
         self.assertEqual(self.backend.sends, 1)
         with self.assertRaisesRegex(Blocked, 'already_attempted'):
             self.run_request()
@@ -1161,6 +1162,7 @@ class AXSelectionTests(unittest.TestCase):
 
     def test_codex_resume_or_voice_empty_composer_defers_without_pressing(self):
         b = self.backend('codex')
+        b.codex_title_unique = True
         layout = dict(role='AXGroup', rect=(310, 630, 900, 770),
                       AXDOMClassList=['_ComposerLayoutBody_build_2'])
         box = dict(role='AXTextArea', rect=(320, 650, 880, 710), AXValue='',
@@ -1499,8 +1501,8 @@ class AXSelectionTests(unittest.TestCase):
         b.request.update(id='codex:test', started_at=123, kind='followup', automation_mode='rage')
         state = {'kCGSSessionOnConsoleKey': True}
         b.Quartz = SimpleNamespace(kCGSessionOnConsoleKey='kCGSSessionOnConsoleKey', CGSessionCopyCurrentDictionary=lambda: state)
-        row = dict(id='codex:test', started_at=123, status='idle')
-        with patch.dict('sys.modules', {'codex_adapter': SimpleNamespace(collect=lambda: [row])}):
+        row = dict(id='codex:test', title=b.title, title_unique=True, started_at=123, status='idle')
+        with patch.dict('sys.modules', {'codex_adapter': SimpleNamespace(collect_session=lambda _: row)}):
             with self.assertRaisesRegex(Blocked, 'state_changed'): b.guard(fresh=True)
             row['status'] = 'completed'
             b.guard(fresh=True)
@@ -1525,9 +1527,9 @@ class AXSelectionTests(unittest.TestCase):
         b.request.update(id='codex:test', started_at=123, kind='followup', automation_mode='rage',
                          project='/reviewed', source='local-session', target='codex://threads/test')
         b.Quartz = SimpleNamespace(kCGSessionOnConsoleKey='on', CGSessionCopyCurrentDictionary=lambda: {'on': True})
-        row = dict(id='codex:test', started_at=123, status='completed', project='/reviewed',
+        row = dict(id='codex:test', title=b.title, title_unique=True, started_at=123, status='completed', project='/reviewed',
                    source='local-session', target='codex://threads/test')
-        with patch.dict('sys.modules', {'codex_adapter': SimpleNamespace(collect=lambda: [row])}):
+        with patch.dict('sys.modules', {'codex_adapter': SimpleNamespace(collect_session=lambda _: row)}):
             b.guard(fresh=True)
             for field in ('project', 'source', 'target'):
                 original = row[field]

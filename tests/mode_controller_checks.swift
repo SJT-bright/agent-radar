@@ -84,7 +84,8 @@ final class CompletedAnswerJudge: ContinuationSending {
             check(b.requests.isEmpty, "startup history never auto sends")
             c.startRageForCompleted(); now += 5; c.tick()
             check(b.requests.count == 1, "explicit historical start")
-            c.observe([row("one", "completed", start: now - 1)], fresh: true)
+            now += 1
+            c.observe([row("one", "completed", start: now - 0.5)], fresh: true)
             now += 5; c.tick()
             check(b.requests.count == 2, "fast completed new round loops")
             check(b.requests[1]["automation_mode"] as? String == "rage", "bridge mode propagated")

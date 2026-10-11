@@ -4,12 +4,17 @@ private final class SupervisionClock { var now = 10_000.0 }
 private final class SupervisionRules { var value = PromptRules() }
 private final class SupervisionSender: ContinuationSending {
     var isRunning = false
+    var sentAt: Double?
+    var clock: () -> Double = { 10_000 }
     var requests: [[String: Any]] = []
+    var sendTimes: [Double?] = []
     var responses: [(String, Bool)] = []
     func cancel() { isRunning = false }
     func run(_ request: [String: Any], completion: @escaping (String, Bool, Double?) -> Void) {
         requests.append(request)
         let response = responses.isEmpty ? ("sent_pending_confirmation", true) : responses.removeFirst()
+        sentAt = response.0 == "sent_pending_confirmation" ? clock() : nil
+        sendTimes.append(sentAt)
         completion(response.0, response.1, nil)
     }
 }
@@ -32,6 +37,7 @@ private final class SupervisionHarness {
     init(marked: Set<String> = ["workbuddy:a"], mode: String = "rage", enabled: Bool = true,
          defaults: UserDefaults) {
         let c = clock, s = sender, j = judge, r = rules
+        s.clock = { c.now }
         controller = ContinuationController(bridge: s, judgeBridge: j, clock: { c.now }, inputIdle: { 1000 }, countDefaults: defaults)
         r.value.completionMode = mode
         r.value.ragePrompt = "普通：继续优化"
@@ -53,6 +59,12 @@ private final class SupervisionHarness {
         controller.observe([row(id, status: status, start: start, app: app)], fresh: true)
     }
     func advance(_ seconds: Double = 5) { clock.now += seconds; controller.tick() }
+    func nextRoundStart() -> Double {
+        // Simulate a new lifecycle event after the preceding send, then expose
+        // it in the next snapshot. Never use a pre-send start as its receipt.
+        clock.now += 1
+        return clock.now - 0.5
+    }
 }
 
 @main struct SupervisionControllerChecks {
@@ -74,7 +86,7 @@ private final class SupervisionHarness {
             let h = harness(marked: [])
             h.finish(); h.advance()
             check(h.judge.requests.isEmpty && h.sender.requests.isEmpty, "unmarked completion is read-only")
-            h.finish(start: 10006, status: "interrupted"); h.advance()
+            h.finish(start: h.nextRoundStart(), status: "interrupted"); h.advance()
             check(h.sender.requests.isEmpty, "unmarked interruption is read-only")
         }
         do {
@@ -148,14 +160,16 @@ private final class SupervisionHarness {
         }
         do {
             let h = harness()
+            h.rules.value.appResumeTexts["workbuddy"] = "专属：恢复未完成的工作"
+            h.rules.value.resumePrompt = "通用：恢复当前项目"
             for (index, status) in ["completed", "interrupted", "completed", "interrupted", "completed", "completed"].enumerated() {
-                h.finish(start: 9990 + Double(index) * 10, status: status)
+                h.finish(start: index == 0 ? 9990 : h.nextRoundStart(), status: status)
                 h.advance(status == "interrupted" ? 1 : 5)
             }
             let texts = h.sender.requests.compactMap { $0["text"] as? String }
             check(texts.count == 6, "each verified terminal round sends once")
-            // 中断恢复使用按软件恢复提示词（默认 resumeText），不占用续接轮换；
-            // 特别提示词节奏只由完成续接推进。
+            // 中断恢复使用专属恢复提示词；所有成功自动发送参与次数周期，
+            // 完成续接根据累计次数选择普通或特别提示词。
             let resume = ContinuationPolicy.resumeText(forApp: "workbuddy",
                                                        overrides: h.rules.value.appResumeTexts,
                                                        global: h.rules.value.resumePrompt)
@@ -164,11 +178,24 @@ private final class SupervisionHarness {
                   "interruptions send per-app resume text; completions keep cadence: \(texts)")
             check(h.judge.requests.isEmpty, "mixed cadence never requests answer judgement")
         }
+        for (app, appPrompt, globalPrompt, expected) in [
+            ("workbuddy", "软件专属恢复", "通用恢复", "软件专属恢复"),
+            ("grok", "", "通用恢复", "通用恢复"),
+            ("grok", "Grok 专属恢复", "通用恢复", "Grok 专属恢复"),
+            ("grok", "", "", ContinuationPolicy.grokResumeText)
+        ] {
+            let h = harness(marked: [app + ":a"])
+            h.rules.value.appResumeTexts[app] = appPrompt
+            h.rules.value.resumePrompt = globalPrompt
+            h.finish(status: "interrupted", app: app); h.advance(1)
+            check(h.sender.requests.count == 1 && h.sender.requests[0]["text"] as? String == expected,
+                  "automatic \(app) interruption resolves provider/global/default resume priority")
+        }
         do {
             let h = harness(marked: ["workbuddy:b"])
             h.rules.value.rageAlternateEvery = 2
             h.finish("b", start: 9990); h.advance()
-            h.finish("b", start: 10000); h.advance()
+            h.finish("b", start: h.nextRoundStart()); h.advance()
             check(h.sender.requests.compactMap { $0["text"] as? String } ==
                   [h.rules.value.ragePrompt, h.rules.value.rageAlternatePrompt],
                   "user-configured interval changes special prompt placement")
@@ -184,7 +211,7 @@ private final class SupervisionHarness {
             check(h.sender.requests.compactMap { $0["text"] as? String } ==
                   [h.rules.value.ragePrompt, h.rules.value.ragePrompt, h.rules.value.ragePrompt],
                   "failed route attempts do not advance cadence")
-            h.finish("c", start: 10020); h.advance()
+            h.finish("c", start: h.nextRoundStart()); h.advance()
             check(h.sender.requests.last?["text"] as? String == h.rules.value.rageAlternatePrompt,
                   "next successful round follows the configured cadence")
         }
@@ -208,14 +235,15 @@ private final class SupervisionHarness {
             check(first.sender.requests.count == 1, "first controller records successful send")
             let second = harness(marked: ["workbuddy:restart"], defaults: shared)
             second.rules.value.rageAlternateEvery = 2
-            second.finish("restart", start: 10001); second.advance()
+            second.clock.now = first.clock.now
+            second.finish("restart", start: second.nextRoundStart()); second.advance()
             check(second.sender.requests.first?["text"] as? String == second.rules.value.rageAlternatePrompt,
                   "restart restores per-session successful-click count")
         }
         do {
             let h = harness(marked: ["workbuddy:a", "workbuddy:b"])
             h.finish("a"); h.advance()
-            h.controller.observe([h.row("a", start: h.clock.now)], fresh: true)
+            h.controller.observe([h.row("a", start: h.nextRoundStart())], fresh: true)
             h.finish("b", start: 10001); h.advance()
             check(h.sender.requests.count == 2 && h.sender.requests.allSatisfy { $0["text"] as? String == h.rules.value.ragePrompt },
                   "each conversation has an independent cadence counter")
@@ -234,7 +262,7 @@ private final class SupervisionHarness {
             case "stale": h.clock.now += 16
             case "waiting": row.status = "waiting"; h.controller.observe([row], fresh: true)
             case "running": row.status = "running"; h.controller.observe([row], fresh: true)
-            case "new-turn": row.started_at = 10001; h.controller.observe([row], fresh: true)
+            case "new-turn": row.started_at = h.nextRoundStart(); h.controller.observe([row], fresh: true)
             case "user-stopped": row.user_stopped = true; h.controller.observe([row], fresh: true)
             case "window-only": row.source = "window"; h.controller.observe([row], fresh: true)
             case "project-changed": row.project = "/another"; h.controller.observe([row], fresh: true)
@@ -249,7 +277,7 @@ private final class SupervisionHarness {
             h.finish(); h.advance()
             check(h.sender.requests.isEmpty && h.notices.last?.message == "这个项目已完结，请验收",
                   "collaboration completion remains notice-only")
-            h.finish(start: 10006, status: "interrupted"); h.advance()
+            h.finish(start: h.nextRoundStart(), status: "interrupted"); h.advance()
             check(h.sender.requests.count == 1, "collaboration opted-in interruption remains independent of marks")
         }
         do {
@@ -264,6 +292,7 @@ private final class SupervisionHarness {
             // Twelve simulated hours across three independently supervised conversations.
             let ids = ["a", "b", "c"]
             let h = harness(marked: Set(ids.map { "workbuddy:" + $0 }))
+            h.rules.value.appResumeTexts["workbuddy"] = "长运行专属：恢复未完成的工作"
             for turn in 0..<720 {
                 let start = h.clock.now
                 for _ in 0..<5 {
@@ -277,10 +306,15 @@ private final class SupervisionHarness {
                     h.clock.now += 1; h.controller.observe(rows, fresh: true)
                     // Simulate an actual same-session acknowledgement for each
                     // click. The next desktop request must await this evidence.
-                    for request in h.sender.requests.dropFirst(turn * ids.count) {
+                    for (offset, request) in h.sender.requests.enumerated().dropFirst(turn * ids.count) {
                         if let index = rows.firstIndex(where: { $0.id == request["id"] as? String }), rows[index].status != "running" {
                             rows[index].status = "running"
-                            rows[index].started_at = h.clock.now
+                            // This new round begins after the simulated press;
+                            // it is first collected at the following whole tick.
+                            let nextStart = h.clock.now + 0.5
+                            check(nextStart > (h.sender.sendTimes[offset] ?? .infinity),
+                                  "new round must follow its successful send at turn \(turn)")
+                            rows[index].started_at = nextStart
                         }
                     }
                 }

@@ -451,12 +451,12 @@ class SessionCollector:
         self._claude_paths: list[Path] = []
         self._claude_scan_at = float("-inf")
 
-    def _read_threads_database(self, database: Path) -> bool:
+    def _read_threads_database(self, database: Path, thread: str | None = None) -> bool:
         """Read one state database; True when it yielded the session rows."""
         for attempt in range(2):
             try:
                 with _readonly(database) as con:
-                    return self._load_threads(con)
+                    return self._load_threads(con, thread)
             except sqlite3.OperationalError as error:
                 lower = str(error).lower()
                 transient = ("locked" in lower or "busy" in lower or
@@ -472,7 +472,7 @@ class SessionCollector:
                 return False
         return False
 
-    def _load_threads(self, con) -> bool:
+    def _load_threads(self, con, thread: str | None = None) -> bool:
         """One bounded read into codex_rows; transient locks re-raise for retry."""
         try:
             columns = {row[1] for row in con.execute("PRAGMA table_info(threads)")}
@@ -489,11 +489,24 @@ class SessionCollector:
                           if "agent_path" in columns else "")
             if "thread_source" in columns:
                 main_tasks += " AND (thread_source IS NULL OR thread_source NOT IN ('subagent','guardian_review'))"
+            target_filter = " AND id=?" if thread is not None else ""
+            parameters = (thread, MAX_SESSIONS) if thread is not None else (MAX_SESSIONS,)
             rows = con.execute("SELECT " + ",".join(requested) +
-                               " FROM threads WHERE archived=0" + main_tasks +
-                               " ORDER BY updated_at DESC LIMIT ?",
-                               (MAX_SESSIONS,)).fetchall()
+                               " FROM threads WHERE archived=0" + main_tasks + target_filter +
+                               " ORDER BY updated_at DESC LIMIT ?", parameters).fetchall()
             self.codex_rows = [dict(row) for row in rows]
+            if thread is not None and len(self.codex_rows) == 1:
+                # The visible header may export only a title. Check all main
+                # tasks, including archived/outside the discovery LIMIT, before
+                # allowing that fallback. Too many rows remain ambiguous.
+                title_fields = [c for c in ("name", "title") if c in columns]
+                titles = (con.execute("SELECT " + ",".join(title_fields) +
+                          " FROM threads WHERE 1=1" + main_tasks + " LIMIT 2049").fetchall()
+                          if title_fields else [])
+                wanted = _text(self.codex_rows[0].get("name") or self.codex_rows[0].get("title"))
+                self.codex_rows[0]["title_unique"] = bool(wanted) and len(titles) <= 2048 and sum(
+                    _text(dict(title).get("name") or dict(title).get("title")) == wanted
+                    for title in titles) == 1
             return True
         except (OSError, sqlite3.Error) as error:
             lower = str(error).lower()
@@ -547,7 +560,7 @@ class SessionCollector:
             })
         return rows
 
-    def _codex(self, processes: dict[int, dict]) -> list[dict]:
+    def _codex(self, processes: dict[int, dict], thread: str | None = None) -> list[dict]:
         root = self.codex_home
         databases = _codex_state_databases(root)
         available = True
@@ -557,19 +570,23 @@ class SessionCollector:
         # table; a just-migrated or partial state file must not hide sessions.
         # On total failure codex_rows keeps the previous collection for degrade.
         for database in databases[:3]:
-            if self._read_threads_database(database):
+            if self._read_threads_database(database, thread):
                 opened = True
                 break
         if not opened:
             # 结构迁移期（threads 表缺失/整体移走）枚举 rollout 兜底；
             # 兜底也为空才降级为上一轮缓存并报错。
-            fallback_rows = self._codex_rollout_fallback(root)
+            # A sender must bind the current exact database row, never fall
+            # back to an old title or a cached discovery snapshot.
+            fallback_rows = self._codex_rollout_fallback(root) if thread is None else []
             if fallback_rows:
                 self.codex_rows = fallback_rows
             else:
                 available = False
                 cause = getattr(self, "_last_db_error", None)
                 self.last_errors.append("Codex 会话数据库暂时不可读" + ("（" + cause + "）" if cause else ""))
+                if thread is not None:
+                    return []
         owners = _codex_owners(processes, root)
         histories: dict[str, dict] = {}
         try:
@@ -628,8 +645,31 @@ class SessionCollector:
                 item["last_activity_at"] = tail["updated_at"]
             if pid:
                 item["pid"] = pid
+            if thread is not None:
+                item["lifecycle_pending"] = state == "unknown" and str(path) in self.tails.backfills
+                item["title_unique"] = row.get("title_unique", False)
             result.append(item)
         return result
+
+    def collect_session(self, session_id: str, *, max_reads: int = 16, budget: float = 2.0) -> dict | None:
+        """Fresh exact-session preflight, with bounded metadata-only backfill.
+
+        Discovery advances one block per poll; a short-lived sender otherwise
+        always starts cold and can never reach a long round's start. Reuse only
+        this target's TailCache, rereading its DB projection on every pass.
+        """
+        if not re.fullmatch(r"codex:[A-Za-z0-9_-]{8,128}", session_id):
+            return None
+        self.last_errors = []
+        processes = _processes()
+        deadline = time.monotonic() + max(0, min(budget, 2.0))
+        row = None
+        for _ in range(max(1, min(max_reads, 16))):
+            rows = self._codex(processes, session_id.removeprefix("codex:"))
+            row = rows[0] if len(rows) == 1 else None
+            if not row or not row.get("lifecycle_pending") or time.monotonic() >= deadline:
+                break
+        return row
 
     def _claude_recent(self) -> list[Path]:
         now = time.monotonic()
@@ -725,6 +765,10 @@ _collector = SessionCollector()
 
 def collect() -> list[dict]:
     return _collector.collect()
+
+
+def collect_session(session_id: str) -> dict | None:
+    return _collector.collect_session(session_id)
 
 
 if __name__ == "__main__":

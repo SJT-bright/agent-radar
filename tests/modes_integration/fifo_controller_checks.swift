@@ -2,6 +2,7 @@ import Foundation
 
 private final class FIFOSender: ContinuationSending {
     var isRunning = false
+    var sentAt: Double?
     var requests: [[String: Any]] = []
     var callback: ((String, Bool, Double?) -> Void)?
     func cancel() { isRunning = false; callback = nil }
@@ -26,6 +27,7 @@ private final class FIFOSender: ContinuationSending {
         let sender = FIFOSender()
         let controller = ContinuationController(bridge: sender, clock: { now }, inputIdle: { 1000 }, countDefaults: defaults)
         var rules = PromptRules(); rules.completionMode = "rage"
+        rules.appResumeTexts["workbuddy"] = "保存的专属恢复提示词"
         controller.rulesProvider = { rules }
         controller.configure(enabled: true, paused: false)
         func row(_ id: String) -> SessionRecord {
@@ -53,7 +55,7 @@ private final class FIFOSender: ContinuationSending {
         check(sender.ids.isEmpty, "explicit window activation shares the desktop lane")
         controller.setDesktopNavigationBusy(false); controller.tick()
         check(sender.ids == [a.id], "first arrival owns the desktop")
-        sender.finish("focus_changed")
+        sender.finish("state_unverified")
         observe()
         check(sender.ids == [a.id], "temporary failure waits its actual retry deadline")
         now += 5; observe()
@@ -64,6 +66,7 @@ private final class FIFOSender: ContinuationSending {
         check(notices[b.id]?.timing?.phase == .queue, "confirmation still owns the desktop lane")
         now += 1; observe()
         check(sender.ids == [a.id, a.id, b.id], "bounded confirmation timeout advances exactly one item")
+        check(sender.requests.last?["text"] as? String == "保存的专属恢复提示词", "automatic interruption uses the saved per-app recovery prompt")
         check(notices[a.id]?.message.contains("30 秒") == true, "timeout is explicit, never a success claim")
         sender.finish("target_unverified")
         now += 1; observe()
@@ -92,6 +95,32 @@ private final class FIFOSender: ContinuationSending {
         controller.observe([a, b, c], fresh: false)
         check(controller.pendingSessionIDs.isEmpty, "stale evidence releases confirmation and cancels pending work")
         controller.stop()
+
+        // A delayed index update must not confirm a round that began before
+        // Send. A fast genuine turn before callback delivery still qualifies.
+        now = 2000
+        let fastSender = FIFOSender()
+        let fast = ContinuationController(bridge: fastSender, clock: { now }, inputIdle: { 1000 }, countDefaults: defaults)
+        fast.rulesProvider = { rules }; fast.configure(enabled: true, paused: false)
+        var x = row("x"), y = row("y")
+        x.id = "codex:00000000-0000-4000-8000-000000000001"; x.app_id = "codex"
+        x.target = "codex://threads/00000000-0000-4000-8000-000000000001"
+        fast.setSupervisedIDs([x.id, y.id])
+        var messages: [String] = []
+        fast.onNotice = { messages.append($0.message) }
+        fast.observe([x, y], fresh: true)
+        x.status = "completed"; fast.observe([x, y], fresh: true)
+        y.status = "completed"; fast.observe([x, y], fresh: true)
+        now = 2005; fast.observe([x, y], fresh: true)
+        check(fastSender.ids == [x.id], "Codex head acquired the FIFO lane")
+        fastSender.sentAt = 2005
+        now = 2006; fastSender.finish("sent_pending_confirmation", attempted: true)
+        x.status = "running"; x.started_at = 2004; x.updated_at = now
+        fast.observe([x, y], fresh: true)
+        check(fastSender.ids == [x.id] && !messages.contains(where: { $0.contains("发送已确认") }), "a pre-send round cannot confirm delivery or release FIFO")
+        x.started_at = 2005.1; fast.observe([x, y], fresh: true)
+        check(fastSender.ids == [x.id, y.id] && messages.contains(where: { $0.contains("发送已确认") }), "subsecond turn after actual send confirms even before callback arrival")
+        fast.stop()
         print("FIFO desktop queue: \(checks) checks passed")
     }
 }

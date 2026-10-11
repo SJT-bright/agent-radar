@@ -64,14 +64,18 @@ struct ContinuationNotice {
 
 protocol ContinuationSending: AnyObject {
     var isRunning: Bool { get }
+    var sentAt: Double? { get }
     func cancel()
     func run(_ request: [String: Any], completion: @escaping (String, Bool, Double?) -> Void)
 }
+
+extension ContinuationSending { var sentAt: Double? { nil } }
 
 final class ContinuationBridge: ContinuationSending {
     private var process: Process?
     private var generation = 0
     var isRunning: Bool { process?.isRunning == true }
+    private(set) var sentAt: Double?
 
     func cancel() {
         generation += 1
@@ -84,6 +88,7 @@ final class ContinuationBridge: ContinuationSending {
     }
 
     func run(_ request: [String: Any], completion: @escaping (String, Bool, Double?) -> Void) {
+        sentAt = nil
         guard !isRunning, let root = Bundle.main.resourcePath else { completion("another_recovery", false, nil); return }
         let task = Process(), input = Pipe(), output = Pipe()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
@@ -103,6 +108,9 @@ final class ContinuationBridge: ContinuationSending {
             DispatchQueue.main.async {
                 guard let self = self, self.generation == current else { return }
                 self.process = nil
+                if let stamp = result?["sent_at"] as? Double, stamp.isFinite, stamp > 0 {
+                    self.sentAt = stamp
+                }
                 completion(result?["code"] as? String ?? "bridge_timeout", result?["attempted"] as? Bool ?? true, result?["retry_after"] as? Double)
             }
         }
@@ -148,7 +156,7 @@ final class ContinuationController {
     private var queue: [ContinuationEvent] = []
     private var active: ContinuationEvent?
     private var attemptedKeys = Set<String>()
-    private var confirmations: [String: (event: ContinuationEvent, until: Double, delayReported: Bool)] = [:]
+    private var confirmations: [String: (event: ContinuationEvent, sentAt: Double, until: Double, delayReported: Bool)] = [:]
     private var timer: Timer?
     private var enabled = false
     private var paused = false
@@ -252,7 +260,8 @@ final class ContinuationController {
         var events = policy.observe(included, now: now,
             interruptText: current.interruptText, rateLimitAllowed: current.rateLimitWakeEnabled,
             rateLimitDelay: Double(current.rateLimitWaitSeconds), rateLimitText: current.rateLimitText,
-            completionMode: current.completionMode, ragePrompt: current.ragePrompt, supervisedIDs: supervisedIDs)
+            completionMode: current.completionMode, ragePrompt: current.ragePrompt,
+            appResumeTexts: current.appResumeTexts, rageResumeText: current.resumePrompt, supervisedIDs: supervisedIDs)
         // A fresh ZCode lifecycle end can be committed between snapshots even
         // when its running row was briefly absent. It is a new monitored round
         // only if its authoritative end happened after monitoring began.
@@ -270,6 +279,7 @@ final class ContinuationController {
                     interruptText: current.interruptText, rateLimitAllowed: current.rateLimitWakeEnabled,
                     rateLimitDelay: Double(current.rateLimitWaitSeconds), rateLimitText: current.rateLimitText,
                     completionMode: current.completionMode, ragePrompt: current.ragePrompt,
+                    appResumeTexts: current.appResumeTexts, rageResumeText: current.resumePrompt,
                     supervisedIDs: supervisedIDs)
             }
         }
@@ -446,6 +456,9 @@ final class ContinuationController {
                sameIdentity(row, event.session),
                ["running", "completed", "interrupted"].contains(row.status),
                (row.started_at ?? 0) > (event.session.started_at ?? 0),
+               // Codex log events carry subsecond timestamps. Other adapters
+               // may project whole seconds; preserve only that precision.
+               (row.started_at ?? 0) >= (row.app_id == "codex" ? pending.sentAt : floor(pending.sentAt)),
                ContinuationPolicy.identityRestriction(row) == nil {
                 // A fast terminal turn between polls also proves delivery. The
                 // ordinary interruption restrictions still decide its recovery.
@@ -550,7 +563,7 @@ final class ContinuationController {
                     self.recordSuccessfulRageSend(for: current.id)
                 }
                 self.helperPermission = true
-                self.confirmations[event.key] = (event, self.clock() + 30, false)
+                self.confirmations[event.key] = (event, self.bridge.sentAt ?? self.clock(), self.clock() + 30, false)
                 self.active = nil
                 self.preparationBeganAt = nil
                 let elapsed = max(0, Int(self.clock() - event.detectedAt))
@@ -578,7 +591,7 @@ final class ContinuationController {
                 }
             } else if !attempted && !event.manual && event.routeRetries < 3
                       && ["target_unverified", "app_unavailable", "search_unavailable", "search_result_missing",
-                          "header_unverified", "sidebar_target_missing", "tree_incomplete", "composer_unreadable"].contains(code) {
+                          "header_unverified", "sidebar_target_missing", "tree_incomplete", "composer_unreadable", "state_unverified"].contains(code) {
                 // 路由瞬态失败（标题自动改名、索引撕裂读、应用正在重启）
                 // 不再终止该轮恢复：有限次退避重试，持续失败仍然如实终局。
                 var deferred = self.active ?? event
@@ -618,6 +631,7 @@ final class ContinuationController {
          "header_unverified": "已导航，但顶部会话标题或项目与目标不一致；未输入文字",
          "window_ambiguous": "存在多个候选窗口，无法核验具体会话", "app_unavailable": "对应应用未运行或存在多个实例",
          "already_running": "会话仍在运行，不需要继续", "state_changed": "任务状态或轮次已变化，未继续发送",
+         "state_unverified": "长日志本轮起点仍在核验，尚未输入或发送",
          "focus_changed": "前台窗口发生变化，稍后重新定位", "tree_incomplete": "对话控件读取超时或不完整，本轮不发送",
          "send_unavailable": "没有找到可用的发送按钮；如已填入文字，请手动检查", "send_unconfirmed": "发送动作未得到确认，不会重复点击",
          "input_failed": "快速输入未成功，本轮已停止", "already_attempted": "本轮已经尝试过继续，不重复发送",

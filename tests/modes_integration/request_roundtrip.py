@@ -26,7 +26,8 @@ with tempfile.TemporaryDirectory(prefix='radar-integration-') as temp:
         assert request['overwrite_draft'] is True and request['manual_retry'] is False
         assert request['key'] == request['id'] + ':' + str(int(request['started_at'] * 1000))
         with patch('supervisor.bridge.time.time', return_value=request['started_at'] + 5):
-            assert perform(request, backend, journal) == dict(code='sent_pending_confirmation', attempted=True)
+            assert perform(request, backend, journal) == dict(code='sent_pending_confirmation', attempted=True,
+                                                            sent_at=request['started_at'] + 5)
         assert backend.value == ('以用户视角优化并验证' if index % 3 == 0 else '继续优化并验证')
     assert backend.sends == 12
     journal.lock.close()

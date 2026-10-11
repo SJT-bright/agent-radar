@@ -274,8 +274,9 @@ def perform(request, backend, journal):
     validate_snapshot(snapshot, text)
     if not snapshot.get('send_enabled'):
         raise Blocked('send_unavailable')
+    sent_at = time.time()
     backend.send()  # At most one press. No blind Enter or retry after ambiguity.
-    return {'code': 'sent_pending_confirmation', 'attempted': True}
+    return {'code': 'sent_pending_confirmation', 'attempted': True, 'sent_at': sent_at}
 
 
 def grok_title_variants(title):
@@ -463,12 +464,15 @@ class MacBackend:
             if app == 'autoclaw':
                 from autoclaw_adapter import collect
             elif app == 'codex':
-                from codex_adapter import collect
+                from codex_adapter import collect_session
             elif app in ('grok', *QODER_IDS):
                 from extended_adapters import collect
             else:
                 from desktop_adapters import collect
-            row = next((r for r in collect() if r['id'] == self.request['id']), None)
+            row = (collect_session(self.request['id']) if app == 'codex' else
+                   next((r for r in collect() if r['id'] == self.request['id']), None))
+            if row and row.get('status') == 'unknown' and row.get('lifecycle_pending'):
+                raise Blocked('state_unverified')
             expected = ({'completed'} if self.request.get('automation_mode') == 'rage' else {'completed', 'idle'}) if self.request.get('kind') == 'followup' else {'interrupted'}
             if not row or row.get('status') not in expected or row.get('started_at') != self.request.get('started_at'):
                 raise Blocked('state_changed')
@@ -477,6 +481,10 @@ class MacBackend:
             for field in ('project', 'source', 'target'):
                 if field in self.request and row.get(field) != self.request[field]:
                     raise Blocked('target_unverified')
+            if app == 'codex':
+                if row.get('title') != self.title:
+                    raise Blocked('target_unverified')
+                self.codex_title_unique = row.get('title_unique', False)
             if row.get('user_stopped'):
                 raise Blocked('user_stopped')
             if app == 'grok' and (grok_target(self.request) != self.grok_identity or row.get('project') != self.grok_identity[2]):
@@ -622,6 +630,22 @@ class MacBackend:
                     selectors.append(name)
             return (len(headings) == 1 and grok_visible_title_matches(headings[0], self.title)
                     and selectors.count(self.grok_identity[1]) == 1)
+        if self.request['app_id'] == 'codex':
+            # A web-area URL identifies the current surface; sidebar links do
+            # not. If the renderer exports a thread ID, it must match even
+            # when the visible title is identical to another conversation.
+            visible = set()
+            for node, role in nodes:
+                if role not in ('AXWebArea', 'AXWindow'):
+                    continue
+                value = str(ax.get_attr(node, 'AXURL', '') or '')
+                match = re.search(r'(?:codex://|/)(?:threads/)([A-Za-z0-9_-]+)(?:[/?#]|$)', value)
+                if match:
+                    visible.add('codex:' + match.group(1))
+            if visible and visible != {self.request['id']}:
+                return False
+            if not visible and not getattr(self, 'codex_title_unique', False):
+                return False
         return headers.count(self.title) == 1
 
     def sidebar_match(self, name):
@@ -660,6 +684,11 @@ class MacBackend:
         # journal, send slot or recovery receipt is changed by this diagnostic.
         if not self.ax.trusted():
             raise Blocked('permission_required')
+        if self.request['app_id'] == 'codex':
+            from codex_adapter import collect_session
+            row = collect_session(self.request['id'])
+            self.codex_title_unique = bool(row and row.get('title') == self.title
+                and row.get('target') == self.request.get('target') and row.get('title_unique'))
         self.bind_window()
         current = self.snapshot()
         try:
@@ -688,7 +717,8 @@ class MacBackend:
             if not handler or self.AppKit.NSBundle.bundleWithURL_(handler).bundleIdentifier() != self.bundle:
                 raise Blocked('target_unverified')
             self.guard()
-            self.AppKit.NSWorkspace.sharedWorkspace().openURL_(url)
+            if not self.AppKit.NSWorkspace.sharedWorkspace().openURL_(url):
+                raise Blocked('target_unverified')
             nodes = self.navigation_nodes(1.5 if self.request['app_id'] == 'codex' else 0.6)
         elif self.request['app_id'] == 'zcode':
             nodes = self.nodes()

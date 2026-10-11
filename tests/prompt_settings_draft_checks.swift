@@ -64,6 +64,44 @@ import Foundation
         withResume.appResumeTexts["grok"] = "新的 Grok 恢复提示词"
         check(withResume.hasChanges(comparedTo: latest), "a per-app resume override is detected")
 
+        var withSavedOverrides = original
+        withSavedOverrides.appRagePrompts = ["codex": "Saved Codex continuation", "qoder": "Saved Qoder continuation"]
+        withSavedOverrides.appResumeTexts = ["codex": "Saved Codex recovery", "qoder": "Saved Qoder recovery"]
+        let savedDraft = PromptSettingsDraft(rules: withSavedOverrides)
+        check(!savedDraft.hasChanges(comparedTo: withSavedOverrides),
+              "loading existing per-app overrides does not mark the draft dirty")
+        for blank in ["", " \t\n "] {
+            var clearedRage = savedDraft
+            clearedRage.appRagePrompts["codex"] = blank
+            check(clearedRage.hasChanges(comparedTo: withSavedOverrides),
+                  "clearing an existing continuation override enables save and close protection")
+            var clearedResume = savedDraft
+            clearedResume.appResumeTexts["codex"] = blank
+            check(clearedResume.hasChanges(comparedTo: withSavedOverrides),
+                  "clearing an existing recovery override enables save and close protection")
+            var addedBlank = untouched
+            addedBlank.appRagePrompts["codex"] = blank
+            addedBlank.appResumeTexts["codex"] = blank
+            check(!addedBlank.hasChanges(comparedTo: original),
+                  "adding empty or whitespace-only overrides without saved values remains unchanged")
+        }
+        var clearedBoth = savedDraft
+        clearedBoth.appRagePrompts["codex"] = ""
+        clearedBoth.appResumeTexts["codex"] = ""
+        var currentWithOutsideChanges = withSavedOverrides
+        currentWithOutsideChanges.appRagePrompts["future-app"] = "Outside continuation"
+        currentWithOutsideChanges.appResumeTexts["future-app"] = "Outside recovery"
+        let clearedSaved = clearedBoth.applying(to: currentWithOutsideChanges)
+        check(clearedSaved.appRagePrompts["codex"] == nil && clearedSaved.appResumeTexts["codex"] == nil,
+              "saving cleared overrides removes both saved Codex keys")
+        check(clearedSaved.appRagePrompts["qoder"] == "Saved Qoder continuation" &&
+              clearedSaved.appResumeTexts["qoder"] == "Saved Qoder recovery" &&
+              clearedSaved.appRagePrompts["future-app"] == "Outside continuation" &&
+              clearedSaved.appResumeTexts["future-app"] == "Outside recovery",
+              "saving cleared overrides preserves unrelated and newly appeared app keys")
+        check(!PromptSettingsDraft(rules: clearedSaved).hasChanges(comparedTo: clearedSaved),
+              "reloading a saved override deletion clears dirty state")
+
         let changes: [(String, (inout PromptSettingsDraft) -> Void)] = [
             ("reminder popup", { $0.reminderPopupEnabled.toggle() }),
             ("reminder sound", { $0.reminderSoundEnabled.toggle() }),
