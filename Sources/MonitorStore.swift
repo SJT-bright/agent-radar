@@ -448,7 +448,7 @@ final class MonitorStore: ObservableObject {
             $0.app_id == "openclaw" && $0.source == "local-db"
         }.map(\.app_id))
         let readable = sessions.filter(\.isReadable)
-        var result = readable.filter { $0.isActive }
+        var result = readable.filter { $0.isActive || openClawCareIDs.contains($0.id) }
         result += sessions.filter {
             $0.status == "unknown" && $0.isDisplayable && liveIDs.contains($0.app_id) && isTodayRow($0)
         }
@@ -580,7 +580,7 @@ final class MonitorStore: ObservableObject {
         let now = Date().timeIntervalSince1970
         return sessions.filter { s in
             guard !isRemoved(s) else { return false }
-            let isCurrent = s.status == "running" || s.status == "waiting" || s.source == "window" ||
+            let isCurrent = openClawCareIDs.contains(s.id) || s.status == "running" || s.status == "waiting" || s.source == "window" ||
                 (now - s.updated_at < 86400 && (liveIDs.contains(s.app_id) || s.app_id == "claude-code")) || pins.contains(s.id)
             guard recent || isCurrent else { return false }
             guard selectedApp == "all" || s.app_id == selectedApp else { return false }
