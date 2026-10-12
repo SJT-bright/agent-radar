@@ -62,7 +62,7 @@ def run_helper(argv, data, timeout):
     Reading stops at MAX_STAGE_BYTES + 1. A deadline kills the process.
     The raised Blocked code never contains helper output.
     """
-    if not isinstance(data, (bytes, bytearray)) or len(data) > 8192:
+    if not isinstance(data, (bytes, bytearray)) or len(data) > 32768:
         raise Blocked("invalid_request")
     flags = {}
     creation = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -328,7 +328,7 @@ class WindowsBackend:
         payload["supervisor_verified"]=True
         payload["title_unique"]=bool(self.request.get("app_id")=="codex" and self._title_unique)
         data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        if len(data) > 8192:
+        if len(data) > 32768:
             raise Blocked("invalid_request")
         try:
             _code, output = self.runner([self.helper, "--native-bridge"], data, STAGE_TIMEOUT[stage])

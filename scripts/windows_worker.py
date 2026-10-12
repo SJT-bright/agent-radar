@@ -74,8 +74,8 @@ def main():
         index=sys.argv.index('--self-test');return self_test(sys.argv[index+1])
     if '--bridge' in sys.argv:
         from supervisor.windows_bridge import execute
-        raw=sys.stdin.buffer.read(16385)
-        try:result=execute(json.loads(raw)) if len(raw)<=16384 else {'code':'invalid_request','attempted':False}
+        raw=sys.stdin.buffer.read(32769)
+        try:result=execute(json.loads(raw)) if len(raw)<=32768 else {'code':'invalid_request','attempted':False}
         except Exception:result={'code':'invalid_request','attempted':False}
         print(json.dumps(result,ensure_ascii=False),flush=True);return 0
     from collector.main import WatchCollector,snapshot,WATCH_RESTART_EXIT_CODE

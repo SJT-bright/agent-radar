@@ -11,7 +11,7 @@ internal static class NativeBridgeHost
         try
         {
             using var stdin = Console.OpenStandardInput();
-            var buffer = new byte[8193];
+            var buffer = new byte[32769];
             var read = 0;
             while (read < buffer.Length)
             {
@@ -19,7 +19,7 @@ internal static class NativeBridgeHost
                 if (count <= 0) break;
                 read += count;
             }
-            if (read > 8192)
+            if (read > 32768)
             {
                 Write("{\"code\":\"request_too_large\",\"attempted\":false}");
                 return 0;

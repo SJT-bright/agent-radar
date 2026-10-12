@@ -24,9 +24,9 @@ public static class BridgeRequestGuard {
     }
 
     public static byte[]? Encode(IReadOnlyDictionary<string, object?> request, out string? error) {
-        var json = JsonSerializer.Serialize(Sanitize(request));
+        var json = JsonSerializer.Serialize(Sanitize(request),new JsonSerializerOptions{Encoder=System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping});
         var bytes = Encoding.UTF8.GetBytes(json);
-        if (bytes.Length > 8192) {
+        if (bytes.Length > 32768) {
             error = "request_too_large";
             return null;
         }
