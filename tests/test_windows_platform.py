@@ -59,6 +59,13 @@ class PortableTests(unittest.TestCase):
         backend.snapshot=lambda:dict(identity=True,input_count=1,value='hello',busy=False)
         backend._invoke=lambda _:dict(code='sent',focused=True,attempted=True)
         backend.send();self.assertEqual(calls,['guard']);self.assertEqual(backend.stage,'send')
+    def test_script_startup_does_not_depend_on_checkout_cwd(self):
+        import subprocess,sys
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(__file__).resolve().parents[1]
+            env={**os.environ,'HOME':tmp,'USERPROFILE':tmp,'APPDATA':str(Path(tmp)/'AppData/Roaming'),'LOCALAPPDATA':str(Path(tmp)/'AppData/Local')}
+            result=subprocess.run([sys.executable,'-B',str(root/'collector/main.py')],cwd=tmp,env=env,capture_output=True,text=True,timeout=20)
+            self.assertEqual(result.returncode,0,result.stderr[-500:]);self.assertIsInstance(json.loads(result.stdout)['sessions'],list)
     def test_frozen_worker_uses_only_isolated_fixture(self):
         import importlib.util
         spec=importlib.util.spec_from_file_location('worker_test',Path(__file__).parents[1]/'scripts/windows_worker.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)

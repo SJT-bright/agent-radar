@@ -8,6 +8,11 @@ import sys
 import math
 from concurrent.futures import ThreadPoolExecutor, wait
 
+from pathlib import Path
+# A packaged script is launched outside the source checkout. Expose its
+# resource root for shared namespace imports without relying on the cwd.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import codex_adapter
 import desktop_adapters
 import autoclaw_adapter
