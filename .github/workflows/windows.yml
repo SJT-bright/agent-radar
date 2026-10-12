@@ -1,0 +1,55 @@
+name: Windows build and acceptance
+on:
+  workflow_dispatch:
+  push:
+    paths: ['Windows/**', 'collector/**', 'supervisor/**', 'scripts/windows_worker.py', 'tests/**', '.github/workflows/windows.yml']
+  pull_request:
+    paths: ['Windows/**', 'collector/**', 'supervisor/**', 'scripts/windows_worker.py', 'tests/**', '.github/workflows/windows.yml']
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - uses: actions/setup-dotnet@v4
+        with: {dotnet-version: '10.0.x'}
+      - name: Python regression
+        shell: pwsh
+        run: python -B -m unittest discover -s tests -p 'test_windows*.py' -v
+      - name: Core semantic checks
+        shell: pwsh
+        run: dotnet run --project Windows/AgentRadar.Core.Tests -c Release
+      - name: Packaging dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check 'pyinstaller==6.16.0'
+          if(-not (Get-Command iscc.exe -ErrorAction SilentlyContinue)) {choco install innosetup --no-progress -y}
+      - name: Build portable and installer
+        shell: pwsh
+        run: ./Windows/build.ps1
+      - name: Packaged worker acceptance
+        shell: pwsh
+        run: |
+          & build/windows/publish/Resources/radar-worker/radar-worker.exe --self-test build/windows/worker-acceptance.json
+          if($LASTEXITCODE -ne 0){throw 'Packaged worker test failed'}
+      - name: Actual WPF controls acceptance
+        shell: pwsh
+        run: |
+          $p=Start-Process -FilePath build/windows/publish/AgentRadar.exe -ArgumentList @('--smoke-test', "$pwd/build/windows/ui-acceptance") -PassThru
+          if(-not $p.WaitForExit(120000)){ $p.Kill(); throw 'WPF acceptance timeout' }
+          if($p.ExitCode -ne 0){ throw 'WPF acceptance failed' }
+          $j=Get-Content build/windows/ui-acceptance/result.json -Raw | ConvertFrom-Json
+          if(-not $j.all_passed){ throw 'UI checks did not pass' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-build-and-evidence
+          path: |
+            build/windows/release/*
+            build/windows/worker-acceptance.json
+            build/windows/ui-acceptance/*
+          retention-days: 14

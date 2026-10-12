@@ -1,5 +1,12 @@
 # 任务雷达
 
+**1.9.0：macOS 与 Windows 原生版，新增 OpenClaw 持续关照。**
+
+[macOS 下载](https://github.com/SJT-bright/agent-radar/releases/tag/v1.9.0) · [Windows 下载与安装说明](Windows/README.md)
+
+指定会话在后续轮次意外中断时，可通过本地网关恢复原会话；每小时最多自动恢复 3 次，重启保留次数。后台任务逐条选择，完成只提醒验收，主动停止和等待确认不会自动恢复。新安装默认关闭自动发送。两端共用只读适配器与恢复协议，Windows 使用原生 WPF 和 UI Automation。
+
+
 **当前版本 1.8.25/build79，已正式安装并重启。** 本地 OpenClaw 接入独立会话列表、原会话单次恢复和新轮次确认；跨对话保持严格 FIFO。新增操作回执、只读输入区诊断、软件提示词来源、结构通知刷新和可选 Claude 生命周期入口，诊断窗口不再阻塞实时更新。411 项 Python 及全部 Swift 回归、正式权限与实际界面检查通过。
 
 用户指定的 OpenClaw 会话已成功启动原会话新轮次，随后因连接错误再次中断；底层模型连接仍需排查。[本轮改进与剩余问题](docs/improvements-20261012.md) · [下载 1.8.25](https://github.com/SJT-bright/agent-radar/releases/tag/v1.8.25) · [发布验证](docs/release-validation.md)。下列旧版本段落为历史记录。

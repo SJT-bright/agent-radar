@@ -40,7 +40,7 @@ class OpenClawTransportTests(unittest.TestCase):
             send_runner=runner
             runner=lambda command,**kw: self.runner(command,**kw) if 'health' in command else send_runner(command,**kw)
         return OpenClawTransport(self.request,Blocked,collector or (lambda sid:copy.deepcopy(self.row)),
-                                 runner or self.runner,clock=lambda:2000.123)
+                                 runner or self.runner,clock=lambda:2000.123,home=Path(self.tmp.name))
 
     def journal(self):
         journal=Journal(Path(self.tmp.name))

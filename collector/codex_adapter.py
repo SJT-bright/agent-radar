@@ -80,6 +80,9 @@ def _readonly(path: Path):
 
 def _processes() -> dict[int, dict]:
     """ps comm contains executable names only, never command arguments/secrets."""
+    if os.name=="nt":
+        from collector.runtime_paths import read_tasklist
+        return {pid:{"app":"codex" if image.lower()=="codex.exe" else "claude", "started":""} for pid,image in (read_tasklist() or {}).items() if image.lower() in ("codex.exe","claude.exe","claude-code.exe")}
     try:
         raw = subprocess.run(
             ["ps", "-axo", "pid=,lstart=,comm="], capture_output=True,
@@ -104,6 +107,9 @@ def _processes() -> dict[int, dict]:
 
 
 def _codex_owners(processes: dict[int, dict], root: Path) -> dict[str, int]:
+    if os.name=="nt":
+        from collector.runtime_paths import codex_lock_owners
+        return codex_lock_owners(processes,root)
     pids = [str(pid) for pid, proc in processes.items() if proc["app"] == "codex"]
     if not pids:
         return {}

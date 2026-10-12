@@ -5,6 +5,7 @@ Only short session titles and lifecycle timestamps leave the reader.
 """
 from pathlib import Path
 from datetime import datetime
+import os
 import json
 import math
 import re
@@ -44,6 +45,12 @@ def epoch(value):
 def live_pid(pid):
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
         return None
+    if os.name=='nt':
+        from collector.runtime_paths import read_tasklist
+        processes=read_tasklist()
+        if processes is None:return None
+        if pid not in processes:return False
+        return True if processes[pid].lower() in ('autoclaw.exe','openclaw.exe') else None
     try:
         result = subprocess.run(['/bin/ps', '-p', str(pid), '-o', 'comm='],
                                 capture_output=True, text=True, timeout=0.5)

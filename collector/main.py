@@ -53,7 +53,7 @@ def _assembled(rows, errors):
             if row.get(key) is None:
                 row[key] = ""
         strings = ("id", "app_id", "app_name", "title", "project", "status", "evidence", "source", "target")
-        numbers = ("updated_at", "started_at", "ended_at", "last_activity_at")
+        numbers = ("updated_at", "started_at", "ended_at", "last_activity_at", "care_retry_at")
         if any(not isinstance(row.get(k), str) for k in strings) or any(
             (k == "updated_at" or row.get(k) is not None) and
             (isinstance(row.get(k), bool) or not isinstance(row.get(k), (int, float)) or not math.isfinite(row[k]))
@@ -72,6 +72,8 @@ def _assembled(rows, errors):
             row.update(status="unknown", user_stopped=True, status_reason="会话停止标记异常，保持待确认")
         if row.get("manual_only") is not None and not isinstance(row["manual_only"], bool):
             row.update(status="unknown", manual_only=True, status_reason="会话操作范围异常，保持待确认")
+        if row.get("continuous_authorized") is not None and not isinstance(row["continuous_authorized"], bool):
+            row.update(status="unknown", continuous_authorized=False, status_reason="持续关照标记异常，保持待确认")
         unique[row["id"]] = row
     diagnostics = list(errors)
     if invalid:

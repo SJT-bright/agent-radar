@@ -150,9 +150,9 @@ struct ContinuationPolicy {
                 let restriction = Self.followupRestriction(row)
                 let marked = supervisedIDs.contains(row.id)
                 events.append(ContinuationEvent(session: row, key: Self.key(row), detectedAt: now,
-                    canContinue: rage && marked && row.manual_only != true && restriction == nil,
-                    explanation: rage ? (marked ? (restriction ?? "本轮已结束，继续持续优化") : "本轮已完成；未标记监督，仅提醒") : "这个项目已完结，请验收",
-                    kind: rage && marked ? "followup" : "completion", text: "",
+                    canContinue: rage && marked && row.manual_only != true && !row.hasOpenClawCareAuthorization && restriction == nil,
+                    explanation: rage && !row.hasOpenClawCareAuthorization ? (marked ? (restriction ?? "本轮已结束，继续持续优化") : "本轮已完成；未标记监督，仅提醒") : "这个项目已完结，请验收",
+                    kind: rage && marked && !row.hasOpenClawCareAuthorization ? "followup" : "completion", text: "",
                     automationMode: rage ? "rage" : "collaboration"))
                 continue
             }
@@ -169,14 +169,17 @@ struct ContinuationPolicy {
             let rate = row.status == "interrupted" && rateLimitAllowed && Self.isRateLimited(row)
             let restriction = row.status == "stalled" ? "尚无明确中断证据，只提醒，不自动发送" : Self.restriction(row, allowRateLimit: rate)
             let times = (attempts[row.id] ?? []).filter { now - $0 < 3600 }
-            let cooldown = !rage && (times.count >= 2 || (times.last.map { now - $0 < 300 } ?? false))
+            let careCooldown = row.hasOpenClawCareAuthorization && (row.care_retry_at ?? 0) > now
+            let manualOnly = row.manual_only == true && !row.hasOpenClawCareAuthorization
+            let cooldown = !rage && !row.hasOpenClawCareAuthorization && (times.count >= 2 || (times.last.map { now - $0 < 300 } ?? false))
             // A newly verified round is independently recoverable. The durable
             // bridge watermark still prevents a second send to the same round.
             // Rate limits retain their configured wait; speeding up cannot clear them.
             let delay = rate ? min(10, max(1, rateLimitDelay.isFinite ? rateLimitDelay : 10)) : (rage ? 1 : 5)
             events.append(ContinuationEvent(session: row, key: Self.key(row), detectedAt: now,
-                canContinue: row.manual_only != true && restriction == nil && !cooldown && (!rage || supervisedIDs.contains(row.id)),
-                explanation: (row.manual_only == true ? "这是后台子任务；仅支持手动恢复该条原会话" : nil) ??
+                canContinue: !manualOnly && restriction == nil && !cooldown && !careCooldown && (!rage || supervisedIDs.contains(row.id)),
+                explanation: (manualOnly ? "这是后台子任务；仅支持手动恢复该条原会话" : nil) ??
+                    (careCooldown ? "持续关照已达到每小时 3 次自动恢复；继续观察，请检查连续失败原因" : nil) ??
                     (rage && !supervisedIDs.contains(row.id) ? "会话未标记监督，本轮只提醒" : nil) ?? restriction ?? (cooldown ? "本会话已触发恢复冷却，先检查连续失败原因" : "检测到本轮意外中断，即将返回原会话继续"),
                 text: rage ? Self.resumeText(forApp: row.app_id, overrides: appResumeTexts, global: rageResumeText)
                     : (rate ? rateLimitText : interruptText), delay: delay,

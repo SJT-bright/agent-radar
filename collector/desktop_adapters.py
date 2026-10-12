@@ -9,6 +9,7 @@ evidence; a filesystem modification time is never a running signal.
 
 from __future__ import annotations
 
+import os
 import hashlib
 import json
 import math
@@ -75,6 +76,9 @@ def _recent(timestamp: float, now: float, maximum: int) -> bool:
 
 def _processes() -> Dict[int, str]:
     """Read executable names only, never command line arguments."""
+    if os.name=="nt":
+        from collector.runtime_paths import read_tasklist
+        return read_tasklist() or {}
     try:
         result = subprocess.run(
             ["/bin/ps", "-axo", "pid=,comm="], capture_output=True,
@@ -93,6 +97,9 @@ def _processes() -> Dict[int, str]:
 
 
 def _belongs_to_app(command: str, app_name: str) -> bool:
+    if os.name=="nt":
+        from collector.runtime_paths import windows_image_matches
+        return windows_image_matches(command,app_name,aliases=(app_name.replace(" ",""),))
     return f"/{app_name}.app/Contents/" in command
 
 

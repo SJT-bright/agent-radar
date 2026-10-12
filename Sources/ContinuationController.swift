@@ -20,22 +20,24 @@ struct RecoveryTiming: Equatable {
     enum Phase { case scheduled, rateLimited, inputIdle, queue, operating, confirming }
     var phase: Phase
     var deadline: Double
+    var requiresDesktopIdle = true
     func label(at now: Double, idleSeconds: Double) -> String {
-        let idle = Int(ceil(HardwareInputIdle.remaining(idleSeconds)))
+        let idle = requiresDesktopIdle ? Int(ceil(HardwareInputIdle.remaining(idleSeconds))) : 0
         let remaining = Int(ceil(max(0, deadline - now)))
         switch phase {
         case .rateLimited:
             return remaining > 0 ? "限流后 \(remaining) 秒重新核验" : "限流等待结束，准备核验原会话"
         case .scheduled, .inputIdle:
-            if remaining > 0 { return "\(remaining) 秒后准备操作电脑" }
+            if remaining > 0 { return requiresDesktopIdle ? "\(remaining) 秒后准备操作电脑" : "\(remaining) 秒后准备后台恢复" }
             if idle > 0 { return "键鼠静止倒计时：\(idle) 秒" }
             return "倒计时 0 秒，准备核验原会话"
         case .queue: return "排队等待前一项操作完成"
-        case .operating: return "正在操作电脑 · 已开始 \(max(0, Int(now - deadline))) 秒"
+        case .operating: return (requiresDesktopIdle ? "正在操作电脑" : "正在后台恢复原会话") + " · 已开始 \(max(0, Int(now - deadline))) 秒"
         case .confirming: return remaining > 0 ? "等待会话响应：\(remaining) 秒" : "仍在等待会话响应，不重复发送"
         }
     }
     func inputHint(idleSeconds: Double) -> String {
+        if !requiresDesktopIdle { return phase == .confirming ? "已请求恢复，正在确认原会话新轮次" : "后台恢复，无需切换窗口或等待键鼠静止" }
         if phase == .confirming { return "已点击发送，正在确认新轮次" }
         return "键鼠需连续静止 2 秒 · 当前还需 \(Int(ceil(HardwareInputIdle.remaining(idleSeconds)))) 秒"
     }
@@ -264,6 +266,12 @@ final class ContinuationController {
         policy.forget(ids); discardQueued({ ids.contains($0.session.id) }, message: "会话已从雷达移除，已取消恢复")
         if let active = active, ids.contains(active.session.id) { cancelActiveSend() }
     }
+    func cancelCareSession(_ id: String) {
+        policy.forget([id])
+        discardQueued({ $0.session.id == id }, message: "持续关照设置已变化，已取消旧排队")
+        discardConfirmations({ $0.session.id == id }, message: "持续关照设置已变化；已发送的轮次不会重发")
+        if active?.session.id == id { cancelActiveSend() }
+    }
     func observe(_ sessions: [SessionRecord], fresh: Bool, excludedIDs: Set<String> = []) {
         rows = sessions
         self.excludedIDs = excludedIDs
@@ -455,13 +463,14 @@ final class ContinuationController {
             project: event.session.project, timing: timing))
     }
     private func timing(for event: ContinuationEvent) -> RecoveryTiming? {
-        if let pending = confirmations[event.key] { return RecoveryTiming(phase: .confirming, deadline: pending.until) }
-        if active?.key == event.key, executing { return RecoveryTiming(phase: .operating, deadline: operationBeganAt ?? clock()) }
+        let desktop = event.session.app_id != "openclaw"
+        if let pending = confirmations[event.key] { return RecoveryTiming(phase: .confirming, deadline: pending.until, requiresDesktopIdle: desktop) }
+        if active?.key == event.key, executing { return RecoveryTiming(phase: .operating, deadline: operationBeganAt ?? clock(), requiresDesktopIdle: desktop) }
         guard let scheduled = queue.first(where: { $0.key == event.key }) ?? (active?.key == event.key ? active : nil) else { return nil }
         let busy = desktopNavigationBusy || awaitingResponse || bridge.isRunning || (active != nil && active?.key != event.key)
             || (active == nil && queue.first?.key != event.key)
-        let phase: RecoveryTiming.Phase = busy ? .queue : (scheduled.notBefore <= clock() && HardwareInputIdle.remaining(inputIdle()) > 0 ? .inputIdle : (scheduled.bypassRestriction ? .rateLimited : .scheduled))
-        return RecoveryTiming(phase: phase, deadline: scheduled.notBefore)
+        let phase: RecoveryTiming.Phase = busy ? .queue : (desktop && scheduled.notBefore <= clock() && HardwareInputIdle.remaining(inputIdle()) > 0 ? .inputIdle : (scheduled.bypassRestriction ? .rateLimited : .scheduled))
+        return RecoveryTiming(phase: phase, deadline: scheduled.notBefore, requiresDesktopIdle: desktop)
     }
     private func updateWaitingNotices() {
         let waiting = queue + (executing ? [] : active.map { [$0] } ?? [])
@@ -566,7 +575,9 @@ final class ContinuationController {
         if now - (preparationBeganAt ?? now) > event.patience { finish(event, "本条操作等待超过时限，已取消恢复"); return }
         guard now >= event.notBefore else { return }
         guard !bridge.isRunning else { return }
-        guard HardwareInputIdle.remaining(inputIdle()) == 0 else { updateWaitingNotices(); return }
+        if current.app_id != "openclaw" && HardwareInputIdle.remaining(inputIdle()) != 0 {
+            updateWaitingNotices(); return
+        }
         if isAutomaticRageSend(event) {
             if event.kind == "followup" {
                 guard let text = nextRagePrompt(for: current) else {
@@ -579,7 +590,7 @@ final class ContinuationController {
         event.session = current; active = event
         executing = true
         operationBeganAt = now
-        notice(event, "正在定位原会话并检查输入框…")
+        notice(event, current.app_id == "openclaw" ? "正在后台核验并恢复原会话…" : "正在定位原会话并检查输入框…")
         updateWaitingNotices()
         var request: [String: Any] = ["mode": "send", "id": current.id, "app_id": current.app_id,
             "title": current.title, "key": event.key, "target": current.target, "text": event.text,
@@ -590,6 +601,7 @@ final class ContinuationController {
         request["navigation_title"] = current.navigation_title
         request["navigation_key"] = current.navigation_key
         request["lifecycle_revision"] = current.lifecycle_revision
+        request["continuous_authorized"] = current.hasOpenClawCareAuthorization
         request["operation_id"] = event.operationID
         let token = generation
         bridge.run(request) { [weak self] code, attempted, retryAfter in
@@ -660,6 +672,9 @@ final class ContinuationController {
 
     static func explain(_ code: String) -> String {
         ["openclaw_cli_unavailable": "未找到本地 OpenClaw 命令行入口，请检查独立 OpenClaw 安装",
+         "openclaw_care_cooldown": "OpenClaw 持续关照已达到每小时 3 次自动恢复；仍在观察，请检查连续失败原因",
+         "openclaw_care_state_unavailable": "OpenClaw 持续关照记录暂不可读，本轮只提醒，未发送恢复请求",
+         "openclaw_endpoint_invalid": "OpenClaw 本地网关地址无效，请核对本机实例；未发送恢复请求",
          "openclaw_gateway_unavailable": "本地 OpenClaw 网关暂不可用，尚未发送恢复请求",
          "session_navigation_unverified": "ZCode 工作区可跳转，但具体会话输入定位尚未核验；未输入、未发送",
          "app_ui_unavailable": "目标应用界面报错或连接已断开，请先恢复该应用",

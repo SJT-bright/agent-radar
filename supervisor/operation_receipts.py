@@ -12,7 +12,10 @@ rejected. Swift can pass a 32-hex operation_id (hyphens optional) minted at
 queue time; the bridge echoes the id it stored on stdout. Later queued,
 identity, readback, new-round, timeout and cancel events must reuse that id.
 """
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    from collector.runtime_paths import fcntl_compat as fcntl
 import json
 import math
 import os
@@ -58,7 +61,8 @@ class ReceiptRejected(ValueError):
 
 
 def support_directory():
-    return Path.home() / 'Library/Application Support/AgentRadar'
+    from collector.runtime_paths import support_directory as portable_support
+    return portable_support()
 
 
 def new_operation_id():

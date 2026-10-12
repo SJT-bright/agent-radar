@@ -9,18 +9,29 @@ import subprocess
 import time
 import uuid
 from pathlib import Path
+try:
+    from . import openclaw_runtime
+except ImportError:
+    import openclaw_runtime
 
 LOCAL_URL = 'ws://127.0.0.1:19189'
+try:
+    from collector import openclaw_care
+except ImportError:
+    import openclaw_care
 
 
 def cli_path():
+    if os.name == 'nt':
+        prefix = openclaw_runtime.cli_prefix()
+        return prefix[0] if prefix else None
     candidates = [Path.home() / '.local/bin/openclaw', Path('/opt/homebrew/bin/openclaw'),
                   Path('/usr/local/bin/openclaw')]
     return next((str(p) for p in candidates if p.is_file() and os.access(p, os.X_OK)), None)
 
 
 class OpenClawTransport:
-    def __init__(self, request, blocked, collector=None, runner=subprocess.run, clock=time.time):
+    def __init__(self, request, blocked, collector=None, runner=subprocess.run, clock=time.time, home=None):
         try:
             from openclaw_adapter import collect_session, parse_id
         except ImportError:
@@ -32,6 +43,11 @@ class OpenClawTransport:
         self.stage = 'preflight'
         self.sent_at = None
         self.parse_id = parse_id
+        self.care_home = home
+        self.local_url = openclaw_runtime.local_url(home)
+
+    def cli_command(self):
+        return openclaw_runtime.cli_prefix() if os.name == 'nt' else [cli_path()]
 
     def guard(self):
         request = self.request
@@ -46,7 +62,8 @@ class OpenClawTransport:
                 raise self.blocked('target_unverified')
         if row.get('source') != 'local-db' or row.get('user_stopped'):
             raise self.blocked('user_stopped' if row.get('user_stopped') else 'target_unverified')
-        if row.get('manual_only') and request.get('manual_retry') is not True:
+        care = (request.get('continuous_authorized') is True and row.get('continuous_authorized') is True)
+        if row.get('manual_only') and request.get('manual_retry') is not True and not care:
             raise self.blocked('manual_resolution')
         expected_revision = request.get('lifecycle_revision')
         if expected_revision and expected_revision != row.get('lifecycle_revision'):
@@ -69,6 +86,8 @@ class OpenClawTransport:
             raise self.blocked('user_stopped')
         if not cli_path():
             raise self.blocked('openclaw_cli_unavailable')
+        if not self.local_url:
+            raise self.blocked('openclaw_endpoint_invalid')
         return row
 
     def inspect(self):
@@ -81,6 +100,7 @@ class OpenClawTransport:
         code = ('already_running' if row['status'] == 'running' else
                 'state_unverified' if row['status'] not in ('completed', 'interrupted') else
                 'user_stopped' if row.get('user_stopped') else
+                'openclaw_endpoint_invalid' if not self.local_url else
                 'ready' if cli_path() else 'openclaw_cli_unavailable')
         return dict(code=code, attempted=False, identity=True, transport='local-rpc',
                     busy=row['status'] == 'running', state_status=row['status'],
@@ -96,8 +116,9 @@ class OpenClawTransport:
         env = dict(os.environ)
         for key in ('OPENCLAW_PROFILE', 'OPENCLAW_STATE_DIR', 'OPENCLAW_CONFIG_PATH', 'OPENCLAW_GATEWAY_URL'):
             env.pop(key, None)
-        env['PATH'] = str(Path.home() / '.local/bin') + ':/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin'
-        health_command = [cli_path(), 'gateway', 'call', 'health', '--expect-url', LOCAL_URL,
+        if os.name != 'nt':
+            env['PATH'] = str(Path.home() / '.local/bin') + ':/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin'
+        health_command = self.cli_command() + ['gateway', 'call', 'health', '--expect-url', self.local_url,
                           '--json', '--timeout', '3000']
         try:
             health = self.runner(health_command, capture_output=True, text=True, timeout=10,
@@ -110,12 +131,21 @@ class OpenClawTransport:
             return dict(code='ready', attempted=False, transport='local-rpc')
         # Re-read the exact session directly before claiming the one send slot.
         row = self.guard()
+        automatic_care = self.request.get('manual_retry') is not True
+        if automatic_care:
+            try:
+                budget = openclaw_care.CareBudget(self.care_home)
+                if budget.retry_at(row['id'], self.clock()) > self.clock():
+                    raise self.blocked('openclaw_care_cooldown')
+                budget.reserve(row['id'], self.clock())
+            except (OSError, ValueError, TypeError):
+                raise self.blocked('openclaw_care_state_unavailable')
         journal.reserve(self.request)
         self.stage = 'send'
         run_id = str(uuid.uuid5(uuid.NAMESPACE_URL, 'AgentRadar:' + self.request['key']))
         params = dict(sessionKey=row['navigation_key'], sessionId=self.parse_id(row['id'])[1],
                       expectedLeafEntryId=None, message=text, deliver=False, idempotencyKey=run_id)
-        command = [cli_path(), 'gateway', 'call', 'chat.send', '--expect-url', LOCAL_URL,
+        command = self.cli_command() + ['gateway', 'call', 'chat.send', '--expect-url', self.local_url,
                    '--json', '--timeout', '10000', '--params', json.dumps(params, ensure_ascii=False)]
         # Never inherit a selected profile/remote instance from a parent shell.
         self.sent_at = self.clock()

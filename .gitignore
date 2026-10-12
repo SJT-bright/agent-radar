@@ -14,3 +14,8 @@ docs/modes-20260924/evidence/
 *.sqlite3
 .env
 .env.*
+
+**/bin/
+**/obj/
+**/.vs/
+Windows/installer/ChineseSimplified.isl

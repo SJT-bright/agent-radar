@@ -38,6 +38,9 @@ struct SessionRecord: Codable, Identifiable, Equatable {
     var lifecycle_revision: String? = nil
     var run_id: String? = nil
     var manual_only: Bool? = nil
+    var continuous_authorized: Bool? = nil
+    var care_retry_at: Double? = nil
+    var hasOpenClawCareAuthorization: Bool { app_id == "openclaw" && continuous_authorized == true }
     var hasDisplayIdentity: Bool {
         let name = title.trimmingCharacters(in: .whitespacesAndNewlines)
         return !name.isEmpty && name != app_name &&

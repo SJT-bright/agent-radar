@@ -49,6 +49,8 @@ final class MonitorStore: ObservableObject {
     @Published var promptRules: PromptRules
     @Published private(set) var supervisedSessionIDs: Set<String>
     @Published private(set) var supervisedAppIDs: Set<String>
+    @Published private(set) var openClawCareIDs = Set<String>()
+    private let careRegistryURL: URL
     static let supervisionDefaultsKey = "supervisedSessionIDs.v1"
     static let appSupervisionDefaultsKey = "supervisedAppIDs.v1"
     @Published var recoverySummary = "自动继续正在检查"
@@ -113,7 +115,8 @@ final class MonitorStore: ObservableObject {
     private var decoderGeneration = 0 // accessed only on decoderQueue
 
     init(defaults: UserDefaults = .standard, writeHealthDiagnostics: Bool = true,
-         continuation: ContinuationController? = nil) {
+         continuation: ContinuationController? = nil, careRegistryURL: URL = OpenClawCareRegistry.defaultURL) {
+        self.careRegistryURL = careRegistryURL
         removalDefaults = defaults
         self.writeHealthDiagnostics = writeHealthDiagnostics
         self.continuation = continuation ?? ContinuationController(countDefaults: defaults)
@@ -135,6 +138,7 @@ final class MonitorStore: ObservableObject {
         pins = Set(defaults.stringArray(forKey: "pinnedSessions") ?? [])
         labels = defaults.dictionary(forKey: "projectLabels") as? [String: String] ?? [:]
         extraBundleIDs = defaults.stringArray(forKey: "extraBundleIDs") ?? []
+        openClawCareIDs = (try? OpenClawCareRegistry.read(careRegistryURL).care) ?? []
         if #available(macOS 13.0, *) { loginEnabled = SMAppService.mainApp.status == .enabled }
         self.continuation.rulesProvider = { [weak self] in self?.promptRules ?? PromptRules() }
         self.continuation.setSupervisedIDs(supervisedSessionIDs)
@@ -434,7 +438,7 @@ final class MonitorStore: ObservableObject {
     /// Keep recent failures visible even if another task in the same app is live.
     /// 非活动条目只有结束/更新在当天才可上屏；进行中的任务不受影响。
     private func isTodayRow(_ row: SessionRecord) -> Bool {
-        if row.isActive { return true }
+        if row.isActive || openClawCareIDs.contains(row.id) { return true }
         return Calendar.current.isDateInToday(Date(timeIntervalSince1970: row.ended_at ?? row.updated_at))
     }
 
@@ -897,7 +901,22 @@ final class MonitorStore: ObservableObject {
     func previewReminderSound() { onPreviewReminderSound?() }
 
     func isSupervised(_ session: SessionRecord) -> Bool {
-        supervisedSessionIDs.contains(session.id) || supervisedAppIDs.contains(session.app_id)
+        supervisedSessionIDs.contains(session.id) || supervisedAppIDs.contains(session.app_id) || openClawCareIDs.contains(session.id)
+    }
+
+    func toggleOpenClawCare(_ session: SessionRecord) {
+        guard session.app_id == "openclaw", session.source == "local-db",
+              OpenClawCareRegistry.valid(session.id), session.navigation_key?.hasPrefix("agent:") == true else {
+            showMessage("无法核验这条 OpenClaw 会话，未开启持续关照"); return
+        }
+        do {
+            let enabled = !openClawCareIDs.contains(session.id)
+            let selection = try OpenClawCareRegistry.update(careRegistryURL, id: session.id, enabled: enabled)
+            continuation.cancelCareSession(session.id)
+            openClawCareIDs = selection.care
+            refreshSupervision()
+            showMessage(enabled ? "持续关照已开启：关注后续轮次；每小时最多自动恢复 3 次，完成后只提醒" : "持续关照已关闭，旧排队已取消")
+        } catch { showMessage("持续关照设置未保存，请检查本地记录；原设置保持不变") }
     }
 
     func isAppSupervised(_ appID: String) -> Bool { supervisedAppIDs.contains(appID) }
@@ -907,7 +926,7 @@ final class MonitorStore: ObservableObject {
     var effectiveSupervisedIDs: Set<String> {
         let unique = Dictionary(grouping: sessions, by: \.id)
         let appRows = sessions.filter {
-            supervisedAppIDs.contains($0.app_id) && unique[$0.id]?.count == 1 &&
+            (supervisedAppIDs.contains($0.app_id) || openClawCareIDs.contains($0.id)) && unique[$0.id]?.count == 1 &&
                 $0.isReadable && !isRemoved($0)
         }
         return supervisedSessionIDs.union(appRows.map(\.id))
@@ -935,6 +954,10 @@ final class MonitorStore: ObservableObject {
     }
 
     func toggleSupervision(for session: SessionRecord) {
+        if openClawCareIDs.contains(session.id) {
+            toggleOpenClawCare(session)
+            return
+        }
         if !isSupervised(session) { setSupervision(true, for: session); return }
         // 按软件监督覆盖时单条「取消」是空操作：给出引导而不是静默失败。
         if !supervisedSessionIDs.contains(session.id) {
@@ -945,7 +968,10 @@ final class MonitorStore: ObservableObject {
     }
 
     func setSupervision(_ enabled: Bool, for session: SessionRecord) {
-        guard enabled else { removeSupervision(sessionID: session.id); return }
+        guard enabled else {
+            if openClawCareIDs.contains(session.id) { toggleOpenClawCare(session) }
+            removeSupervision(sessionID: session.id); return
+        }
         // A stale card cannot mark a different or unreadable conversation.
         let matches = sessions.filter { $0.id == session.id }
         guard matches.count == 1, let current = matches.first,
@@ -962,6 +988,9 @@ final class MonitorStore: ObservableObject {
 
     /// 取消持久化选择不依赖当前采集结果；会话消失或不可读时仍可撤销。
     func removeSupervision(sessionID: String) {
+        if openClawCareIDs.contains(sessionID) {
+            do { openClawCareIDs = try OpenClawCareRegistry.update(careRegistryURL, id: sessionID, enabled: false).care; continuation.cancelCareSession(sessionID); refreshSupervision(); writeDiagnostic() } catch { showMessage("持续关照记录无法保存，原设置已保留") }; return
+        }
         guard supervisedSessionIDs.contains(sessionID) else { return }
         supervisedSessionIDs.remove(sessionID)
         removalDefaults.set(supervisedSessionIDs.sorted(), forKey: Self.supervisionDefaultsKey)
@@ -1186,6 +1215,7 @@ final class MonitorStore: ObservableObject {
                                   "supervised_sessions": supervisedSessionIDs.count,
                                   "supervised_apps": supervisedAppIDs.count,
                                   "effective_supervised_sessions": effectiveSupervisedIDs.count,
+                                  "openclaw_care_sessions": openClawCareIDs.count,
                                   "completion_mode": promptRules.completionMode,
                                   "keep_awake_enabled": keepAwakeEnabled,
                                   "keep_awake_active": keepAwakeStatus.fullyActive,

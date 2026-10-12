@@ -8,6 +8,10 @@ import re
 import sqlite3
 import time
 import json
+try:
+    from . import openclaw_care
+except ImportError:
+    import openclaw_care
 from pathlib import Path
 try:
     from .failure_reasons import failure_reason
@@ -55,7 +59,14 @@ def parse_id(value):
 
 class OpenClawCollector:
     def __init__(self, home=None, clock=time.time):
-        self.home = Path(home) if home is not None else Path.home()
+        try:
+            from supervisor.openclaw_runtime import source_home
+        except ImportError:
+            import sys
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+            from supervisor.openclaw_runtime import source_home
+        self.home = source_home(home)
+        self.care_home = Path(home) if home is not None else None
         self.root = self.home / '.openclaw' / 'agents'
         self.clock = clock
         self.last_errors = []
@@ -65,7 +76,10 @@ class OpenClawCollector:
         # Do not follow redirects or other OpenClaw profiles (including AutoClaw).
         if not database.resolve().is_relative_to(self.root.resolve()):
             raise ValueError('database redirect')
-        con = sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=.3)
+        from urllib.parse import quote
+        # Encode the native filename without a URI authority, including WSL UNC.
+        uri = 'file:' + quote(str(database), safe='/') + '?mode=ro'
+        con = sqlite3.connect(uri, uri=True, timeout=.3)
         con.row_factory = sqlite3.Row
         try:
             con.execute('PRAGMA query_only=ON')
@@ -188,6 +202,12 @@ class OpenClawCollector:
                        timing_reason='按原会话同一 run ID 最新执行段的开始和结束事件计算')
         if end:
             row['ended_at'] = end
+        if row['id'] in openclaw_care.registry(self.care_home)[1]:
+            row['continuous_authorized'] = True
+            try:
+                row['care_retry_at'] = openclaw_care.CareBudget(self.care_home).retry_at(row['id'], now)
+            except (OSError, ValueError, TypeError):
+                row['care_retry_at'] = now + openclaw_care.WINDOW_SECONDS
         return row
 
     def collect(self, session_id=None, include_children=False):
@@ -227,22 +247,14 @@ class OpenClawCollector:
         return sorted(unique.values(), key=priority, reverse=True)[:SESSION_LIMIT]
 
     def selected_ids(self):
-        path = self.home / 'Library/Application Support/AgentRadar/selected-openclaw-sessions.json'
-        try:
-            if path.is_symlink() or path.stat().st_size > 16384:
-                return []
-            data = json.loads(path.read_bytes())
-            values = data.get('ids', []) if isinstance(data, dict) and data.get('version') == 1 else []
-            return list(dict.fromkeys(v for v in values if parse_id(v)))[:16] if isinstance(values, list) else []
-        except (OSError, ValueError):
-            return []
+        return sorted(v for v in openclaw_care.registry(self.care_home)[0] if parse_id(v))
 
     def _provider_reason(self, run_id):
         # Only the gateway's fixed execution-error metadata lines are used.
         # The bounded map retains derived reasons, never log lines or error text.
         if self._error_metadata is None:
             self._error_metadata = {}
-            path = self.home / 'Library/Logs/openclaw/gateway.log'
+            path = self.home / ('.openclaw/logs/gateway.log' if __import__('os').name == 'nt' else 'Library/Logs/openclaw/gateway.log')
             try:
                 with path.open('rb') as handle:
                     size = path.stat().st_size

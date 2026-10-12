@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+<PropertyGroup><OutputType>WinExe</OutputType><TargetFramework>net10.0-windows</TargetFramework><UseWPF>true</UseWPF><UseWindowsForms>true</UseWindowsForms><EnableWindowsTargeting>true</EnableWindowsTargeting><ImplicitUsings>disable</ImplicitUsings><Nullable>enable</Nullable><AssemblyName>AgentRadar</AssemblyName><Version>1.9.0</Version><ApplicationManifest>app.manifest</ApplicationManifest></PropertyGroup>
+<PropertyGroup><ApplicationIcon>AppIcon.ico</ApplicationIcon></PropertyGroup>
+<ItemGroup><ProjectReference Include="../AgentRadar.Core/AgentRadar.Core.csproj"/></ItemGroup>
+</Project>

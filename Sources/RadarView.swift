@@ -787,6 +787,9 @@ private struct ConversationCard: View {
                 Button("查看状态与计时原因…") { store.showSessionDetails(session) }
                 Button("只读检查原会话输入区…") { store.inspectSessionInput(session) }
                 Button("打开对应应用") { store.openSession(session) }
+                if session.app_id == "openclaw" {
+                    Button(store.openClawCareIDs.contains(session.id) ? "关闭 OpenClaw 持续关照" : "开启 OpenClaw 持续关照") { store.toggleOpenClawCare(session) }
+                }
                 if session.status == "interrupted" {
                     Button("手动恢复此会话") {
                         store.retryContinuation(sessionID: session.id, key: ContinuationPolicy.key(session))
@@ -906,6 +909,9 @@ private struct CompactConversationRow: View {
                 Button("查看状态与计时原因…") { store.showSessionDetails(session) }
                 Button("只读检查原会话输入区…") { store.inspectSessionInput(session) }
                 Button("打开对应应用") { store.openSession(session) }
+                if session.app_id == "openclaw" {
+                    Button(store.openClawCareIDs.contains(session.id) ? "关闭 OpenClaw 持续关照" : "开启 OpenClaw 持续关照") { store.toggleOpenClawCare(session) }
+                }
                 if session.status == "interrupted" {
                     Button("手动恢复此会话") {
                         store.retryContinuation(sessionID: session.id, key: ContinuationPolicy.key(session))

@@ -5,7 +5,6 @@ No OCR coordinates, broad window guessing, or daemon. The separate judge mode
 uses only the fixed local Ollama model and cannot enter the send path.
 stdout is bounded result codes; no AX tree, clipboard, or chat contents logged.
 """
-import fcntl
 import hashlib
 import json
 import math
@@ -61,6 +60,43 @@ def digest(value):
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def _runtime_paths():
+    try:
+        from collector import runtime_paths
+        return runtime_paths
+    except ImportError:
+        try:
+            import runtime_paths
+            return runtime_paths
+        except ImportError:
+            return None
+
+
+def _support_directory():
+    paths = _runtime_paths()
+    if paths is None:
+        return Path.home() / 'Library/Application Support/AgentRadar'
+    return paths.support_directory()
+
+
+def _local_project(value):
+    """POSIX absolute path, or a Windows drive path. UNC shares are not local."""
+    paths = _runtime_paths()
+    if paths is None:
+        return isinstance(value, str) and value.startswith('/') and not value.startswith('//')
+    return paths.is_user_local_path(value)
+
+
+def _app_root(mac_parts, windows_names, markers):
+    paths = _runtime_paths()
+    if paths is None:
+        return Path.home().joinpath('Library', 'Application Support', *mac_parts)
+    found = paths.app_support_root(None, mac_parts, windows_names, markers)
+    if found.state != 'ok' or found.path is None:
+        raise Blocked('target_unverified')
+    return found.path
+
+
 class Journal:
     MAX_RECORDS = 10000
     MAX_BYTES = 4 * 1024 * 1024
@@ -74,15 +110,24 @@ class Journal:
         return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0
 
     def __init__(self, directory=None):
-        self.directory = directory or Path.home() / 'Library/Application Support/AgentRadar'
+        self.directory = Path(directory) if directory else _support_directory()
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path = self.directory / 'continuation-attempts.json'
-        self.lock = (self.directory / 'continuation.lock').open('a')
+        paths = _runtime_paths()
         try:
-            fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if paths is None:
+                raise ImportError()
+            self.lock = paths.HeldLock(self.directory / 'continuation.lock', blocking=False)
         except BlockingIOError:
-            self.lock.close()
             raise Blocked('another_recovery')
+        except ImportError:
+            import fcntl
+            self.lock = (self.directory / 'continuation.lock').open('a')
+            try:
+                fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                self.lock.close()
+                raise Blocked('another_recovery')
         self.rows, self.latest, self.legacy = [], {}, set()
         if self.path.exists():
             try:
@@ -169,6 +214,10 @@ class Journal:
             # replay, and the global lock still serializes desktop input.
             seconds = 5 if request.get('kind') == 'followup' else 0
             waits = [seconds - (now - r['time']) for r in same]
+        elif request.get('app_id')=='openclaw' and request.get('continuous_authorized') is True:
+            # The transport rechecks explicit care scope and the durable 3/hour budget.
+            waits=[]
+            if len(recent)>=8:waits.append(3600-(now-sorted(r['time'] for r in recent)[-8]))
         else:
             waits = [300 - (now - r['time']) for r in same]
             if len(recent) >= 8:
@@ -306,7 +355,9 @@ def grok_visible_title_matches(visible, title, sidebar=False):
 
 def grok_target(request, root=None):
     """Bind stable desktop ID to unique full title and project, never snippets."""
-    root = root or Path.home() / 'Library/Application Support/com.grokapp.grok-app'
+    root = root or _app_root(
+        ('com.grokapp.grok-app',), ('com.grokapp.grok-app', 'Grok'),
+        (('sessions_index.json', 'json'), ('projects.json', 'json')))
     def read(name, limit):
         path = root / name
         for attempt in range(2):
@@ -344,7 +395,7 @@ def grok_target(request, root=None):
         project = project[0]
         if len([p for p in projects if p.get('name') == project['name']]) != 1:
             raise Blocked('target_unverified')
-        if not isinstance(project.get('path'), str) or not project['path'].startswith('/'):
+        if not isinstance(project.get('path'), str) or not _local_project(project['path']):
             raise Blocked('target_unverified')
         return title, project['name'], project['path']
     except (OSError, ValueError, KeyError, TypeError):
@@ -367,7 +418,7 @@ def zcode_target(request, root=None):
         if len(matches) != 1:
             raise Blocked('target_unverified')
         _, project, _, title = matches[0]
-        if (not isinstance(project, str) or not project.startswith('/') or
+        if (not isinstance(project, str) or not _local_project(project) or
                 not isinstance(title, str) or not title or
                 project != request.get('project') or title != request.get('title')):
             raise Blocked('target_unverified')
@@ -398,7 +449,8 @@ def qoder_target(request, root=None):
             request.get('id') != app_id + ':' + sid):
         raise Blocked('target_unverified')
     folder = 'com.qoder.app.stable' if app_id == 'qoder' else 'com.qodercn.app.stable'
-    path = root or Path.home() / 'Library/Application Support' / folder / 'main.sqlite'
+    names = (folder, 'Qoder' if app_id == 'qoder' else 'Qoder CN')
+    path = root or _app_root((folder,), names, (('main.sqlite', 'sqlite'),)) / 'main.sqlite'
     try:
         with sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=0.5) as db:
             db.execute('PRAGMA query_only=ON')
@@ -422,7 +474,7 @@ def qoder_target(request, root=None):
         title, project = rows[0]
         if (not isinstance(title, str) or title != request.get('title') or
                 title != request.get('navigation_title') or not isinstance(project, str) or
-                not project.startswith('/') or project != request.get('project') or
+                not _local_project(project) or project != request.get('project') or
                 not Path(project).name):
             raise Blocked('target_unverified')
         return sid, title, workspace_name or Path(project).name, project
@@ -1447,6 +1499,9 @@ def main():
         if len(raw) > 16384:
             raise Blocked('invalid_request')
         request = json.loads(raw)
+        if os.name=="nt":
+            from supervisor.windows_bridge import execute
+            print(json.dumps(execute(request)));return
         if request.get('mode') == 'judge':
             try:
                 try:

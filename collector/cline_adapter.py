@@ -3,6 +3,7 @@
 All databases are opened read-only; SQLite honors live WAL/locking. A session
 creation timestamp and a running desktop process cannot prove an active turn.
 """
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -43,7 +44,7 @@ class ClineCollector:
         self.last_errors = []
         processes = self.process_supplier()
         gui_pid = next((pid for pid, path in processes.items()
-                        if path.endswith(APP_PATH + 'cline-app')), None)
+                        if path.endswith(APP_PATH + 'cline-app') or os.name=="nt" and path.lower()=="cline.exe"), None)
         if gui_pid is None:
             return []
         try:
@@ -131,7 +132,7 @@ class ClineCollector:
                     started, ended = (started if not terminal else 0), registry_end
                 elif not terminal:
                     worker = processes.get(session['pid'], '')
-                    alive = APP_PATH in worker
+                    alive = APP_PATH in worker or os.name=="nt" and worker.lower()=="cline.exe"
                     fresh = -30 <= now - last_activity <= FRESH_SECONDS
                     if started and alive and fresh and session['status'] in ('running', 'active', 'busy', 'idle'):
                         status, reason = 'running', 'Cline 本轮已开始，执行进程存活且有近期运行事件'

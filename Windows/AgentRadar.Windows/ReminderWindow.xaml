@@ -1,0 +1,23 @@
+<Window x:Class="AgentRadar.Windows.ReminderWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="AI 监督提醒"
+        Width="240"
+        SizeToContent="Height"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        Topmost="True"
+        ShowInTaskbar="False"
+        ShowActivated="False"
+        ResizeMode="NoResize"
+        WindowStartupLocation="Manual"
+        UseLayoutRounding="True"
+        FontFamily="Segoe UI, Microsoft YaHei UI"
+        Foreground="White"
+        AutomationProperties.AutomationId="reminder.panel"
+        AutomationProperties.Name="AI 监督提醒">
+  <Border x:Name="Shell" CornerRadius="18" Padding="10">
+    <StackPanel x:Name="Root" Width="220"/>
+  </Border>
+</Window>

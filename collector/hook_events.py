@@ -6,7 +6,10 @@ here installs or edits Claude's own hook settings.
 """
 from __future__ import annotations
 
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    from collector.runtime_paths import fcntl_compat as fcntl
 import json
 import math
 import os
@@ -36,7 +39,8 @@ HOOK_EVENTS = {
 
 
 def default_path() -> Path:
-    return Path.home() / "Library" / "Application Support" / "AgentRadar" / "claude-lifecycle.jsonl"
+    from collector.runtime_paths import support_directory
+    return support_directory() / "claude-lifecycle.jsonl"
 
 
 def turn_id_of(data: dict) -> str | None:
@@ -263,7 +267,7 @@ def _write_fd(fd: int, events: list[dict]) -> None:
             raise OSError("short write")
         view = view[wrote:]
     os.fsync(fd)
-    os.fchmod(fd, 0o600)
+    if hasattr(os,"fchmod"): os.fchmod(fd, 0o600)
 
 
 def _kept(before: list[dict], after: list[dict], event: dict) -> bool:

@@ -5,6 +5,7 @@ requests, chat exports, or app UI interaction are needed by these collectors.
 """
 from __future__ import annotations
 
+import os
 import json
 from pathlib import Path
 import sqlite3
@@ -14,10 +15,10 @@ from uuid import UUID
 
 try:
     from .codex_adapter import _timestamp, _text
-    from .desktop_adapters import _processes
+    from .desktop_adapters import _processes, _belongs_to_app
 except ImportError:
     from codex_adapter import _timestamp, _text
-    from desktop_adapters import _processes
+    from desktop_adapters import _processes, _belongs_to_app
 
 LIMIT = 40
 TAIL_BYTES = 512 * 1024
@@ -71,13 +72,21 @@ class ExtendedCollector:
                                      ('qoder', 'Qoder', 'com.qoder.app.stable'),
                                      ('grok', 'Grok', 'com.grokapp.grok-app')]:
             pid = next((pid for pid, executable in processes.items()
-                        if f'/{name}.app/Contents/MacOS/' in executable), None)
+                        if _belongs_to_app(executable,name)), None)
             if pid is None:
                 for row in self._last.get(app_id, []):
                     rows.append({**row, 'pid': None, 'status': 'unknown',
                                  'status_reason': '对应应用进程已退出或暂不可确认，状态留在后台'})
                 continue
             root = self.home / 'Library/Application Support' / folder
+            if os.name=='nt':
+                from collector.runtime_paths import app_support_root
+                marker=(('main.sqlite','sqlite'),) if app_id!='grok' else (('sessions_index.json','json'),)
+                names=(folder,name,name.replace(' ',''))
+                candidate=app_support_root(self.home,(folder,),names,marker)
+                if candidate.path is None:
+                    self.last_errors.append(name+' 本地数据目录待确认：'+candidate.state);continue
+                root=candidate.path
             if not root.exists():
                 self._last.pop(app_id, None)
                 continue
