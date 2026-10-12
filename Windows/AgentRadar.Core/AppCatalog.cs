@@ -25,6 +25,9 @@ public static class AppCatalog {
         ("windsurf", "windsurf", "Windsurf"),
         ("lmstudio", "lmstudio", "LM Studio"),
         ("workbuddy", "workbuddy", "WorkBuddy"),
+        ("workbuddy-ai", "workbuddy-ai", "WorkBuddy AI"),
+        ("trae-solo", "trae-solo", "TRAE SOLO"),
+        ("minimax", "minimax", "MiniMax Design"),
         ("zcode", "zcode", "ZCode"),
         ("autoclaw", "autoclaw", "AutoClaw"),
     ];

@@ -81,7 +81,7 @@ public static class SmokeHarness {
   public void SetKeepAwake(bool enabled){}public void SetStartup(bool enabled){}
  }
  sealed class FixtureWorker:IWorkerClient {
-  public event Action<CollectorSnapshot>? Snapshot;public event Action<string>? Fault;
+  public event Action<CollectorSnapshot>? Snapshot;public event Action<string>? Fault {add{}remove{}}
   public int RealSends{get;private set;}=0;
   public List<SessionRecord> Rows{get;}=[];
   public Task StartAsync(CancellationToken token=default){var now=DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()/1000d;Rows.Clear();Rows.Add(new SessionRecord{Id="codex:11111111-1111-4111-8111-111111111111",AppId="codex",AppName="Codex",Title="Fixture conversation",Project="C:\\Fixture\\VideoOS",Status="running",Evidence="isolated lifecycle fixture",Source="local-session",Target="fixture://disabled",StartedAt=now-20,UpdatedAt=now,TimingBasis="turn"});Rows.Add(new SessionRecord{Id="openclaw:main:22222222-2222-4222-8222-222222222222",AppId="openclaw",AppName="OpenClaw",Title="Fixture OpenClaw",Project="C:\\Fixture\\Research",Status="unknown",Source="local-db",NavigationKey="agent:main:dashboard:fixture",UpdatedAt=now,ManualOnly=true});Snapshot?.Invoke(new CollectorSnapshot{Sessions=Rows,CollectedAt=now});return Task.CompletedTask;}

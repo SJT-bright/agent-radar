@@ -173,7 +173,7 @@ class TitleReader:
     def __init__(self, home=None):
         from collector.runtime_paths import app_support_root
         candidate=app_support_root(home,('AutoClaw',),('AutoClaw','autoclaw'),(('Local Storage/leveldb','leveldb'),))
-        self.directory=(candidate.path / 'Local Storage/leveldb') if candidate.path is not None else Path(home or Path.home()) / '.agent-radar-unconfirmed-autoclaw-root' 
+        self.directory=(candidate.path / 'Local Storage/leveldb') if candidate.path is not None else Path(home or Path.home()) / '.agent-radar-unconfirmed-autoclaw-root'
         self.signature = None
         self.result = {}
 
