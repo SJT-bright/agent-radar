@@ -118,6 +118,22 @@ import Foundation
         old.save(to: defaults)
         check(PromptRules.load(from: defaults).ragePrompt(forApp: "grok") == "我自己的 Grok 长期提示词",
               "user-customized Grok prompt survives migration")
+        let careDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("radar-care-store-" + UUID().uuidString)
+        try! FileManager.default.createDirectory(at: careDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: careDirectory) }
+        let careURL = careDirectory.appendingPathComponent("selection.json")
+        let careID = "openclaw:main:11111111-1111-4111-8111-111111111111"
+        _ = try! OpenClawCareRegistry.update(careURL, id: careID, enabled: true)
+        let careStore = MonitorStore(defaults: defaults, writeHealthDiagnostics: false, careRegistryURL: careURL)
+        var cared = row(careID, "completed", app: "openclaw")
+        cared.source = "local-db"; cared.navigation_key = "agent:main:dashboard:fixture"; cared.manual_only = true; cared.continuous_authorized = true
+        careStore.sessions = [cared]
+        check(careStore.displaySessions.contains { $0.id == careID }, "cared terminal survives day boundary without desktop app")
+        check(careStore.visibleSessions.contains { $0.id == careID }, "cared terminal remains in detailed list without live window")
+        careStore.sessions = []
+        careStore.removeSupervision(sessionID: careID)
+        check(!careStore.openClawCareIDs.contains(careID), "offline care can be revoked by stable ID")
+        check(try! OpenClawCareRegistry.read(careURL).care.isEmpty, "offline revocation persists")
         print("Supervision Store: \(count) checks passed")
     }
 }
