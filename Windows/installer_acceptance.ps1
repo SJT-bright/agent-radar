@@ -17,6 +17,7 @@ if($Mode -eq 'install'){
  if(-not (Test-Path "$install/AgentRadar.exe") -or -not (Test-Path "$install/Resources/radar-worker/radar-worker.exe")){throw 'Installed product or worker missing'}
  $runKey="HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
  if((Get-ItemProperty $runKey -Name AgentRadar -ErrorAction SilentlyContinue).AgentRadar){throw "Startup fixture already exists"}
+ if(-not (Test-Path $runKey)){New-Item -Path $runKey | Out-Null}
  New-ItemProperty -Path $runKey -Name AgentRadar -Value ('"'+(Join-Path $install 'AgentRadar.exe')+'"') -PropertyType String | Out-Null
  $original=(Get-FileHash "$dest/publish/AgentRadar.exe" -Algorithm SHA256).Hash
  $installed=(Get-FileHash "$install/AgentRadar.exe" -Algorithm SHA256).Hash
