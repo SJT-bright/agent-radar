@@ -15,6 +15,9 @@ if($Mode -eq 'install'){
  $p=Start-Process -FilePath $setup.FullName -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-',"/DIR=`"$install`"",'/TASKS=') -Wait -PassThru
  if($p.ExitCode -ne 0){throw "Silent installer exit $($p.ExitCode)"}
  if(-not (Test-Path "$install/AgentRadar.exe") -or -not (Test-Path "$install/Resources/radar-worker/radar-worker.exe")){throw 'Installed product or worker missing'}
+ $runKey="HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+ if((Get-ItemProperty $runKey -Name AgentRadar -ErrorAction SilentlyContinue).AgentRadar){throw "Startup fixture already exists"}
+ New-ItemProperty -Path $runKey -Name AgentRadar -Value ('"'+(Join-Path $install 'AgentRadar.exe')+'"') -PropertyType String | Out-Null
  $original=(Get-FileHash "$dest/publish/AgentRadar.exe" -Algorithm SHA256).Hash
  $installed=(Get-FileHash "$install/AgentRadar.exe" -Algorithm SHA256).Hash
  if($original -ne $installed){throw 'Installed native program differs from packaged program'}
@@ -27,6 +30,8 @@ if($Mode -eq 'install'){
  if($p.ExitCode -ne 0){throw 'Uninstall failed'}
  if((Get-FileHash $marker -Algorithm SHA256).Hash -ne $j.marker_hash){throw 'User data marker changed during install or uninstall'}
  if(Test-Path "$install/AgentRadar.exe"){throw 'Installed executable still exists after uninstall'}
+ if((Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name AgentRadar -ErrorAction SilentlyContinue).AgentRadar){throw "Owned startup entry survived uninstall"}
+ $j | Add-Member -NotePropertyName owned_startup_removed -NotePropertyValue $true
  $j.all_passed=$true;$j | Add-Member -NotePropertyName uninstalled -NotePropertyValue $true
  $j | ConvertTo-Json | Set-Content -Encoding utf8 $proof
  Remove-Item $marker

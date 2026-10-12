@@ -45,6 +45,6 @@ python -B -m unittest discover -s tests -p 'test_windows*.py' -v
 ./Windows/build.ps1
 ```
 
-构建需要 .NET 10 SDK、Python 3.12 和 Inno Setup。WPF 是 Windows 原生桌面框架，见 [Microsoft 官方说明](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/overview/)。GitHub Actions 在 Windows runner 中构建安装版与便携版，再运行冻结采集器验收及实际 WPF 控件测试。隔离验收不调用真实 AI 应用或发送消息。
+构建需要 .NET 10 SDK、Python 3.12 和 Inno Setup。WPF 是 Windows 原生桌面框架，见 [Microsoft 官方说明](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/overview/)。GitHub Actions 在 Windows runner 中构建安装版与便携版，再安装到含中文与空格的目录，运行安装后的冻结采集器及实际 WPF 控件测试，并检查卸载保留用户数据。隔离验收不调用真实 AI 应用或发送消息。
 
 源码采用仓库根目录 MIT 许可。安装包依赖的 .NET、Python、PyInstaller 和 Inno Setup 各自保留原许可。

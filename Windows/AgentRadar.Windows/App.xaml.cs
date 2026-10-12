@@ -100,7 +100,8 @@ public partial class App : System.Windows.Application
         _window.AttachPlatform(platform);
         _window.ExitRequested += ExitProduct;
         _window.Show();
-        ApplyPlatform(runtime.Settings.KeepAwake, runtime.Settings.StartWithWindows, report: true);
+        if(!repository.LastLoadFailed)ApplyPlatform(runtime.Settings.KeepAwake, runtime.Settings.StartWithWindows, report: true);
+        else _window.Report("设置文件暂不可读，以仅提醒启动；原文件及登录启动项已保留。");
         _tray = new TrayIcon(ShowExisting, ExitProduct);
         var start = runtime.StartAsync(_lifetime.Token);
         _ = start.ContinueWith(task =>

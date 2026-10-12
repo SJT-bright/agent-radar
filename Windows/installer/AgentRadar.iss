@@ -38,3 +38,13 @@ Name: "{autodesktop}\任务雷达"; Filename: "{app}\AgentRadar.exe"; Tasks: des
 [Run]
 Filename: "{app}\AgentRadar.exe"; Description: "打开任务雷达"; Flags: nowait postinstall skipifsilent
 ; User settings, queues, journals and sessions live outside {app}; uninstall never deletes them.
+
+[Code]
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var StartupCommand: String;
+begin
+  if CurUninstallStep = usUninstall then
+    if RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'AgentRadar', StartupCommand) then
+      if CompareText(StartupCommand, '"' + ExpandConstant('{app}\AgentRadar.exe') + '"') = 0 then
+        RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'AgentRadar');
+end;
