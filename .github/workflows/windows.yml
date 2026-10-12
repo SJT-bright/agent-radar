@@ -31,19 +31,25 @@ jobs:
       - name: Build portable and installer
         shell: pwsh
         run: ./Windows/build.ps1
+      - name: Actual installer acceptance
+        shell: pwsh
+        run: ./Windows/installer_acceptance.ps1 install
       - name: Packaged worker acceptance
         shell: pwsh
         run: |
-          & build/windows/publish/Resources/radar-worker/radar-worker.exe --self-test build/windows/worker-acceptance.json
+          & "$pwd/build/windows/安装验收 任务雷达/Resources/radar-worker/radar-worker.exe" --self-test build/windows/worker-acceptance.json
           if($LASTEXITCODE -ne 0){throw 'Packaged worker test failed'}
       - name: Actual WPF controls acceptance
         shell: pwsh
         run: |
-          $p=Start-Process -FilePath build/windows/publish/AgentRadar.exe -ArgumentList @('--smoke-test', "$pwd/build/windows/ui-acceptance") -PassThru
+          $p=Start-Process -FilePath "$pwd/build/windows/安装验收 任务雷达/AgentRadar.exe" -ArgumentList @('--smoke-test', "$pwd/build/windows/ui-acceptance") -PassThru
           if(-not $p.WaitForExit(120000)){ $p.Kill(); throw 'WPF acceptance timeout' }
           if($p.ExitCode -ne 0){ throw 'WPF acceptance failed' }
           $j=Get-Content build/windows/ui-acceptance/result.json -Raw | ConvertFrom-Json
           if(-not $j.all_passed){ throw 'UI checks did not pass' }
+      - name: Uninstall and preserve user data
+        shell: pwsh
+        run: ./Windows/installer_acceptance.ps1 uninstall
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -51,5 +57,6 @@ jobs:
           path: |
             build/windows/release/*
             build/windows/worker-acceptance.json
+            build/windows/installer-acceptance.json
             build/windows/ui-acceptance/*
           retention-days: 14

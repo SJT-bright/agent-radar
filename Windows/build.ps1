@@ -7,6 +7,7 @@ python -m PyInstaller --noconfirm --clean --name radar-worker --distpath "$dest/
 if($LASTEXITCODE -ne 0){throw 'Worker packaging failed'}
 dotnet publish "$PSScriptRoot/AgentRadar.Windows/AgentRadar.Windows.csproj" -c Release -r win-x64 --self-contained true -p:Version=$Version -p:DebugType=None -o "$dest/publish"
 if($LASTEXITCODE -ne 0){throw 'Windows publish failed'}
+if(Test-Path "$root/LICENSE"){Copy-Item "$root/LICENSE" "$dest/publish/LICENSE.txt"}
 New-Item -ItemType Directory -Force -Path "$dest/publish/Resources" | Out-Null
 Copy-Item "$dest/worker/radar-worker" "$dest/publish/Resources/radar-worker" -Recurse -Force
 New-Item -ItemType Directory -Force -Path "$dest/release" | Out-Null
