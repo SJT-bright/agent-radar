@@ -83,6 +83,7 @@
     <Setter Property="SpellCheck.IsEnabled" Value="False"/>
   </Style>
 
+  <Style TargetType="MenuItem"><Setter Property="Foreground" Value="White"/><Setter Property="Background" Value="Transparent"/></Style>
   <Style TargetType="ScrollViewer">
     <Setter Property="Background" Value="Transparent"/>
   </Style>
