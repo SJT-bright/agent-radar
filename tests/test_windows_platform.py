@@ -76,7 +76,9 @@ class PortableTests(unittest.TestCase):
                 result=dict(code=code,identity=True,stable_id=sid,busy=False,input_count=1,send_available=True,send_enabled=True,empty=not value[0],digest=hashlib.sha256(value[0].encode()).hexdigest(),focused=True,attempted=payload['stage'] in ('write','send'))
                 return 0,json.dumps(result).encode()
             backend=win.WindowsBackend(request,helper=helper,reader=lambda _:dict(row),identity=lambda _:None,idle=lambda:10,locked=lambda:False,runner=runner)
-            result=perform(request,backend,Journal(Path(tmp)/'journal'))
+            journal=Journal(Path(tmp)/'journal')
+            try:result=perform(request,backend,journal)
+            finally:journal.lock.close()
             self.assertEqual(result['code'],'sent_pending_confirmation');self.assertEqual(stages.count('write'),1);self.assertEqual(stages.count('send'),1)
     def test_window_title_uniqueness_cannot_be_supplied_by_request(self):
         import time
