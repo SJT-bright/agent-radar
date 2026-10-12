@@ -128,5 +128,13 @@ public static class StagePolicy {
         return hint.Length > 0 && hint == wanted;
     }
 
+    public static bool MetadataCarriesThread(string name,string automationId,string helpText,IEnumerable<string> keys,bool windowTitle) {
+        // Document/editor names can contain drafts or historical messages.
+        // Only a window title or non-content identifiers may carry identity.
+        return keys.Where(k=>k.Length>=16).Any(k=>(windowTitle&&name.Length<=512&&name.Contains(k,StringComparison.Ordinal))
+            || automationId.Length<=512&&automationId.Contains(k,StringComparison.Ordinal)
+            || helpText.Length<=512&&helpText.StartsWith("codex://threads/",StringComparison.Ordinal)&&helpText.Contains(k,StringComparison.Ordinal));
+    }
+
     public static string FormatSeconds(double value) => value.ToString("0.###", CultureInfo.InvariantCulture);
 }
