@@ -8,7 +8,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from collector.codex_adapter import SessionCollector, TailCache, _codex_status, _codex_lifecycle, _readonly
+from collector import hook_events
+from collector.codex_adapter import (SessionCollector, TailCache, _claude_resolve, _codex_lifecycle,
+                                     _codex_status, _readonly)
 
 
 def event(kind, stamp=100, **payload):
@@ -189,7 +191,7 @@ class StatusTests(unittest.TestCase):
     def test_missing_sources_create_no_files(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
-            collector = SessionCollector(root / "codex", root / "claude")
+            collector = SessionCollector(root / "codex", root / "claude", root / "lifecycle.jsonl")
             with patch("collector.codex_adapter._processes", return_value={}):
                 self.assertEqual(collector.collect(), [])
             self.assertEqual(list(root.iterdir()), [])
@@ -308,7 +310,8 @@ class CollectorTests(unittest.TestCase):
         self.codex.mkdir()
         self.claude = self.root / "claude"
         self.claude.mkdir()
-        self.collector = SessionCollector(self.codex, self.claude)
+        self.lifecycle = self.root / "claude-lifecycle.jsonl"
+        self.collector = SessionCollector(self.codex, self.claude, self.lifecycle)
         self.db = self.codex / "state_5.sqlite"
         with sqlite3.connect(self.db) as con:
             con.execute("CREATE TABLE threads(id TEXT,name TEXT,title TEXT,cwd TEXT,rollout_path TEXT,"
@@ -471,15 +474,15 @@ class CollectorTests(unittest.TestCase):
         # 必须兜底出真实行，subagent/guardian_review 排除，时间线来自 thread_turns。
         (self.codex / "state_5.sqlite").unlink()
         now = time.time()
-        self.rollout("ecc793cc-aaff-56c5-b399-865d5a506662", "/projects/迁移期项目")
-        self.rollout("7d5a1f26-d63a-576f-9aa4-0f1c9ee289a3", "/x", thread_source="subagent")
-        self.rollout("d8f370e5-d171-5afc-a837-3a2378b16991", "/x", thread_source="guardian_review")
+        self.rollout("01a0fdcd-6806-7470-abfb-609fa29a6af0", "/projects/迁移期项目")
+        self.rollout("01a0fdce-0000-7470-abfb-609fa29a6af0", "/x", thread_source="subagent")
+        self.rollout("01a0fdcf-1111-7470-abfb-609fa29a6af0", "/x", thread_source="guardian_review")
         with sqlite3.connect(self.codex / "thread_history_1.sqlite") as con:
             con.execute("INSERT INTO thread_turns VALUES(?,?,?,?,?)",
-                        ("ecc793cc-aaff-56c5-b399-865d5a506662", "completed", now - 300, now - 60, 1))
+                        ("01a0fdcd-6806-7470-abfb-609fa29a6af0", "completed", now - 300, now - 60, 1))
         with patch("collector.codex_adapter._codex_owners", return_value={}):
             rows = self.collector._codex({})
-        self.assertEqual([r["id"] for r in rows], ["codex:ecc793cc-aaff-56c5-b399-865d5a506662"])
+        self.assertEqual([r["id"] for r in rows], ["codex:01a0fdcd-6806-7470-abfb-609fa29a6af0"])
         self.assertEqual(rows[0]["status"], "completed")
         self.assertEqual(rows[0]["project"], "/projects/迁移期项目")
         self.assertEqual(rows[0]["started_at"], now - 300)
@@ -490,7 +493,7 @@ class CollectorTests(unittest.TestCase):
     def test_migration_and_empty_fallback_degrades_previous_rows(self):
         # 兜底也为空（无 rollout）时保持既有降级：上次行以 unknown 展示并报错。
         (self.codex / "state_5.sqlite").unlink()
-        self.rollout("ecc793cc-aaff-56c5-b399-865d5a506662", "/projects/示例")
+        self.rollout("01a0fdcd-6806-7470-abfb-609fa29a6af0", "/projects/示例")
         with patch("collector.codex_adapter._codex_owners", return_value={"abc": 8}):
             first = self.collector._codex({8: {"app": "codex"}})
         self.assertEqual(first[0]["status"], "unknown")
@@ -576,6 +579,211 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(rows[0]["title"], "我的任务")
         self.assertEqual(rows[0]["app_id"], "claude-code")
         self.assertEqual(rows[0]["id"], "claude:abc")
+
+    def _proc(self):
+        return {12: {"app": "claude", "started": "START"}}
+
+    def _descriptor(self, **fields):
+        payload = {"pid": 12, "sessionId": "abc", "status": "busy", "procStart": "START",
+                   "cwd": "/example", "name": "我的任务"}
+        payload.update(fields)
+        sessions = self.claude / "sessions"
+        sessions.mkdir(exist_ok=True)
+        (sessions / "12.json").write_text(json.dumps(payload))
+
+    def _log(self, *events, sid="abc"):
+        folder = self.claude / "projects" / "-example"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / (sid + ".jsonl")).write_text("".join(json.dumps(event) + "\n" for event in events))
+
+    def _record(self, kind, turn="turn-1", stamp=200):
+        names = {"turn_started": "UserPromptSubmit", "turn_completed": "Stop",
+                 "turn_failed": "StopFailure", "permission_wait": "PermissionRequest"}
+        if kind == "user_stopped":
+            payload = {"event": "user_stopped", "session_id": "abc", "turn_id": turn,
+                       "cwd": "/example", "timestamp": stamp}
+        else:
+            payload = {"hook_event_name": names[kind], "session_id": "abc", "prompt_id": turn,
+                       "cwd": "/example", "timestamp": stamp, "prompt": "SECRET_PROMPT",
+                       "tool_input": {"command": "SECRET_TOOL"},
+                       "last_assistant_message": "SECRET_ANSWER"}
+        result = hook_events.record(payload, self.lifecycle, now=1_000)
+        self.assertTrue(result["stored"], result)
+        self.assertNotIn("SECRET", self.lifecycle.read_text(encoding="utf-8"))
+        return result
+
+    def test_claude_tail_retains_turn_id_not_message_text(self):
+        folder = self.claude / "projects" / "-example"
+        folder.mkdir(parents=True)
+        path = folder / "abc.jsonl"
+        path.write_text(json.dumps({"type": "assistant", "timestamp": 200, "prompt_id": "turn-1",
+                                    "cwd": "/example", "message": {"stop_reason": "end_turn",
+                                                                   "content": "SECRET_BODY"}}) + "\n")
+        cache = TailCache()
+        state = cache.read(path, "claude")
+        self.assertEqual((state["status"], state["turn_id"], state["event"]), ("completed", "turn-1", "end_turn"))
+        self.assertNotIn("SECRET_BODY", json.dumps(cache.entries))
+
+    def test_tool_use_without_a_descriptor_stays_unknown(self):
+        self._log({"type": "assistant", "timestamp": 50, "message": {"stop_reason": "tool_use",
+                                                                    "content": "SECRET_BODY"}})
+        rows = self.collector._claude({})
+        self.assertEqual(rows[0]["status"], "unknown")
+        self.assertNotIn("SECRET_BODY", json.dumps(rows))
+
+    def test_old_busy_without_a_terminal_event_stays_running(self):
+        self._descriptor(updatedAt=1, turn_id="turn-1")
+        rows = self.collector._claude(self._proc())
+        self.assertEqual(rows[0]["status"], "running")
+        self.assertNotIn("user_stopped", rows[0])
+        self.assertEqual(rows[0]["evidence"], "CLI 会话状态 busy；PID 与启动时间匹配")
+
+    def test_newer_same_turn_end_overrides_older_busy_descriptor(self):
+        self._descriptor(updatedAt=100, turn_id="turn-1")
+        self._log({"type": "assistant", "timestamp": 200, "prompt_id": "turn-1", "cwd": "/example",
+                   "message": {"stop_reason": "end_turn", "content": "SECRET_BODY"}})
+        rows = self.collector._claude(self._proc())
+        self.assertEqual(rows[0]["status"], "completed")
+        self.assertEqual(rows[0]["ended_at"], 200)
+        self.assertIn("end_turn", rows[0]["evidence"])
+        self.assertNotIn("user_stopped", rows[0])
+        self.assertNotIn("SECRET_BODY", json.dumps(rows))
+
+    def test_end_without_a_shared_turn_does_not_pass_busy_or_completed(self):
+        self._descriptor(updatedAt=100)
+        self._log({"type": "assistant", "timestamp": 200, "cwd": "/example",
+                   "message": {"stop_reason": "end_turn", "content": "SECRET_BODY"}})
+        rows = self.collector._claude(self._proc())
+        self.assertEqual(rows[0]["status"], "unknown")
+        self.assertNotIn("ended_at", rows[0])
+        self.assertNotIn("started_at", rows[0])
+
+    def test_older_end_from_another_turn_does_not_clear_newer_busy(self):
+        self._descriptor(updatedAt=300, turn_id="turn-2")
+        self._log({"type": "assistant", "timestamp": 200, "prompt_id": "turn-1",
+                   "message": {"stop_reason": "end_turn"}})
+        rows = self.collector._claude(self._proc())
+        self.assertEqual(rows[0]["status"], "running")
+
+    def test_newer_end_from_another_turn_stays_unknown(self):
+        self._descriptor(updatedAt=100, turn_id="turn-1")
+        self._log({"type": "assistant", "timestamp": 200, "prompt_id": "turn-2",
+                   "message": {"stop_reason": "end_turn"}})
+        rows = self.collector._claude(self._proc())
+        self.assertEqual(rows[0]["status"], "unknown")
+
+    def test_newer_same_turn_busy_keeps_running_over_an_older_end(self):
+        self._descriptor(updatedAt=300, turn_id="turn-1")
+        self._log({"type": "assistant", "timestamp": 200, "prompt_id": "turn-1",
+                   "message": {"stop_reason": "end_turn"}})
+        rows = self.collector._claude(self._proc())
+        self.assertEqual(rows[0]["status"], "running")
+
+    def test_same_turn_without_comparable_times_stays_unknown(self):
+        self._descriptor(turn_id="turn-1")
+        self._log({"type": "assistant", "timestamp": 200, "prompt_id": "turn-1",
+                   "message": {"stop_reason": "end_turn"}})
+        rows = self.collector._claude(self._proc())
+        self.assertEqual(rows[0]["status"], "unknown")
+
+    def test_idle_descriptor_is_not_replaced_by_a_transcript_end(self):
+        self._descriptor(status="idle", updatedAt=50, turn_id="turn-1")
+        self._log({"type": "assistant", "timestamp": 80, "prompt_id": "turn-1",
+                   "message": {"stop_reason": "end_turn"}})
+        rows = self.collector._claude(self._proc())
+        self.assertEqual(rows[0]["status"], "idle")
+        self.assertEqual(rows[0]["evidence"], "CLI 会话状态 idle；PID 与启动时间匹配")
+
+    def test_permission_descriptor_closes_on_a_newer_same_turn_end(self):
+        self._descriptor(status="waiting_for_permission", updatedAt=100, turn_id="turn-1")
+        self._log({"type": "system", "subtype": "turn_duration", "timestamp": 180, "prompt_id": "turn-1"})
+        rows = self.collector._claude(self._proc())
+        self.assertEqual(rows[0]["status"], "completed")
+        self.assertIn("turn_duration", rows[0]["evidence"])
+
+    def test_hook_completion_overrides_busy_descriptor(self):
+        self._descriptor()
+        self._record("turn_started", stamp=100)
+        self._record("turn_completed", stamp=180)
+        rows = self.collector._claude(self._proc())
+        self.assertEqual(rows[0]["status"], "completed")
+        self.assertEqual(rows[0]["title"], "我的任务")
+        self.assertEqual(rows[0]["project"], "/example")
+        self.assertEqual((rows[0]["started_at"], rows[0]["ended_at"], rows[0]["timing_basis"]), (100, 180, "turn"))
+        self.assertIn("正常结束", rows[0]["evidence"])
+        self.assertNotIn("user_stopped", rows[0])
+
+    def test_hook_file_alone_does_not_invent_a_session(self):
+        self._record("turn_started", stamp=100)
+        self._record("turn_completed", stamp=180)
+        self.assertEqual(self.collector._claude({}), [])
+
+    def test_newer_busy_descriptor_without_a_turn_blocks_an_older_hook_end(self):
+        self._record("turn_started", stamp=100)
+        self._record("turn_completed", stamp=150)
+        self._descriptor(updatedAt=300)
+        rows = self.collector._claude(self._proc())
+        self.assertEqual(rows[0]["status"], "unknown")
+        self.assertNotIn("ended_at", rows[0])
+
+    def test_permission_wait_is_not_a_stop(self):
+        self._descriptor()
+        self._record("turn_started", stamp=100)
+        self._record("permission_wait", stamp=140)
+        rows = self.collector._claude(self._proc())
+        self.assertEqual(rows[0]["status"], "waiting")
+        self.assertIn("权限", rows[0]["evidence"])
+        self.assertNotIn("user_stopped", rows[0])
+        self.assertNotEqual(rows[0]["status"], "interrupted")
+
+    def test_user_stop_is_not_completion_or_permission_wait(self):
+        self._descriptor()
+        self._record("turn_started", stamp=100)
+        self._record("user_stopped", stamp=160)
+        rows = self.collector._claude(self._proc())
+        self.assertEqual(rows[0]["status"], "interrupted")
+        self.assertTrue(rows[0]["user_stopped"])
+        self.assertIn("主动停止", rows[0]["status_reason"])
+        self.assertNotIn("权限", rows[0]["evidence"])
+
+    def test_stop_failure_is_not_a_user_stop(self):
+        self._descriptor()
+        self._record("turn_started", stamp=100)
+        self._record("turn_failed", stamp=160)
+        rows = self.collector._claude(self._proc())
+        self.assertEqual(rows[0]["status"], "interrupted")
+        self.assertNotIn("user_stopped", rows[0])
+        self.assertIn("失败", rows[0]["evidence"])
+        self.assertNotIn("主动", rows[0]["evidence"])
+
+    def test_completion_after_permission_wait_is_completed(self):
+        self._descriptor()
+        self._record("turn_started", stamp=100)
+        self._record("permission_wait", stamp=130)
+        self._record("turn_completed", stamp=170)
+        rows = self.collector._claude(self._proc())
+        self.assertEqual(rows[0]["status"], "completed")
+        self.assertNotIn("user_stopped", rows[0])
+
+    def test_late_old_turn_event_cannot_replace_the_current_turn(self):
+        self._descriptor()
+        self._record("turn_started", "turn-a", 100)
+        self._record("turn_completed", "turn-a", 120)
+        self._record("turn_started", "turn-b", 200)
+        rejected = hook_events.record(
+            {"hook_event_name": "PermissionRequest", "session_id": "abc", "prompt_id": "turn-a",
+             "cwd": "/example", "timestamp": 110, "tool_input": {"command": "SECRET_TOOL"}},
+            self.lifecycle, now=1_000)
+        self.assertFalse(rejected["stored"])
+        self.assertEqual(rejected["reason"], "late_turn")
+        rows = self.collector._claude(self._proc())
+        self.assertEqual(rows[0]["status"], "running")
+        self.assertNotIn("权限", rows[0]["evidence"])
+        self.assertNotIn("SECRET_TOOL", self.lifecycle.read_text(encoding="utf-8"))
+
+    def test_resolve_does_not_guess_interruption_from_age(self):
+        chosen = _claude_resolve({"status": "running", "at": 1, "turn_id": "turn-1", "raw": "busy"}, {}, None)
+        self.assertEqual(chosen["status"], "running")
 
 
 if __name__ == "__main__":

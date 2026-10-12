@@ -108,6 +108,31 @@ struct ToastWindowChecks {
         toast.closeAll()
         present(notice("d", "1"))
         expect(!panel.isVisible && displayed.count == 3, "Dismiss-all must still acknowledge retained completion rounds")
+        NoticeOpenFeedback.rejectionMessage = NoticeOpenFeedback.desktopBusy
+        expect(NoticeOpenFeedback.messageAfterOpen(accepted: false) == NoticeOpenFeedback.desktopBusy,
+               "A busy desktop channel keeps the reminder and explains the refusal")
+        expect(NoticeOpenFeedback.messageAfterOpen(accepted: true) == nil,
+               "An accepted open is the only result that dismisses the reminder")
+        NoticeOpenFeedback.rejectionMessage = nil
+        expect(NoticeOpenFeedback.messageAfterOpen(accepted: false) == NoticeOpenFeedback.missingSession,
+               "A missing session still uses the original not-found explanation")
+        var navigationDone: ((Bool) -> Void)?
+        var navigationCalls = 0
+        toast.show(notice("nav", "1"), anchor: anchor, cancel: {}, permission: {},
+            openAfterNavigation: { _, done in navigationCalls += 1; navigationDone = done })
+        toast.openCurrentSession(); toast.openCurrentSession()
+        expect(panel.isVisible && navigationCalls == 1, "An in-flight open retains its reminder and cannot run twice")
+        navigationDone?(false)
+        expect(panel.isVisible, "A failed asynchronous navigation keeps the reminder")
+        toast.openCurrentSession(); navigationDone?(true)
+        expect(!panel.isVisible && navigationCalls == 2, "Only completed successful navigation acknowledges its reminder")
+        toast.show(notice("nav-old", "1"), anchor: anchor, cancel: {}, permission: {},
+            openAfterNavigation: { _, done in navigationDone = done })
+        toast.openCurrentSession()
+        toast.closeAll(); present(notice("nav-new", "1"))
+        navigationDone?(true)
+        expect(panel.isVisible && displayed.last == "nav-new:1", "A late navigation result cannot dismiss a new reminder")
+        toast.closeAll()
         print("Toast geometry and presentation checks passed: \(count)")
     }
 }

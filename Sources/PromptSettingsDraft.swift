@@ -22,7 +22,8 @@ struct PromptSettingsDraft: Equatable {
         rateLimitWaitSeconds = rules.rateLimitWaitSeconds
         rateLimitText = rules.rateLimitText
         ragePrompt = rules.ragePrompt
-        // 原样复制 override 字典：草稿只承载显式自定义，留空表示用通用。
+        // 原样复制 override 字典：草稿只承载显式自定义。留空键在保存时删除。
+        // Grok 没有专属续接时使用软件默认，其他软件使用通用续接。
         appRagePrompts = rules.appRagePrompts
         appResumeTexts = rules.appResumeTexts
         rageAlternateEvery = rules.rageAlternateEvery
@@ -74,7 +75,8 @@ struct PromptSettingsDraft: Equatable {
         result.ragePrompt = ragePrompt
         // 合并语义：草稿只承载用户在该窗口碰过的应用；未涉及的键原样保留，
         // 窗口打开期间其它应用新出现的 override 不会被保存抹掉。
-        // 显式留空值由 normalized() 过滤，等于「移除专属、回到通用」。
+        // 显式留空值由 normalized() 删除该键。Grok 随后使用软件默认续接，
+        // 其他软件使用通用续接。
         for (appID, text) in appRagePrompts {
             result.appRagePrompts[appID] = text
         }
@@ -86,31 +88,50 @@ struct PromptSettingsDraft: Equatable {
         return result.normalized()
     }
 
+    func effectiveContinuation(forApp appID: String, saved: PromptRules) -> PromptRules.EffectivePrompt {
+        applying(to: saved).continuationEffect(forApp: appID)
+    }
+
+    func effectiveRecovery(forApp appID: String, saved: PromptRules) -> PromptRules.EffectivePrompt {
+        applying(to: saved).recoveryEffect(forApp: appID)
+    }
+
     var validationMessages: [String] {
-        var prompts: [(label: String, text: String, usesDefaultWhenEmpty: Bool)] = [
+        var messages: [String] = []
+        let prompts: [(label: String, text: String, usesDefaultWhenEmpty: Bool)] = [
             ("中断提示词", interruptText, false),
             ("限流提示词", rateLimitText, false),
             ("普通提示词", ragePrompt, true),
             ("特别提示词", rageAlternatePrompt, true)
         ]
+        func appendFieldWarnings(label: String, text: String, usesDefaultWhenEmpty: Bool) {
+            if text.unicodeScalars.count > PromptRules.maxLength {
+                messages.append("\(label)超过 \(PromptRules.maxLength) 字符；完整内容已保留，请删减后保存。")
+            }
+            if text.unicodeScalars.contains(where: Self.isRemovedControlCharacter) {
+                messages.append("\(label)包含控制字符，保存时会移除；换行和制表符会保留。")
+            }
+            if usesDefaultWhenEmpty && PromptRules.sanitize(text).isEmpty {
+                messages.append("\(label)为空或清理后为空，保存时会使用默认提示词。")
+            }
+        }
+        for prompt in prompts {
+            appendFieldWarnings(label: prompt.label, text: prompt.text, usesDefaultWhenEmpty: prompt.usesDefaultWhenEmpty)
+        }
         for (appID, text) in appRagePrompts.sorted(by: { $0.key < $1.key }) {
-            // 专属续接为空会回退通用提示词，与普通提示词同语义，需提示用户。
-            prompts.append(("\(PromptRules.appDisplayNames[appID] ?? appID) 专属提示词", text, true))
+            let label = "\(PromptRules.appDisplayNames[appID] ?? appID) 专属提示词"
+            appendFieldWarnings(label: label, text: text, usesDefaultWhenEmpty: false)
+            if PromptRules.sanitize(text).isEmpty {
+                if appID == "grok" {
+                    messages.append("\(label)为空或清理后为空，保存后不写入专属覆盖；下次普通续接使用 Grok 软件默认，不使用通用续接提示词。")
+                } else {
+                    messages.append("\(label)为空或清理后为空，保存后该软件使用通用续接提示词。")
+                }
+            }
         }
         for (appID, text) in appResumeTexts.sorted(by: { $0.key < $1.key }) {
-            prompts.append(("\(PromptRules.appDisplayNames[appID] ?? appID) 恢复提示词", text, false))
-        }
-        var messages: [String] = []
-        for prompt in prompts {
-            if prompt.text.unicodeScalars.count > PromptRules.maxLength {
-                messages.append("\(prompt.label)超过 \(PromptRules.maxLength) 字符；完整内容已保留，请删减后保存。")
-            }
-            if prompt.text.unicodeScalars.contains(where: Self.isRemovedControlCharacter) {
-                messages.append("\(prompt.label)包含控制字符，保存时会移除；换行和制表符会保留。")
-            }
-            if prompt.usesDefaultWhenEmpty && PromptRules.sanitize(prompt.text).isEmpty {
-                messages.append("\(prompt.label)为空或清理后为空，保存时会使用默认提示词。")
-            }
+            appendFieldWarnings(label: "\(PromptRules.appDisplayNames[appID] ?? appID) 恢复提示词",
+                                text: text, usesDefaultWhenEmpty: false)
         }
         if !(1...10).contains(rateLimitWaitSeconds) {
             messages.append("限流等待时间须为 1–10 秒，保存时会调整到此范围。")

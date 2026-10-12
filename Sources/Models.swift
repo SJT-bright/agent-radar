@@ -35,6 +35,9 @@ struct SessionRecord: Codable, Identifiable, Equatable {
     var navigation_title: String? = nil
     var navigation_key: String? = nil
     var user_stopped: Bool? = nil
+    var lifecycle_revision: String? = nil
+    var run_id: String? = nil
+    var manual_only: Bool? = nil
     var hasDisplayIdentity: Bool {
         let name = title.trimmingCharacters(in: .whitespacesAndNewlines)
         return !name.isEmpty && name != app_name &&
@@ -46,7 +49,9 @@ struct SessionRecord: Codable, Identifiable, Equatable {
     /// A verified Codex identity survives uncertain lifecycle evidence. Display
     /// does not grant automation or count an unknown conversation as running.
     var isDisplayable: Bool {
-        isReadable || (hasDisplayIdentity && app_id == "codex" && source == "local-session" &&
+        isReadable || (hasDisplayIdentity && app_id == "openclaw" && source == "local-db" &&
+            id.hasPrefix("openclaw:") && navigation_key?.hasPrefix("agent:") == true) ||
+        (hasDisplayIdentity && app_id == "codex" && source == "local-session" &&
             id.hasPrefix("codex:") && UUID(uuidString: String(id.dropFirst(6))) != nil &&
             target == "codex://threads/" + String(id.dropFirst(6)))
     }
@@ -90,7 +95,9 @@ struct SessionRecord: Codable, Identifiable, Equatable {
         }
     }
     var priority: Int {
-        ["interrupted": 0, "stalled": 1, "waiting": 2, "running": 3, "unknown": 4, "idle": 5, "completed": 6][status] ?? 4
+        // 手动停止不是待处理中断，不能靠 interrupted 的优先级自动排到运行中前面。
+        if userStoppedInterruption { return 6 }
+        return ["interrupted": 0, "stalled": 1, "waiting": 2, "running": 3, "unknown": 4, "idle": 5, "completed": 6][status] ?? 4
     }
     var isActive: Bool { ["running", "waiting", "stalled"].contains(status) }
     func elapsedLabel(at now: Double) -> String {
@@ -105,6 +112,19 @@ struct SessionRecord: Codable, Identifiable, Equatable {
         if seconds >= 3600 { return "\(seconds / 3600)时\((seconds % 3600) / 60)分" }
         if seconds >= 60 { return "\(seconds / 60)分\(seconds % 60)秒" }
         return "\(seconds)秒"
+    }
+}
+
+/// Same-turn result of opening the session named by a reminder.
+/// The toast reads it immediately after the open call returns.
+enum NoticeOpenFeedback {
+    static var rejectionMessage: String?
+    static let desktopBusy = "正在处理前一条对话，请等待操作结束后再打开会话"
+    static let missingSession = "原会话暂未读取到，请在对应应用中打开"
+    /// Nil means the navigation was accepted and the reminder may close.
+    static func messageAfterOpen(accepted: Bool) -> String? {
+        guard !accepted else { return nil }
+        return rejectionMessage ?? missingSession
     }
 }
 

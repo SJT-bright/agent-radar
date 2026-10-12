@@ -121,8 +121,8 @@ import Foundation
         var uncertainCodex = active
         uncertainCodex.app_id = "codex"
         uncertainCodex.app_name = "Codex"
-        uncertainCodex.id = "codex:f9160256-f9b4-5a49-b6a2-1c558250176b"
-        uncertainCodex.target = "codex://threads/f9160256-f9b4-5a49-b6a2-1c558250176b"
+        uncertainCodex.id = "codex:01a050b9-8392-74c2-ad6e-ca98cbc6503d"
+        uncertainCodex.target = "codex://threads/01a050b9-8392-74c2-ad6e-ca98cbc6503d"
         uncertainCodex.project = "/projects/long-conversation"
         store.apps.append(AppRecord(id: "codex", name: "Codex", bundleID: "com.openai.codex", pid: 43, path: ""))
         store.sessions = [uncertainCodex]
@@ -264,6 +264,152 @@ import Foundation
               "Only today's conversations surface for an idle app")
         check(store.conversationGroups.count == 1 && store.conversationGroups[0].sessions.count == 1,
               "Disclosed group history is limited to today")
+
+        var manualStop = sample("interrupted", start: now - 20, end: now)
+        manualStop.id = "manual"
+        manualStop.app_id = "manual-app"
+        manualStop.app_name = "A Manual"
+        manualStop.user_stopped = true
+        manualStop.updated_at = now
+        var realBreak = sample("interrupted", start: now - 40, end: now - 2)
+        realBreak.id = "real"
+        realBreak.app_id = "real-app"
+        realBreak.app_name = "M Real"
+        realBreak.updated_at = now - 2
+        var runningRow = sample("running", start: now - 15)
+        runningRow.id = "run"
+        runningRow.app_id = "run-app"
+        runningRow.app_name = "Z Run"
+        runningRow.updated_at = now - 1
+        check(manualStop.priority == sample("completed").priority && manualStop.priority > runningRow.priority,
+              "A manual stop uses the neutral completed priority and does not outrank running work")
+        check(realBreak.priority < runningRow.priority, "A real interruption still outranks running work")
+        store.apps = [
+            AppRecord(id: "manual-app", name: "A Manual", bundleID: "local.manual", pid: 11, path: ""),
+            AppRecord(id: "real-app", name: "M Real", bundleID: "local.real", pid: 12, path: ""),
+            AppRecord(id: "run-app", name: "Z Run", bundleID: "local.run", pid: 13, path: "")
+        ]
+        store.sessions = [manualStop, realBreak, runningRow]
+        check(store.displaySessions.map(\.id) == ["real", "run", "manual"],
+              "Real interruptions lead, running work follows, and a manual stop is not pinned first")
+
+        let dayStart = Calendar.current.startOfDay(for: Date(timeIntervalSince1970: now)).timeIntervalSince1970
+        let room = max(now - dayStart, 1)
+        let slot = room / 50
+        func stamp(_ steps: Double) -> Double { dayStart + room - steps * slot }
+        func dated(_ id: String, _ app: String, _ name: String, _ status: String, _ steps: Double) -> SessionRecord {
+            let when = stamp(steps)
+            var item = sample(status, start: when - slot, end: status == "running" ? nil : when)
+            item.id = id
+            item.app_id = app
+            item.app_name = name
+            item.updated_at = when
+            item.ended_at = status == "running" ? nil : when
+            return item
+        }
+        var quota: [SessionRecord] = [dated("shown-run", "shown", "Shown", "running", 0),
+                                      dated("also-run", "also", "Also", "running", 0.1)]
+        for index in 0..<15 { quota.append(dated("hist-\(index)", "shown", "Shown", "completed", 2 + Double(index))) }
+        quota.append(dated("also-old", "also", "Also", "completed", 30))
+        for index in 0..<12 { quota.append(dated("other-\(index)", "hidden", "Hidden", "completed", 0.2 + Double(index) * 0.01)) }
+        store.apps = [
+            AppRecord(id: "shown", name: "Shown", bundleID: "local.shown", pid: 21, path: ""),
+            AppRecord(id: "also", name: "Also", bundleID: "local.also", pid: 22, path: "")
+        ]
+        store.sessions = quota
+        let shownGroup = store.conversationGroups.first { $0.id == "shown" }
+        let alsoGroup = store.conversationGroups.first { $0.id == "also" }
+        check(shownGroup?.sessions.count == 13 &&
+              shownGroup?.sessions.contains { $0.id == "hist-0" } == true &&
+              shownGroup?.sessions.contains { $0.id == "hist-11" } == true &&
+              shownGroup?.sessions.contains { $0.id == "hist-14" } != true,
+              "Displayed-app history keeps the 12 newest rows and does not lose them to other software")
+        check(alsoGroup?.sessions.map(\.id) == ["also-run"],
+              "The global history cap still drops the oldest row once displayed apps fill it")
+        check(store.conversationGroups.allSatisfy { group in !group.sessions.contains { $0.id.hasPrefix("other-") } },
+              "History from an app that is not on screen cannot occupy the 12 slots")
+
+        store.apps = []
+        store.sessions = []
+        store.paused = false
+        store.errors = []
+        store.accessibility = true
+        let blank = store.emptyDisplayExplanation ?? ""
+        check(blank.contains("暂无可显示的对话") && blank.contains("查询") &&
+              !blank.contains("采集错误") && !blank.contains("暂停") && !blank.contains("过滤") && !blank.contains("权限"),
+              "An empty list with no fault still points at the existing check")
+        store.paused = true
+        check(store.emptyDisplayExplanation?.contains("监控已暂停") == true, "A paused empty list says monitoring is paused")
+        store.paused = false
+        store.errors = ["会话采集暂未更新，活动状态已降级"]
+        check(store.emptyDisplayExplanation?.contains("采集错误") == true, "Collector errors are visible on an empty list")
+        store.errors = []
+        store.accessibility = false
+        check(store.emptyDisplayExplanation?.contains("窗口读取权限") == true, "Missing window-read permission is stated on an empty list")
+        store.accessibility = true
+        var yesterday = sample("completed", start: now - 200_000, end: now - 190_000)
+        yesterday.id = "yesterday"
+        yesterday.updated_at = now - 190_000
+        yesterday.ended_at = now - 190_000
+        store.sessions = [yesterday]
+        check(store.displaySessions.isEmpty && store.emptyDisplayExplanation?.contains("当日或展示范围") == true &&
+              store.emptyDisplayExplanation?.contains("查询") == true,
+              "Rows outside today or the display range explain an empty list and keep the check entry")
+        var placeholder = yesterday
+        placeholder.id = "placeholder"
+        placeholder.title = "Test · 会话待识别"
+        placeholder.status = "running"
+        placeholder.updated_at = now
+        store.sessions = [placeholder]
+        check(store.displaySessions.isEmpty && store.emptyDisplayExplanation?.contains("过滤") != true,
+              "An unreadable placeholder is not described as a today or display-range filter")
+        store.accessibility = false
+        store.paused = true
+        store.errors = ["读取失败"]
+        store.sessions = [yesterday]
+        let combined = store.emptyDisplayExplanation ?? ""
+        check(combined.contains("监控已暂停") && combined.contains("采集错误") &&
+              combined.contains("窗口读取权限") && combined.contains("当日或展示范围") && combined.contains("查询"),
+              "Pause, collector error, permission and display-range filtering can be explained together")
+        store.paused = false
+        store.errors = []
+        store.accessibility = false
+        store.apps = [AppRecord(id: "run-app", name: "Z Run", bundleID: "local.run", pid: 13, path: "")]
+        store.sessions = [runningRow]
+        check(!store.displaySessions.isEmpty && store.emptyDisplayExplanation == nil,
+              "A readable local session stays listed without window permission")
+
+        let openSuite = suite + ".open"
+        let openDefaults = UserDefaults(suiteName: openSuite)!
+        defer { openDefaults.removePersistentDomain(forName: openSuite) }
+        let openController = ContinuationController(countDefaults: openDefaults)
+        let openStore = MonitorStore(defaults: openDefaults, writeHealthDiagnostics: false, continuation: openController)
+        var target = sample("running", start: now)
+        target.id = "notice-target"
+        target.app_id = "not-a-real-agent-radar-app"
+        target.app_name = "Missing App"
+        target.updated_at = now
+        openStore.sessions = [target]
+        openController.setDesktopNavigationBusy(true)
+        let pendingBefore = openController.pendingSessionIDs
+        check(openStore.openNoticeSession(sessionID: "notice-target") == false,
+              "A busy desktop channel must not report the reminder open as accepted")
+        check(openController.isOperatingDesktop, "Refusing the open leaves the current desktop operation in place")
+        check(openController.pendingSessionIDs == pendingBefore, "A refused open does not enter or reorder the continuation queue")
+        check(NoticeOpenFeedback.rejectionMessage == NoticeOpenFeedback.desktopBusy &&
+              openStore.actionMessage == NoticeOpenFeedback.desktopBusy,
+              "The refusal tells the reminder that the previous operation still owns the channel")
+        check(NoticeOpenFeedback.messageAfterOpen(accepted: false) == NoticeOpenFeedback.desktopBusy &&
+              NoticeOpenFeedback.messageAfterOpen(accepted: true) == nil,
+              "The reminder stays open on refusal and closes only after the navigation is accepted")
+        check(openStore.openNoticeSession(sessionID: "does-not-exist") == false &&
+              NoticeOpenFeedback.rejectionMessage == NoticeOpenFeedback.missingSession,
+              "A session that is not in the current snapshot is still reported as missing")
+        openController.setDesktopNavigationBusy(false)
+        NoticeOpenFeedback.rejectionMessage = "stale"
+        check(openStore.canBeginSessionNavigation() && NoticeOpenFeedback.rejectionMessage == nil &&
+              !openController.isOperatingDesktop,
+              "An idle channel can accept navigation without occupying it or jumping the queue")
         print("\(checks) session clock checks passed")
     }
 }

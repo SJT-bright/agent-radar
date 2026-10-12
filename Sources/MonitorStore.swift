@@ -87,6 +87,12 @@ final class MonitorStore: ObservableObject {
     private let nativeQueue = DispatchQueue(label: "radar.native", qos: .utility)
     private let decoderQueue = DispatchQueue(label: "radar.decode", qos: .utility)
     private let diagnosticWriter = HealthDiagnosticWriter()
+    private var windowActivityObserver: WindowActivityObserver?
+    private let inputInspectionBridge = ContinuationBridge()
+    private var diagnosticWindow: ReadOnlyDiagnosticWindow?
+    private var nativeFullScans = 0
+    private var nativePartialScans = 0
+    private var nativeLastScanMS = 0.0
     private var nativeSessions: [SessionRecord] = []
     private var localSessions: [SessionRecord] = []
     private var process: Process?
@@ -139,6 +145,11 @@ final class MonitorStore: ObservableObject {
     }
 
     func start() {
+        stopping = false
+        let observer = WindowActivityObserver()
+        windowActivityObserver = observer
+        observer.onRequestsChanged = { [weak self] in self?.refreshNativeFromNotification() }
+        observer.setPaused(paused)
         keepAwake.setEnabled(keepAwakeEnabled)
         continuation.onSummary = { [weak self] in self?.recoverySummary = $0 }
         continuation.onNotice = { [weak self] in self?.onRecoveryNotice?($0) }
@@ -159,11 +170,16 @@ final class MonitorStore: ObservableObject {
     }
 
     func stop() {
+        windowActivityObserver?.stop()
+        windowActivityObserver = nil
         onSessionsObserved?([], false)
         keepAwake.stop()
         continuation.stop()
         permissionQueryGeneration += 1
         permissionHealthBridge.cancel()
+        inputInspectionBridge.cancel()
+        diagnosticWindow?.close()
+        diagnosticWindow = nil
         stopping = true
         collectorGeneration += 1
         timer?.invalidate()
@@ -173,6 +189,7 @@ final class MonitorStore: ObservableObject {
 
     func togglePause() {
         paused.toggle()
+        windowActivityObserver?.setPaused(paused)
         pausedAt = paused ? Date() : nil
         continuation.configure(enabled: autoContinueEnabled && !permissionRepairActive, paused: paused)
         if paused {
@@ -290,15 +307,41 @@ final class MonitorStore: ObservableObject {
     }
 
     func refreshNative() {
+        performNativeRefresh(plan: .full(.fullDue))
+    }
+
+    private func refreshNativeFromNotification() {
+        guard !scanning, !paused, !stopping,
+              let plan = windowActivityObserver?.takeRequest() else { return }
+        performNativeRefresh(plan: plan)
+    }
+
+    private func performNativeRefresh(plan: WindowRefreshPlan) {
         guard !scanning, !paused else { return }
         scanning = true
         let extras = extraBundleIDs
         nativeQueue.async { [weak self] in
             guard let self = self else { return }
-            let scan = self.monitor.scan(extraBundleIDs: extras)
+            let began = ProcessInfo.processInfo.systemUptime
+            let scan: NativeScan
+            let full: Bool
+            switch plan {
+            case .full:
+                scan = self.monitor.scan(extraBundleIDs: extras); full = true
+            case .partial(let pids, _):
+                let partial = self.monitor.scanPartial(pids: pids, extraBundleIDs: extras)
+                scan = partial.scan
+                if case .escalatedToFull = partial.disposition { full = true } else { full = false }
+            }
+            let elapsed = (ProcessInfo.processInfo.systemUptime - began) * 1000
             DispatchQueue.main.async {
                 self.scanning = false
-                guard !self.paused else { return }
+                guard !self.paused, !self.stopping else { return }
+                self.nativeLastScanMS = elapsed
+                if full { self.nativeFullScans += 1 } else { self.nativePartialScans += 1 }
+                self.windowActivityObserver?.noteAccessibilityTrusted(scan.accessibility)
+                if full { self.windowActivityObserver?.noteFullScanCompleted() }
+                self.windowActivityObserver?.replaceTargets(scan.apps.map(\.pid))
                 if self.apps != scan.apps { self.apps = scan.apps }
                 self.nativeSessions = scan.sessions
                 if self.accessibility != scan.accessibility { self.accessibility = scan.accessibility }
@@ -310,6 +353,7 @@ final class MonitorStore: ObservableObject {
                     self.verifyAccessibility(reveal: false)
                 }
                 self.rebuild()
+                self.refreshNativeFromNotification()
             }
         }
     }
@@ -396,7 +440,9 @@ final class MonitorStore: ObservableObject {
 
     var displaySessions: [SessionRecord] {
         let now = Date().timeIntervalSince1970
-        let liveIDs = Set(apps.map(\.id))
+        let liveIDs = Set(apps.map(\.id)).union(sessions.filter {
+            $0.app_id == "openclaw" && $0.source == "local-db"
+        }.map(\.app_id))
         let readable = sessions.filter(\.isReadable)
         var result = readable.filter { $0.isActive }
         result += sessions.filter {
@@ -431,14 +477,35 @@ final class MonitorStore: ObservableObject {
         // Keep a stable app/order while timers and status refresh; no bouncing list.
         // Select current conversations first, then exclude them. Filtering
         // before selection would resurrect older history after every removal.
-        return result.filter { !isRemoved($0) }.sorted {
-            // 中断的对话最需要处理，排在最前；手动停止不算中断；运行中的次之。
-            let leftRank = $0.userStoppedInterruption ? 0 : ($0.isActive ? 1 : 2)
-            let rightRank = $1.userStoppedInterruption ? 0 : ($1.isActive ? 1 : 2)
+        return result.filter { !isRemoved($0) }.sorted { left, right in
+            let leftRank = displayRank(left)
+            let rightRank = displayRank(right)
             if leftRank != rightRank { return leftRank < rightRank }
-            if $0.app_name != $1.app_name { return $0.app_name < $1.app_name }
-            return $0.id < $1.id
+            if left.app_name != right.app_name { return left.app_name < right.app_name }
+            return left.id < right.id
         }
+    }
+
+    /// Real interruptions come first, then work in progress. A manual stop stays with other finished rows.
+    private func displayRank(_ session: SessionRecord) -> Int {
+        if session.status == "interrupted" && !session.userStoppedInterruption { return 0 }
+        if session.isActive { return 1 }
+        return 2
+    }
+
+    /// Why the floating list has nothing to show. Nil when at least one row is visible.
+    var emptyDisplayExplanation: String? {
+        let visible = Set(displaySessions.map(\.id))
+        guard visible.isEmpty else { return nil }
+        var reasons: [String] = []
+        if paused { reasons.append("监控已暂停，列表停止刷新") }
+        if !errors.isEmpty { reasons.append("采集错误：" + errors.joined(separator: "；")) }
+        if !accessibility { reasons.append("没有窗口读取权限，依赖窗口的对话无法显示") }
+        if sessions.contains(where: { !isRemoved($0) && $0.isDisplayable && !visible.contains($0.id) }) {
+            reasons.append("有对话因当日或展示范围过滤而未列出")
+        }
+        if reasons.isEmpty { reasons.append("暂无可显示的对话") }
+        return reasons.joined(separator: "。") + "。可点下方「查询」检查窗口读取和输入组件。"
     }
 
     var interruptedCount: Int {
@@ -456,12 +523,15 @@ final class MonitorStore: ObservableObject {
         // Keep the current task in front; the disclosure reveals every other
         // readable conversation already collected for that application.
         let shown = Set(grouped.values.flatMap { $0.map(\.id) })
-        // 久远对话只留在后台：分组展开只补充当天的其余会话，且有界封顶。
-        let allReadable = sessions.filter {
-            $0.isDisplayable && !isRemoved($0) && !shown.contains($0.id) && isTodayRow($0)
+        let displayedApps = Set(order)
+        // History is capped at 12, but only after limiting to apps already on screen.
+        // Rows from apps that are not displayed must not consume those slots.
+        let history = sessions.filter {
+            displayedApps.contains($0.app_id) && $0.isDisplayable && !isRemoved($0) &&
+                !shown.contains($0.id) && isTodayRow($0)
         }.sorted { $0.updated_at > $1.updated_at }.prefix(12)
-        for session in allReadable where grouped[session.app_id] != nil {
-            grouped[session.app_id, default: []].append(session)
+        for session in history {
+            grouped[session.app_id]?.append(session)
         }
         return order.compactMap { id in
             guard let sessions = grouped[id] else { return nil }
@@ -487,7 +557,7 @@ final class MonitorStore: ObservableObject {
         guard expanded else { return NSSize(width: 60, height: 32) }
         let screenHeight = NSScreen.main?.visibleFrame.height ?? 800
         let groups = conversationGroups
-        let contentHeight: CGFloat = groups.isEmpty ? 66 : groups.reduce(CGFloat(8)) { height, group in
+        let contentHeight: CGFloat = groups.isEmpty ? 120 : groups.reduce(CGFloat(8)) { height, group in
             let primaryHeight: CGFloat = (["interrupted", "stalled"].contains(group.primary.status) ? 76 : 62)
                 + (group.primary.secondaryDisplayName == nil ? 0 : 14)
             let extrasHeight: CGFloat = isAppGroupExpanded(group.id)
@@ -540,11 +610,20 @@ final class MonitorStore: ObservableObject {
         labels[session.id] = clean.isEmpty ? nil : clean
         UserDefaults.standard.set(labels, forKey: "projectLabels")
     }
-    func openSession(_ session: SessionRecord) {
+    /// True only when this call may use the desktop channel. A busy channel stays busy and is not queued ahead.
+    func canBeginSessionNavigation() -> Bool {
         guard !continuation.isOperatingDesktop else {
-            showMessage("正在处理前一条对话，请等待操作结束后再打开会话")
-            return
+            NoticeOpenFeedback.rejectionMessage = NoticeOpenFeedback.desktopBusy
+            showMessage(NoticeOpenFeedback.desktopBusy)
+            return false
         }
+        NoticeOpenFeedback.rejectionMessage = nil
+        return true
+    }
+
+    @discardableResult
+    func openSession(_ session: SessionRecord, completion: ((SessionActivationResult) -> Void)? = nil) -> Bool {
+        guard canBeginSessionNavigation() else { completion?(.unavailable); return false }
         continuation.setDesktopNavigationBusy(true)
         monitor.activate(session) { [weak self] result in
             guard let self = self else { return }
@@ -559,16 +638,41 @@ final class MonitorStore: ObservableObject {
             case .conversationLink:
                 break
             }
+            completion?(result)
         }
+        return true
     }
 
     @discardableResult func openNoticeSession(sessionID: String) -> Bool {
         guard let session = sessions.first(where: { $0.id == sessionID }) else {
-            showMessage("原会话暂未读取到，请在对应应用中打开")
+            NoticeOpenFeedback.rejectionMessage = NoticeOpenFeedback.missingSession
+            showMessage(NoticeOpenFeedback.missingSession)
             return false
         }
-        openSession(session)
-        return true
+        return openSession(session)
+    }
+
+    func openNoticeSession(sessionID: String, completion: @escaping (Bool) -> Void) {
+        guard let session = sessions.first(where: { $0.id == sessionID }) else {
+            NoticeOpenFeedback.rejectionMessage = NoticeOpenFeedback.missingSession
+            completion(false); return
+        }
+        _ = openSession(session) { result in
+            switch result {
+            case .conversationLink: completion(true)
+            case .application:
+                NoticeOpenFeedback.rejectionMessage = "已切换到应用，请选择原对话；提醒仍保留"
+                completion(false)
+            case .workspaceLink:
+                NoticeOpenFeedback.rejectionMessage = "已打开工作区，请选择原对话；提醒仍保留"
+                completion(false)
+            case .unavailable:
+                if NoticeOpenFeedback.rejectionMessage == nil {
+                    NoticeOpenFeedback.rejectionMessage = "未能打开原对话，请检查应用；提醒仍保留"
+                }
+                completion(false)
+            }
+        }
     }
 
     func isRemoved(_ session: SessionRecord) -> Bool {
@@ -934,8 +1038,15 @@ final class MonitorStore: ObservableObject {
     func cancelContinuation() { continuation.cancelCurrent() }
     func showContinuationDiagnostics() {
         verifyAccessibility()
-        showDiagnostic(title: "AI 监督状态",
-                       text: continuation.diagnostic + "\n辅助功能：" + accessibilityCheckDetail)
+        let current = continuation.diagnostic + "\n辅助功能：" + accessibilityCheckDetail
+        let directory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/AgentRadar")
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let history = OperationReceiptWriter.recentSummary(directory: directory)
+            DispatchQueue.main.async {
+                self?.showDiagnostic(title: "AI 监督状态", text: current + "\n\n最近操作回执（仅元数据）\n" + history)
+            }
+        }
     }
     func previewContinuationNotice() {
         let row = displaySessions.first
@@ -974,6 +1085,24 @@ final class MonitorStore: ObservableObject {
         }
         showDiagnostic(title: session.app_name + " · 状态与计时", text: "\(session.displayIdentityDetail)\n\n\(session.statusLabel)\n\(session.statusReason)\n\n计时依据\n\(session.timingExplanation)\n开始：\(stamp(session.started_at))\n结束：\(stamp(session.ended_at))\n\n状态证据\n\(session.evidence)")
     }
+
+    func inspectSessionInput(_ session: SessionRecord) {
+        guard !inputInspectionBridge.isRunning else {
+            showMessage("正在只读检查输入区，请稍候"); return
+        }
+        var request: [String: Any] = ["mode": "inspect", "id": session.id, "app_id": session.app_id,
+            "title": session.title, "key": ContinuationPolicy.key(session), "project": session.project,
+            "source": session.source, "target": session.target]
+        request["navigation_title"] = session.navigation_title
+        request["navigation_key"] = session.navigation_key
+        request["manual_retry"] = session.manual_only == true
+        inputInspectionBridge.run(request) { [weak self] code, _, _ in
+            guard let self = self else { return }
+            let summary = self.inputInspectionBridge.inspectionSummary ?? ContinuationController.explain(code)
+            self.showDiagnostic(title: session.app_name + " · 原会话输入区检查",
+                                text: "本机只读检查；没有切换窗口、写入或发送。\n" + summary)
+        }
+    }
     var backgroundDiagnostic: String {
         var lines = [accessibility ? "窗口权限：辅助功能已开启" : "窗口权限：任务雷达尚未获得辅助功能授权；扣子等依赖窗口读取的应用无法取得对话信息。本地会话读取不受影响。"]
         lines.append("自动发现：已开启。每轮检查运行中的应用，识别 AI 名称/标识；授权后轮询未知应用的明确生成按钮，识别后自动记住。能确认标题和状态的会话自动显示，无须逐个手动添加。")
@@ -993,29 +1122,9 @@ final class MonitorStore: ObservableObject {
     }
     func showBackgroundDiagnostics() { showDiagnostic(title: "后台读取情况", text: backgroundDiagnostic) }
     private func showDiagnostic(title: String, text: String) {
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = "本机只读诊断 · " + DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
-        alert.addButton(withTitle: "知道了")
-        alert.window.appearance = NSAppearance(named: .darkAqua)
-        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 390, height: 290))
-        scroll.hasVerticalScroller = true
-        scroll.drawsBackground = false
-        let content = NSTextView(frame: scroll.bounds)
-        content.isEditable = false
-        content.isSelectable = true
-        content.drawsBackground = false
-        content.textColor = .white
-        content.font = .systemFont(ofSize: 12)
-        content.textContainerInset = NSSize(width: 8, height: 8)
-        content.autoresizingMask = [.width]
-        content.isVerticallyResizable = true
-        content.textContainer?.widthTracksTextView = true
-        content.string = text
-        scroll.documentView = content
-        alert.accessoryView = scroll
-        alert.window.level = .floating
-        alert.runModal()
+        diagnosticWindow?.close()
+        diagnosticWindow = ReadOnlyDiagnosticWindow(title: title, text: text)
+        diagnosticWindow?.show()
     }
     func addApplication() {
         let picker = NSOpenPanel()
@@ -1068,6 +1177,11 @@ final class MonitorStore: ObservableObject {
                                   "reminder_popup_enabled": reminderPopupEnabled,
                                   "reminder_sound_enabled": reminderSoundEnabled,
                                   "collector_restarts": collectorRestarts,
+                                  "native_full_scans": nativeFullScans,
+                                  "native_partial_scans": nativePartialScans,
+                                  "native_last_scan_ms": nativeLastScanMS,
+                                  "ax_observed_apps": windowActivityObserver?.observingPIDs.count ?? 0,
+                                  "ax_polling_apps": windowActivityObserver?.pollingOnlyPIDs.count ?? 0,
                                   "follow_up_armed": promptRules.followUps.count,
                                   "supervised_sessions": supervisedSessionIDs.count,
                                   "supervised_apps": supervisedAppIDs.count,
@@ -1125,4 +1239,40 @@ final class HealthDiagnosticWriter {
             }
         }
     }
+}
+
+/// A diagnostic must leave the main dispatch queue available for collector
+/// snapshots and AX notifications while its text remains on screen.
+private final class ReadOnlyDiagnosticWindow: NSObject {
+    private let alert = NSAlert()
+    init(title: String, text: String) {
+        super.init()
+        alert.messageText = title
+        alert.informativeText = "本机只读诊断 · " + DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
+        let button = alert.addButton(withTitle: "知道了")
+        button.target = self
+        button.action = #selector(close)
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 390, height: 290))
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        let content = NSTextView(frame: scroll.bounds)
+        content.isEditable = false
+        content.isSelectable = true
+        content.drawsBackground = false
+        content.textColor = .white
+        content.font = .systemFont(ofSize: 12)
+        content.textContainerInset = NSSize(width: 8, height: 8)
+        content.autoresizingMask = [.width]
+        content.isVerticallyResizable = true
+        content.textContainer?.widthTracksTextView = true
+        content.string = text
+        scroll.documentView = content
+        alert.accessoryView = scroll
+        alert.window.appearance = NSAppearance(named: .darkAqua)
+        alert.window.level = .floating
+        alert.window.isReleasedWhenClosed = false
+        alert.layout()
+    }
+    func show() { alert.window.makeKeyAndOrderFront(nil) }
+    @objc func close() { alert.window.close() }
 }

@@ -65,17 +65,28 @@ struct ContinuationNotice {
 protocol ContinuationSending: AnyObject {
     var isRunning: Bool { get }
     var sentAt: Double? { get }
+    var recordsOperations: Bool { get }
+    var sentRunID: String? { get }
+    var inspectionSummary: String? { get }
     func cancel()
     func run(_ request: [String: Any], completion: @escaping (String, Bool, Double?) -> Void)
 }
 
-extension ContinuationSending { var sentAt: Double? { nil } }
+extension ContinuationSending {
+    var sentAt: Double? { nil }
+    var recordsOperations: Bool { false }
+    var sentRunID: String? { nil }
+    var inspectionSummary: String? { nil }
+}
 
 final class ContinuationBridge: ContinuationSending {
+    var recordsOperations: Bool { true }
     private var process: Process?
     private var generation = 0
     var isRunning: Bool { process?.isRunning == true }
     private(set) var sentAt: Double?
+    private(set) var sentRunID: String?
+    private(set) var inspectionSummary: String?
 
     func cancel() {
         generation += 1
@@ -89,6 +100,8 @@ final class ContinuationBridge: ContinuationSending {
 
     func run(_ request: [String: Any], completion: @escaping (String, Bool, Double?) -> Void) {
         sentAt = nil
+        sentRunID = nil
+        inspectionSummary = nil
         guard !isRunning, let root = Bundle.main.resourcePath else { completion("another_recovery", false, nil); return }
         let task = Process(), input = Pipe(), output = Pipe()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
@@ -108,6 +121,8 @@ final class ContinuationBridge: ContinuationSending {
             DispatchQueue.main.async {
                 guard let self = self, self.generation == current else { return }
                 self.process = nil
+                if let summary = result?["diagnostic_summary"] as? String, summary.count <= 1000 { self.inspectionSummary = summary }
+                if let id = result?["run_id"] as? String, UUID(uuidString: id) != nil { self.sentRunID = id }
                 if let stamp = result?["sent_at"] as? Double, stamp.isFinite, stamp > 0 {
                     self.sentAt = stamp
                 }
@@ -156,7 +171,7 @@ final class ContinuationController {
     private var queue: [ContinuationEvent] = []
     private var active: ContinuationEvent?
     private var attemptedKeys = Set<String>()
-    private var confirmations: [String: (event: ContinuationEvent, sentAt: Double, until: Double, delayReported: Bool)] = [:]
+    private var confirmations: [String: (event: ContinuationEvent, sentAt: Double, until: Double, delayReported: Bool, expectedRunID: String?)] = [:]
     private var timer: Timer?
     private var enabled = false
     private var paused = false
@@ -168,6 +183,13 @@ final class ContinuationController {
     private var rules: PromptRules { rulesProvider?() ?? PromptRules() }
     private var fresh: Bool { lastFresh.map { clock() - $0 <= 15 } ?? false }
     private var awaitingResponse: Bool { confirmations.values.contains { !$0.delayReported } }
+    private lazy var receiptWriter: OperationReceiptWriter? = {
+        guard bridge.recordsOperations, let path = Bundle.main.resourcePath else { return nil }
+        return OperationReceiptWriter(resourcePath: path)
+    }()
+    private func record(_ event: ContinuationEvent, stage: String, code: String, attempted: Bool = false) {
+        receiptWriter?.submit(event: event, stage: stage, code: code, attempted: attempted, time: clock())
+    }
     var isOperatingDesktop: Bool { desktopNavigationBusy || executing || bridge.isRunning || awaitingResponse }
     func setDesktopNavigationBusy(_ busy: Bool) { desktopNavigationBusy = busy }
 
@@ -301,7 +323,10 @@ final class ContinuationController {
     private func discardQueued(_ matches: (ContinuationEvent) -> Bool, message: String) {
         let cancelled = queue.filter(matches)
         queue.removeAll(where: matches)
-        for event in cancelled { notice(event, message, cancellable: false) }
+        for event in cancelled {
+            record(event, stage: "cancel", code: "cancelled")
+            notice(event, message, cancellable: false)
+        }
     }
     private static func preparationDelay(_ seconds: Double) -> Double {
         seconds.isFinite ? min(10, max(0, seconds)) : 10
@@ -313,6 +338,7 @@ final class ContinuationController {
         event.notBefore = clock() + Self.preparationDelay(event.delay)
         event.waitMessage = event.bypassRestriction ? "检测到限流，最多等待 10 秒后重新核验原会话" : (event.manual ? "已排定手动恢复" : "已排定恢复，发送前会再次核验会话")
         queue.append(event)
+        record(event, stage: "queued", code: "queued")
         notice(event, event.waitMessage, cancellable: true)
     }
     func startRageForCompleted() {
@@ -347,6 +373,7 @@ final class ContinuationController {
         if let index = queue.firstIndex(where: { $0.key == key }) {
             // Manual authorization changes this item, never its FIFO position.
             event.notBefore = queue[index].notBefore
+            event.operationID = queue[index].operationID
             event.waitMessage = "已排定手动恢复，保留原排队位置"
             queue[index] = event
             notice(event, event.waitMessage)
@@ -358,7 +385,10 @@ final class ContinuationController {
         let cancelled = queue.first { $0.session.id == sessionID && $0.key == key }
         queue.removeAll { $0.session.id == sessionID && $0.key == key }
         if active?.session.id == sessionID && active?.key == key { cancelActiveSend() }
-        else if let event = cancelled { notice(event, "已取消本轮恢复", cancellable: false) }
+        else if let event = cancelled {
+            record(event, stage: "cancel", code: "cancelled")
+            notice(event, "已取消本轮恢复", cancellable: false)
+        }
     }
     func cancelCurrent() {
         discardConfirmations({ _ in true }, message: "已停止跟踪发送确认；已发送消息不会撤回")
@@ -369,7 +399,10 @@ final class ContinuationController {
         let cancelled = active
         if executing, let event = active { attemptedKeys.insert(event.key) }
         bridge.cancel(); executing = false; active = nil; preparationBeganAt = nil
-        if let event = cancelled { notice(event, "已取消本轮恢复；若已点击发送，不会撤回消息", cancellable: false) }
+        if let event = cancelled {
+            record(event, stage: "cancel", code: "cancelled", attempted: attemptedKeys.contains(event.key))
+            notice(event, "已取消本轮恢复；若已点击发送，不会撤回消息", cancellable: false)
+        }
     }
     private func unique(_ row: SessionRecord) -> Bool {
         rows.filter { $0.id == row.id }.count == 1 && !rows.contains { other in
@@ -439,7 +472,10 @@ final class ContinuationController {
     }
     private func discardConfirmations(_ matches: (ContinuationEvent) -> Bool, message: String) {
         let cancelled = confirmations.values.map { $0.event }.filter(matches)
-        for event in cancelled { confirmations[event.key] = nil }
+        for event in cancelled {
+            confirmations[event.key] = nil
+            record(event, stage: "cancel", code: "confirmation_cancelled", attempted: true)
+        }
         for event in cancelled { notice(event, message, cancellable: false) }
     }
     private func confirmNewRound() {
@@ -449,27 +485,31 @@ final class ContinuationController {
             if let row = rows.first(where: { $0.id == event.session.id }),
                !sameIdentity(row, event.session) || row.user_stopped == true {
                 confirmations[event.key] = nil
+                record(event, stage: "cancel", code: "identity_changed", attempted: true)
                 notice(event, "会话身份已变化或已主动停止，停止跟踪发送确认", cancellable: false)
                 continue
             }
             if let row = rows.first(where: { $0.id == event.session.id }), unique(row),
                sameIdentity(row, event.session),
+               (row.app_id != "openclaw" || (pending.expectedRunID != nil && row.run_id == pending.expectedRunID)),
                ["running", "completed", "interrupted"].contains(row.status),
                (row.started_at ?? 0) > (event.session.started_at ?? 0),
                // Codex log events carry subsecond timestamps. Other adapters
                // may project whole seconds; preserve only that precision.
-               (row.started_at ?? 0) >= (row.app_id == "codex" ? pending.sentAt : floor(pending.sentAt)),
+               (row.started_at ?? 0) >= (["codex", "openclaw"].contains(row.app_id) ? pending.sentAt : floor(pending.sentAt)),
                ContinuationPolicy.identityRestriction(row) == nil {
                 // A fast terminal turn between polls also proves delivery. The
                 // ordinary interruption restrictions still decide its recovery.
                 policy.observeConfirmedRound(row, now: clock())
                 confirmations[event.key] = nil
+                record(event, stage: "new-round", code: "confirmed", attempted: true)
                 notice(event, "已观察到原会话的新轮次，发送已确认", cancellable: false)
             } else if clock() >= pending.until && !pending.delayReported {
                 // Slow apps may finish between polls after the 30-second notice.
                 // Keep one receipt per pending session so that terminal turn can
                 // still be observed; this never retries the original send.
                 confirmations[event.key]?.delayReported = true
+                record(event, stage: "timeout", code: "new_round_timeout", attempted: true)
                 notice(event, "已点击发送，30 秒内尚未观察到新轮次；处理下一条，继续观察，不重复发送")
             }
         }
@@ -549,10 +589,13 @@ final class ContinuationController {
         request["started_at"] = current.started_at
         request["navigation_title"] = current.navigation_title
         request["navigation_key"] = current.navigation_key
+        request["lifecycle_revision"] = current.lifecycle_revision
+        request["operation_id"] = event.operationID
         let token = generation
         bridge.run(request) { [weak self] code, attempted, retryAfter in
             guard let self = self, self.generation == token, self.active?.key == event.key else { return }
             self.executing = false
+            self.record(event, stage: attempted ? "send" : "preflight", code: code, attempted: attempted)
             if code == "permission_required" { self.helperPermission = false }
             if attempted || code == "already_attempted" || code == "sent_pending_confirmation" {
                 self.attemptedKeys.insert(event.key)
@@ -562,8 +605,8 @@ final class ContinuationController {
                 if self.isAutomaticRageSend(event) {
                     self.recordSuccessfulRageSend(for: current.id)
                 }
-                self.helperPermission = true
-                self.confirmations[event.key] = (event, self.bridge.sentAt ?? self.clock(), self.clock() + 30, false)
+                if current.app_id != "openclaw" { self.helperPermission = true }
+                self.confirmations[event.key] = (event, self.bridge.sentAt ?? self.clock(), self.clock() + 30, false, self.bridge.sentRunID)
                 self.active = nil
                 self.preparationBeganAt = nil
                 let elapsed = max(0, Int(self.clock() - event.detectedAt))
@@ -591,7 +634,7 @@ final class ContinuationController {
                 }
             } else if !attempted && !event.manual && event.routeRetries < 3
                       && ["target_unverified", "app_unavailable", "search_unavailable", "search_result_missing",
-                          "header_unverified", "sidebar_target_missing", "tree_incomplete", "composer_unreadable", "state_unverified"].contains(code) {
+                          "header_unverified", "sidebar_target_missing", "tree_incomplete", "composer_unreadable", "state_unverified", "openclaw_gateway_unavailable"].contains(code) {
                 // 路由瞬态失败（标题自动改名、索引撕裂读、应用正在重启）
                 // 不再终止该轮恢复：有限次退避重试，持续失败仍然如实终局。
                 var deferred = self.active ?? event
@@ -604,16 +647,21 @@ final class ContinuationController {
                 self.notice(deferred, deferred.waitMessage)
             } else { self.finish(event, code == "user_active" && attempted
                 ? "已输入文字后检测到键鼠操作，本轮已停止。请检查原会话；为避免重复发送，不自动重试"
-                : Self.explain(code)) }
+                : code == "send_unavailable" && !attempted
+                    ? "目标输入区暂无可用的发送按钮；未写入任何文字，原会话保持原样"
+                    : Self.explain(code)) }
         }
     }
     private func finish(_ event: ContinuationEvent, _ message: String) {
         active = nil; executing = false; preparationBeganAt = nil
+        record(event, stage: "cancel", code: "operation_finished", attempted: attemptedKeys.contains(event.key))
         notice(event, message, cancellable: false, permission: message == Self.explain("permission_required"))
     }
 
     static func explain(_ code: String) -> String {
-        ["session_navigation_unverified": "ZCode 工作区可跳转，但具体会话输入定位尚未核验；未输入、未发送",
+        ["openclaw_cli_unavailable": "未找到本地 OpenClaw 命令行入口，请检查独立 OpenClaw 安装",
+         "openclaw_gateway_unavailable": "本地 OpenClaw 网关暂不可用，尚未发送恢复请求",
+         "session_navigation_unverified": "ZCode 工作区可跳转，但具体会话输入定位尚未核验；未输入、未发送",
          "app_ui_unavailable": "目标应用界面报错或连接已断开，请先恢复该应用",
          "journal_capacity": "防重复会话记录已达容量，本轮保持未发送",
          "ready": "输入组件已就绪", "permission_required": "需要给「任务雷达」开启辅助功能；授权后会重新检查本轮状态",
@@ -631,7 +679,7 @@ final class ContinuationController {
          "header_unverified": "已导航，但顶部会话标题或项目与目标不一致；未输入文字",
          "window_ambiguous": "存在多个候选窗口，无法核验具体会话", "app_unavailable": "对应应用未运行或存在多个实例",
          "already_running": "会话仍在运行，不需要继续", "state_changed": "任务状态或轮次已变化，未继续发送",
-         "state_unverified": "长日志本轮起点仍在核验，尚未输入或发送",
+         "state_unverified": "原会话本轮状态仍在核验，尚未输入或发送",
          "focus_changed": "前台窗口发生变化，稍后重新定位", "tree_incomplete": "对话控件读取超时或不完整，本轮不发送",
          "send_unavailable": "没有找到可用的发送按钮；如已填入文字，请手动检查", "send_unconfirmed": "发送动作未得到确认，不会重复点击",
          "input_failed": "快速输入未成功，本轮已停止", "already_attempted": "本轮已经尝试过继续，不重复发送",

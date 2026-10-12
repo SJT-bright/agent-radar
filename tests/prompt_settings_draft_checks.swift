@@ -163,8 +163,12 @@ import Foundation
         empty.ragePrompt = " \n "
         empty.appRagePrompts["grok"] = "\u{0}\u{7F}"
         empty.rageAlternatePrompt = "\t"
-        check(empty.validationMessages.filter { $0.contains("默认提示词") }.count == 3,
-              "empty continuation prompts explain their default fallback")
+        check(empty.validationMessages.filter { $0.contains("使用默认提示词") }.count == 2,
+              "empty generic continuation and alternate prompts still explain their default fallback")
+        check(hasWarning(empty, containing: "Grok 专属提示词为空或清理后为空，保存后不写入专属覆盖；下次普通续接使用 Grok 软件默认，不使用通用续接提示词。"),
+              "empty Grok continuation names the software default")
+        check(!empty.validationMessages.contains { $0.contains("Grok 专属提示词") && $0.contains("使用默认提示词") },
+              "empty Grok continuation is not described as the generic default")
         check(hasWarning(empty, containing: "Grok 专属提示词包含控制字符"),
               "a prompt emptied by control cleanup reports both causes")
         let defaultSaved = empty.applying(to: original)
@@ -226,6 +230,115 @@ import Foundation
         bounds.rageAlternateEvery = 101
         check(bounds.applying(to: original).rateLimitWaitSeconds == 10 &&
               bounds.applying(to: original).rageAlternateEvery == 100, "numeric upper bounds match persisted rules")
+
+        let fresh = PromptRules()
+        let grokContinuation = fresh.continuationEffect(forApp: "grok")
+        check(grokContinuation.text == fresh.ragePrompt(forApp: "grok") &&
+              grokContinuation.text == PromptRules.defaultGrokRagePrompt &&
+              grokContinuation.text != fresh.ragePrompt &&
+              grokContinuation.source == .softwareDefault &&
+              grokContinuation.sourceLabel == "Grok 软件默认",
+              "an empty Grok continuation field resolves to the Grok software default")
+        let codexContinuation = fresh.continuationEffect(forApp: "codex")
+        check(codexContinuation.text == fresh.ragePrompt(forApp: "codex") &&
+              codexContinuation.text == PromptRules.defaultRagePrompt &&
+              codexContinuation.source == .generic && codexContinuation.sourceLabel == "通用默认",
+              "other apps with no override use the generic continuation")
+        check(fresh.genericContinuationEffect().text == fresh.ragePrompt &&
+              fresh.genericContinuationEffect().sourceLabel == "通用默认",
+              "the generic field reports its own built-in text")
+        check(PromptRules.continuationFieldDetail(forApp: "grok").contains("Grok 软件默认") &&
+              PromptRules.continuationFieldDetail(forApp: "grok").contains("不使用上方的通用续接提示词") &&
+              !PromptRules.continuationFieldDetail(forApp: "grok").contains("留空使用通用提示词") &&
+              PromptRules.genericContinuationDetail.contains("Grok 软件默认"),
+              "Grok field copy no longer says an empty override uses the generic prompt")
+        check(PromptRules.continuationFieldDetail(forApp: "codex").contains("通用续接提示词") &&
+              !PromptRules.continuationFieldDetail(forApp: "codex").contains("Grok 软件默认"),
+              "non-Grok empty continuation still explains the generic prompt")
+
+        var dedicated = fresh
+        dedicated.ragePrompt = "通用续接正文"
+        dedicated.appRagePrompts["grok"] = "Grok 专属正文"
+        dedicated.appRagePrompts["codex"] = "Codex 专属正文"
+        check(dedicated.continuationEffect(forApp: "grok").text == dedicated.ragePrompt(forApp: "grok") &&
+              dedicated.continuationEffect(forApp: "grok").source == .dedicated &&
+              dedicated.continuationEffect(forApp: "grok").text == "Grok 专属正文",
+              "a saved Grok override stays the authorized continuation text")
+        check(dedicated.continuationEffect(forApp: "codex").source == .dedicated &&
+              dedicated.continuationEffect(forApp: "codex").text == "Codex 专属正文",
+              "a saved Codex override stays dedicated")
+        check(dedicated.continuationEffect(forApp: "qoder").source == .generic &&
+              dedicated.continuationEffect(forApp: "qoder").sourceLabel == "通用" &&
+              dedicated.continuationEffect(forApp: "qoder").text == "通用续接正文",
+              "a customized generic prompt is the source for apps without an override")
+        var blankDedicated = dedicated
+        blankDedicated.appRagePrompts["grok"] = ""
+        check(blankDedicated.ragePrompt(forApp: "grok") == "" &&
+              blankDedicated.continuationEffect(forApp: "grok").source == .dedicated,
+              "a stored empty Grok key still follows ragePrompt and is not rewritten")
+
+        let grokRecovery = fresh.recoveryEffect(forApp: "grok")
+        let codexRecovery = fresh.recoveryEffect(forApp: "codex")
+        check(grokRecovery.source == .softwareDefault && grokRecovery.sourceLabel == "Grok 软件默认" &&
+              grokRecovery.text == PromptRules.grokSoftwareResumeText,
+              "Grok recovery with no override uses the Grok software default")
+        check(codexRecovery.source == .fixedDefault && codexRecovery.sourceLabel == "固定默认" &&
+              codexRecovery.text == PromptRules.fixedResumeText &&
+              PromptRules.fixedResumeText == "刚才中断了，请继续",
+              "other apps recover with the fixed default when no generic recovery is set")
+        check(PromptRules.recoveryFieldDetail(forApp: "grok").contains("Grok 软件默认") &&
+              PromptRules.recoveryFieldDetail(forApp: "codex").contains("固定默认"),
+              "recovery field copy names the software default and the fixed default")
+        var genericRecovery = fresh
+        genericRecovery.resumePrompt = "  通用恢复正文  "
+        check(genericRecovery.recoveryEffect(forApp: "grok").source == .generic &&
+              genericRecovery.recoveryEffect(forApp: "grok").sourceLabel == "通用恢复" &&
+              genericRecovery.recoveryEffect(forApp: "grok").text == "通用恢复正文" &&
+              genericRecovery.recoveryEffect(forApp: "codex").text == "通用恢复正文",
+              "a generic recovery prompt wins over both software defaults")
+        genericRecovery.appResumeTexts["grok"] = " Grok 专属恢复 "
+        genericRecovery.appResumeTexts["codex"] = " \n\t "
+        check(genericRecovery.recoveryEffect(forApp: "grok").source == .dedicated &&
+              genericRecovery.recoveryEffect(forApp: "grok").text == "Grok 专属恢复",
+              "a dedicated recovery prompt wins over the generic recovery")
+        check(genericRecovery.recoveryEffect(forApp: "codex").source == .generic &&
+              genericRecovery.recoveryEffect(forApp: "codex").text == "通用恢复正文",
+              "whitespace-only dedicated recovery falls through to the generic recovery")
+        check(fresh.alternateEffect().text == PromptRules.defaultRageAlternatePrompt &&
+              fresh.alternateEffect().text != PromptRules.defaultGrokRagePrompt &&
+              fresh.alternateEffect().source == .generic,
+              "the special turn, including Grok, uses the alternate prompt")
+        check(fresh.interruptEffect().text == "刚才中断了，请继续" && fresh.interruptEffect().source == .configured &&
+              fresh.rateLimitEffect().text == "刚才被限流了，现在请继续" && fresh.rateLimitEffect().source == .configured,
+              "collaboration interrupt and rate-limit text keep their configured wording")
+        var emptiedLimits = fresh
+        emptiedLimits.interruptText = ""
+        emptiedLimits.rateLimitText = ""
+        check(emptiedLimits.interruptEffect().text.isEmpty && emptiedLimits.rateLimitEffect().text.isEmpty,
+              "empty interrupt and rate-limit text stay empty instead of borrowing another prompt")
+
+        var clearGrok = PromptSettingsDraft(rules: dedicated)
+        clearGrok.appRagePrompts["grok"] = " \n "
+        clearGrok.appResumeTexts["grok"] = ""
+        let preview = clearGrok.applying(to: dedicated)
+        check(preview.continuationEffect(forApp: "grok").source == .softwareDefault &&
+              preview.continuationEffect(forApp: "grok").text == PromptRules.defaultGrokRagePrompt &&
+              preview.ragePrompt == "通用续接正文" &&
+              preview.appRagePrompts["codex"] == "Codex 专属正文",
+              "clearing only the Grok continuation returns to the software default")
+        check(clearGrok.effectiveContinuation(forApp: "grok", saved: dedicated).text == PromptRules.defaultGrokRagePrompt &&
+              clearGrok.effectiveRecovery(forApp: "grok", saved: dedicated).source == .softwareDefault &&
+              clearGrok.effectiveRecovery(forApp: "grok", saved: dedicated).text == PromptRules.grokSoftwareResumeText &&
+              dedicated.appRagePrompts["grok"] == "Grok 专属正文",
+              "the draft preview does not change the already authorized Grok prompt")
+        var clearCodex = PromptSettingsDraft(rules: dedicated)
+        clearCodex.appRagePrompts["codex"] = ""
+        check(hasWarning(clearCodex, containing: "Codex 专属提示词为空或清理后为空，保存后该软件使用通用续接提示词。"),
+              "clearing a non-Grok continuation explains the generic prompt")
+        check(clearCodex.effectiveContinuation(forApp: "codex", saved: dedicated).source == .generic &&
+              clearCodex.effectiveContinuation(forApp: "codex", saved: dedicated).text == "通用续接正文" &&
+              clearCodex.effectiveContinuation(forApp: "qoder", saved: dedicated).text == "通用续接正文",
+              "clearing Codex uses the generic continuation and leaves other apps unchanged")
 
         print("Prompt settings draft checks: \(count) passed")
     }

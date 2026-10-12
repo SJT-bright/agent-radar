@@ -109,9 +109,12 @@ struct RadarView: View {
 
             ScrollView {
                 LazyVStack(spacing: 4) {
-                    if store.displaySessions.isEmpty {
-                        Text("暂无可显示的对话")
-                            .font(.system(size: 11)).frame(height: 72)
+                    if store.displaySessions.isEmpty, let reason = store.emptyDisplayExplanation {
+                        Text(reason)
+                            .font(.system(size: 11))
+                            .multilineTextAlignment(.leading)
+                            .frame(maxWidth: .infinity, minHeight: 96, alignment: .topLeading)
+                            .padding(.top, 4)
                     }
                     ForEach(store.conversationGroups) { group in
                         ConversationGroupView(group: group, store: store)
@@ -782,6 +785,7 @@ private struct ConversationCard: View {
             }
             .contextMenu {
                 Button("查看状态与计时原因…") { store.showSessionDetails(session) }
+                Button("只读检查原会话输入区…") { store.inspectSessionInput(session) }
                 Button("打开对应应用") { store.openSession(session) }
                 if session.status == "interrupted" {
                     Button("手动恢复此会话") {
@@ -900,6 +904,7 @@ private struct CompactConversationRow: View {
             }
             .contextMenu {
                 Button("查看状态与计时原因…") { store.showSessionDetails(session) }
+                Button("只读检查原会话输入区…") { store.inspectSessionInput(session) }
                 Button("打开对应应用") { store.openSession(session) }
                 if session.status == "interrupted" {
                     Button("手动恢复此会话") {

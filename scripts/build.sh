@@ -10,6 +10,7 @@ mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources/collector" "$PRO
 cp "$PROJECT_DIR/scripts/Info.plist" "$APP_DIR/Contents/Info.plist"
 cp "$PROJECT_DIR/Assets/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 cp "$PROJECT_DIR"/collector/*.py "$APP_DIR/Contents/Resources/collector/"
+cp "$PROJECT_DIR/scripts/record_claude_event.py" "$APP_DIR/Contents/Resources/collector/"
 /usr/bin/python3 "$PROJECT_DIR/scripts/bundle_watchdog.py" "$APP_DIR/Contents/Resources"
 mkdir -p "$APP_DIR/Contents/Resources/icons"
 cp "$PROJECT_DIR"/Assets/icons/*.png "$APP_DIR/Contents/Resources/icons/"

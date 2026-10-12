@@ -29,6 +29,9 @@ def row(sid="codex:a", **values):
 
 class PipelineTests(unittest.TestCase):
     def setUp(self):
+        openclaw = patch.object(pipeline.openclaw_adapter, "collect", return_value=[])
+        openclaw.start()
+        self.addCleanup(openclaw.stop)
         patcher = patch.object(pipeline.autoclaw_adapter, "collect", return_value=[])
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -60,6 +63,31 @@ class PipelineTests(unittest.TestCase):
         snapshot = self.snapshot([row(title="前一条"), None, {}], [row(title="后一条")])
         self.assertEqual(len(snapshot["sessions"]), 1)
         self.assertEqual(snapshot["sessions"][0]["title"], "后一条")
+
+    def test_nullable_project_does_not_poison_whole_snapshot(self):
+        snapshot=self.snapshot([row(project=None)], [row("healthy")])
+        self.assertEqual(len(snapshot['sessions']),2)
+        self.assertEqual(snapshot['sessions'][0]['project'],'')
+
+    def test_bad_required_field_and_nonfinite_times_are_isolated(self):
+        snapshot=self.snapshot([row("null-title",title=None),row("nan",updated_at=float('nan'))],[row("healthy")])
+        self.assertEqual([r['id'] for r in snapshot['sessions']],['healthy'])
+        self.assertIn('2 条',snapshot['errors'][-1])
+        json.dumps(snapshot,allow_nan=False)
+
+    def test_corrupt_stop_flag_does_not_regain_authority(self):
+        snapshot=self.snapshot([row(user_stopped='bad')],[])
+        self.assertEqual(snapshot['sessions'][0]['status'],'unknown')
+        self.assertTrue(snapshot['sessions'][0]['user_stopped'])
+
+    def test_bad_optional_openclaw_fields_cannot_break_snapshot_or_enable_automatic_send(self):
+        snapshot = self.snapshot([row("bad", manual_only="false", run_id=[])], [row("healthy")])
+        self.assertEqual(len(snapshot["sessions"]), 2)
+        guarded = snapshot["sessions"][0]
+        self.assertEqual(guarded["status"], "unknown")
+        self.assertIs(guarded["manual_only"], True)
+        self.assertNotIn("run_id", guarded)
+        json.dumps(snapshot, allow_nan=False)
 
     def test_failed_adapter_does_not_discard_other_adapter_or_leak_error_details(self):
         with patch.object(pipeline.codex_adapter, "collect", side_effect=RuntimeError("private source text")), \

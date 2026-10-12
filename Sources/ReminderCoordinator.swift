@@ -36,6 +36,10 @@ final class ReminderCoordinator {
                         permission: { [weak store] in store?.requestPermission() },
                         retry: { [weak store] sessionID, key in store?.retryContinuation(sessionID: sessionID, key: key) },
                         open: { [weak store] sessionID in store?.openNoticeSession(sessionID: sessionID) ?? false },
+                        openAfterNavigation: { [weak store] sessionID, done in
+                            guard let store = store else { done(false); return }
+                            store.openNoticeSession(sessionID: sessionID, completion: done)
+                        },
                         cancelRecovery: { [weak store] sessionID, key in store?.cancelContinuation(sessionID: sessionID, key: key) })
         }
     }

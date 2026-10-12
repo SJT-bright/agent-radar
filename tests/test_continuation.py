@@ -665,6 +665,8 @@ class AXSelectionTests(unittest.TestCase):
             @staticmethod
             def get(n, k): return (n.get('err', 0), n.get(k))
             @staticmethod
+            def text_value(n): return n.get('AXValue', '') or ''
+            @staticmethod
             def trusted(): return True
             @staticmethod
             def action_names(n): return n.get('actions', ['AXPress'])
@@ -1246,6 +1248,71 @@ class AXSelectionTests(unittest.TestCase):
         for value in ('Work with Codex\nmore', 'Work with Codex\n\n', ' Work with Codex\n'):
             box['AXValue'] = value
             self.assertFalse(b.snapshot()['send_deferred'])
+
+    def test_codex_rotated_placeholder_wording_still_recognizes_composer(self):
+        # Codex 26.10 rotates the declared placeholder wording by state
+        # ("与 Codex 协作", "随心输入", "询问 ChatGPT"). Recognition rides the
+        # structural signature; a wording whitelist must not dead-end the round.
+        b = self.backend('codex')
+        b.codex_title_unique = True
+        layout = dict(role='AXGroup', rect=(310, 630, 900, 770),
+                      AXDOMClassList=['_ComposerLayoutBody_build_2'])
+        box = dict(role='AXTextArea', rect=(320, 650, 880, 710),
+                   AXDescription='随心输入', AXDOMClassList=['ProseMirror'], AXParent=layout)
+        header = dict(role='AXHeading', rect=(310, 70, 450, 100), AXValue=1, label=b.title)
+        b.nodes = lambda: [(header, 'AXHeading'), (box, 'AXTextArea')]
+        for hint in ('随心输入', '询问 ChatGPT', 'Ask ChatGPT'):
+            box['AXDescription'] = box['AXTitle'] = hint
+            box['AXValue'] = hint + '\n'
+            leaf = dict(role='AXStaticText', AXValue=hint)
+            middle = dict(role='AXGroup', AXChildren=[leaf])
+            placeholder = dict(role='AXGroup', AXDOMClassList=['placeholder'], AXChildren=[middle])
+            box['AXChildren'] = [placeholder]
+            snap = b.snapshot()
+            self.assertEqual(snap['input_count'], 1)
+            self.assertEqual(snap['value'], '')
+            self.assertTrue(snap['send_deferred'])
+
+    def test_codex_unreadable_dom_classes_fall_back_to_placeholder_shape(self):
+        # A cold or busy Chromium tree can serve the composer without DOM
+        # class lists; the exact exported placeholder subtree is the structural
+        # proof. A real draft under the same conditions stays unrecognized and
+        # the round is refused instead of pasting into an unverified editor.
+        b = self.backend('codex')
+        b.codex_title_unique = True
+        layout = dict(role='AXGroup', rect=(310, 630, 900, 770))
+        leaf = dict(role='AXStaticText', AXValue='与 Codex 协作')
+        middle = dict(role='AXGroup', AXChildren=[leaf])
+        placeholder = dict(role='AXGroup', AXChildren=[middle])
+        box = dict(role='AXTextArea', rect=(320, 650, 880, 710),
+                   AXValue='与 Codex 协作\n', AXDescription='与 Codex 协作',
+                   AXParent=layout, AXChildren=[placeholder])
+        header = dict(role='AXHeading', rect=(310, 70, 450, 100), AXValue=1, label=b.title)
+        b.nodes = lambda: [(header, 'AXHeading'), (box, 'AXTextArea')]
+        snap = b.snapshot()
+        self.assertEqual(snap['input_count'], 1)
+        self.assertEqual(snap['value'], '')
+        self.assertTrue(snap['send_deferred'])
+        box['AXValue'] = '真实草稿内容'
+        box['AXChildren'] = []
+        snap = b.snapshot()
+        self.assertEqual(snap['input_count'], 0)
+        self.assertFalse(snap['send_deferred'])
+
+    def test_codex_readable_foreign_layout_rejects_unknown_hint_editor(self):
+        # Tolerating rotated wording must not admit a readable non-composer
+        # layout: a readable parent without _ComposerLayoutBody_ is a
+        # different widget no matter what the editor claims.
+        b = self.backend('codex')
+        layout = dict(role='AXGroup', rect=(310, 630, 900, 770),
+                      AXDOMClassList=['@container/request-card'])
+        box = dict(role='AXTextArea', rect=(320, 650, 880, 710), AXValue='',
+                   AXDescription='随心输入', AXDOMClassList=['ProseMirror'], AXParent=layout)
+        header = dict(role='AXHeading', rect=(310, 70, 450, 100), AXValue=1, label=b.title)
+        b.nodes = lambda: [(header, 'AXHeading'), (box, 'AXTextArea')]
+        snap = b.snapshot()
+        self.assertEqual(snap['input_count'], 0)
+        self.assertFalse(snap['send_deferred'])
 
     def test_codex_native_paste_updates_editor_without_axvalue(self):
         b = self.backend('codex')

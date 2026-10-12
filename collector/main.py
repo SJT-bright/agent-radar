@@ -5,6 +5,7 @@ import json
 import os
 import time
 import sys
+import math
 from concurrent.futures import ThreadPoolExecutor, wait
 
 import codex_adapter
@@ -12,6 +13,7 @@ import desktop_adapters
 import autoclaw_adapter
 import extended_adapters
 import cline_adapter
+import openclaw_adapter
 
 
 # Leave most of the ten-second recovery budget to verified navigation/input.
@@ -25,7 +27,7 @@ WATCH_RESTART_EXIT_CODE = 75
 def _adapters():
     return [("Codex / Claude", codex_adapter), ("ZCode / WorkBuddy", desktop_adapters),
             ("AutoClaw", autoclaw_adapter), ("Qoder / Grok", extended_adapters),
-            ("Cline", cline_adapter)]
+            ("Cline", cline_adapter), ("OpenClaw", openclaw_adapter)]
 
 
 def _collect_adapter(name, module):
@@ -41,13 +43,40 @@ def _collect_adapter(name, module):
 
 def _assembled(rows, errors):
     unique = {}
+    invalid = 0
     for row in rows:
         if not isinstance(row, dict) or not row.get("id"):
             continue
-        row.setdefault("target", "")
-        row.setdefault("project", "")
+        row = row.copy()
+        # A damaged external row must not poison Swift's entire JSON snapshot.
+        for key in ("target", "project"):
+            if row.get(key) is None:
+                row[key] = ""
+        strings = ("id", "app_id", "app_name", "title", "project", "status", "evidence", "source", "target")
+        numbers = ("updated_at", "started_at", "ended_at", "last_activity_at")
+        if any(not isinstance(row.get(k), str) for k in strings) or any(
+            (k == "updated_at" or row.get(k) is not None) and
+            (isinstance(row.get(k), bool) or not isinstance(row.get(k), (int, float)) or not math.isfinite(row[k]))
+            for k in numbers):
+            invalid += 1
+            continue
+        optional_strings = ("timing_basis", "status_reason", "timing_reason", "navigation_title", "navigation_key", "lifecycle_revision", "run_id")
+        for key in optional_strings:
+            if row.get(key) is not None and not isinstance(row[key], str):
+                row.pop(key)
+        for key in ("pid", "window_id"):
+            if row.get(key) is not None and (isinstance(row[key], bool) or not isinstance(row[key], int)):
+                row.pop(key)
+        if row.get("user_stopped") is not None and not isinstance(row["user_stopped"], bool):
+            # A malformed stop flag must never silently regain send authority.
+            row.update(status="unknown", user_stopped=True, status_reason="会话停止标记异常，保持待确认")
+        if row.get("manual_only") is not None and not isinstance(row["manual_only"], bool):
+            row.update(status="unknown", manual_only=True, status_reason="会话操作范围异常，保持待确认")
         unique[row["id"]] = row
-    return {"sessions": list(unique.values()), "errors": errors, "collected_at": time.time()}
+    diagnostics = list(errors)
+    if invalid:
+        diagnostics.append("已隔离 " + str(invalid) + " 条格式异常会话，其他会话继续更新")
+    return {"sessions": list(unique.values()), "errors": diagnostics, "collected_at": time.time()}
 
 
 def snapshot():

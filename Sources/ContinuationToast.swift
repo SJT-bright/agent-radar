@@ -110,6 +110,7 @@ final class ContinuationToast {
         let permission: () -> Void
         let retry: (String, String) -> Void
         let open: (String) -> Bool
+        let openAfterNavigation: ((String, @escaping (Bool) -> Void) -> Void)?
         let cancelRecovery: ((String, String) -> Void)?
         var key: String { (notice.sessionID ?? notice.conversation) + ":" + (notice.recoveryKey ?? notice.title) }
         var sessionKey: String { notice.sessionID ?? (notice.title + ":" + notice.conversation) }
@@ -119,6 +120,7 @@ final class ContinuationToast {
     private var queue = SessionNoticeQueue<Entry>()
     private var current: Entry? { queue.current }
     private var retryInFlight = Set<String>()
+    private var navigationInFlight = Set<String>()
     private var presentedKeys = Set<String>()
     private var draggedTopLeft: NSPoint?
     private var dragging = false
@@ -171,12 +173,31 @@ final class ContinuationToast {
     func show(_ notice: ContinuationNotice, anchor: NSRect, cancel: @escaping () -> Void,
               permission: @escaping () -> Void, retry: @escaping (String, String) -> Void = { _, _ in },
               open: @escaping (String) -> Bool = { _ in false },
+              openAfterNavigation: ((String, @escaping (Bool) -> Void) -> Void)? = nil,
               cancelRecovery: ((String, String) -> Void)? = nil) {
         let entry = Entry(notice: notice, anchor: anchor, cancel: cancel, permission: permission, retry: retry,
-                          open: open, cancelRecovery: cancelRecovery)
+                          open: open, openAfterNavigation: openAfterNavigation, cancelRecovery: cancelRecovery)
         guard queue.show(entry) else { return }
         if !notice.isRecovering && !notice.cancellable { retryInFlight.remove(entry.key) }
         render()
+    }
+
+    /// Keep the reminder until navigation really finishes. A late completion
+    /// from an older reminder cannot dismiss a different session or turn.
+    func openCurrentSession() {
+        guard let entry = current, let session = entry.notice.sessionID,
+              navigationInFlight.insert(entry.key).inserted else { return }
+        let done: (Bool) -> Void = { [weak self] success in
+            guard let self = self else { return }
+            self.navigationInFlight.remove(entry.key)
+            guard self.current?.key == entry.key else { return }
+            if let message = NoticeOpenFeedback.messageAfterOpen(accepted: success) {
+                self.queue.updateCurrent { $0.notice.message = message }
+                self.render()
+            } else { self.close() }
+        }
+        if let navigate = entry.openAfterNavigation { navigate(session, done) }
+        else { done(entry.open(session)) }
     }
 
     private func render() {
@@ -216,16 +237,7 @@ final class ContinuationToast {
                                              if self?.current?.key == entry.key { self?.close() }
                                          }, close: { [weak self] in self?.close() },
                                          dismissAll: { [weak self] in self?.closeAll() }, permission: entry.permission,
-                                         open: { [weak self] in
-                                             guard let self = self, self.current?.key == entry.key,
-                                                   let session = entry.notice.sessionID else { return }
-                                             if entry.open(session) {
-                                                 self.close()
-                                             } else {
-                                                 self.queue.updateCurrent { $0.notice.message = "原会话暂未读取到，请在对应应用中打开" }
-                                                 self.render()
-                                             }
-                                         },
+                                         open: { [weak self] in self?.openCurrentSession() },
                                          retry: { [weak self] in
                                              guard let self = self, self.current?.key == entry.key,
                                                    entry.notice.canRetry, !entry.notice.isRecovering,

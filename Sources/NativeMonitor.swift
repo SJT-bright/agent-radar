@@ -7,12 +7,50 @@ import Foundation
 /// Accessibility reads are bounded; discovery never activates an application.
 enum SessionActivationResult { case unavailable, application, workspaceLink, conversationLink }
 
+/// 局部扫描的有界策略。超过这些上限时必须改走原来的全量 scan，避免局部请求占住采集队列。
+struct PartialRefreshLimits: Equatable {
+    var maxPartialsBetweenFull = 2
+    var maxBaselineAge: TimeInterval = 3
+    var maxPIDs = 8
+    var partialBudget: TimeInterval = 1
+    static let standard = PartialRefreshLimits()
+}
+
+enum PartialRefreshEscalation: String, Equatable {
+    case noBaseline
+    case partialBudget
+    case baselineStale
+    case accessibilityChanged
+    case tooManyPIDs
+}
+
+enum PartialRefreshDisposition: Equatable {
+    case partial
+    case unchanged
+    case full(PartialRefreshEscalation)
+}
+
+struct PartialWindowScan {
+    enum Disposition: Equatable {
+        case partial
+        case unchanged
+        case escalatedToFull(PartialRefreshEscalation)
+    }
+    var scan: NativeScan
+    var disposition: Disposition
+    var refreshedPIDs: [Int32]
+    var removedPIDs: [Int32]
+}
+
 final class NativeMonitor {
     private var discoveredBundles = Set(UserDefaults.standard.stringArray(forKey: "autoDiscoveredAIBundles.v1") ?? [])
     private var discoveryCursor = 0
     // 上一轮每个应用（按 pid）的真实窗口行：本轮预算耗尽时原样复用，
     // 避免每次都生成新占位 ID 使监督/置顶等以会话 ID 为键的状态翻转。
     private var lastWindowRows: [Int32: [SessionRecord]] = [:]
+    private var deliveredScan: NativeScan?
+    private var partialsSinceFull = 0
+    private var lastFullUptime: TimeInterval = 0
     private struct Definition {
         let id: String
         let name: String
@@ -77,7 +115,7 @@ final class NativeMonitor {
         "org.mozilla.firefox", "org.chromium.chromium", "com.operasoftware.opera"
     ]
 
-    private static let localAdapterIDs: Set<String> = ["codex", "zcode", "workbuddy", "workbuddy-ai", "autoclaw", "grok", "qoder", "qoder-cn", "cline"]
+    private static let localAdapterIDs: Set<String> = ["codex", "zcode", "workbuddy", "workbuddy-ai", "autoclaw", "grok", "qoder", "qoder-cn", "cline", "openclaw"]
 
     /// Exact bundle definitions take precedence over a localized application
     /// name. Recognition discovers an app; it grants no conversation status.
@@ -139,87 +177,8 @@ final class NativeMonitor {
         let probes = unknown.filter { probeIDs.contains(($0.bundleIdentifier ?? "").lowercased()) }
 
         for application in known + probes {
-            guard let bundleID = application.bundleIdentifier, !bundleID.isEmpty else { continue }
-            let bundleKey = bundleID.lowercased()
-            let nativeDefinition = Self.knownApplication(bundleID: bundleKey, name: application.localizedName ?? "")
-            let browser = Self.browserIDs.contains(bundleKey)
-            let manuallyAdded = extras.contains(bundleKey)
-            let probing = probeIDs.contains(bundleKey)
-            // Helpers are not registered as separate AI applications unless explicitly added.
-            guard application.activationPolicy != .prohibited || manuallyAdded else { continue }
-
-            let definition = nativeDefinition.map { Definition(id: $0.id, name: $0.name) } ?? Definition(
-                id: browser ? "browser-\(bundleKey)" : "custom-\(bundleKey)",
-                name: application.localizedName ?? bundleID
-            )
-            let app = AppRecord(id: definition.id, name: definition.name, bundleID: bundleID,
-                                pid: application.processIdentifier, path: application.bundleURL?.path ?? "")
-            if (!browser || manuallyAdded) && !probing { apps.append(app) }
-
-            guard trusted else {
-                if !browser || manuallyAdded {
-                    sessions.append(placeholder(app, evidence: "已发现应用；授予辅助功能权限后可读取窗口，会话状态待确认"))
-                }
-                continue
-            }
-            let windowDeadline = probing ? deadline.end : deadline.end - (probes.isEmpty ? 0 : 0.6)
-            guard ProcessInfo.processInfo.systemUptime < windowDeadline else {
-                if (!browser || manuallyAdded) && !probing {
-                    sessions.append(contentsOf: Self.carriedRows(previous: lastWindowRows[app.pid], app: app,
-                                                                 note: "本轮读取时间已用尽；显示上一轮窗口读取结果"))
-                }
-                continue
-            }
-
-            let axApplication = AXUIElementCreateApplication(app.pid)
-            AXUIElementSetMessagingTimeout(axApplication, 0.06)
-            let appBudget = Budget(end: min(windowDeadline, ProcessInfo.processInfo.systemUptime + (probing ? 0.25 : 0.45)))
-            let windows = elements(attribute(axApplication, kAXWindowsAttribute as String))
-            if windows.isEmpty {
-                if (!browser || manuallyAdded) && !probing {
-                    sessions.append(placeholder(app, evidence: "已发现应用；没有可读取的窗口，不能确认会话状态"))
-                }
-                continue
-            }
-
-            var observed = 0
-            for window in windows.prefix(10) {
-                guard appBudget.available else { break }
-                let windowTitle = string(attribute(window, kAXTitleAttribute as String))
-                let webService = browser ? Self.browserService(windowTitle) : nil
-                guard !browser || webService != nil || manuallyAdded else { continue }
-                let sessionAppID = webService.map { "web-\($0.id)" } ?? app.id
-                let sessionAppName = webService.map { "\($0.name) · \(app.name)" } ?? app.name
-                let state = readStatus(window, appID: sessionAppID, budget: appBudget)
-                // Generic send/stop buttons and arbitrary window text do not
-                // qualify a previously unknown program as an AI application.
-                guard !probing || state.status == "running" else { continue }
-                if probing && discoveredBundles.insert(bundleKey).inserted {
-                    UserDefaults.standard.set(discoveredBundles.sorted(), forKey: "autoDiscoveredAIBundles.v1")
-                    apps.append(app)
-                }
-                let number = (attribute(window, "AXWindowNumber") as? NSNumber)?.intValue
-                // AXUIElement's CF identity remains stable when a window title changes.
-                // A window identity represents the exposed window, not unseen tabs or chats.
-                let key = number.map(String.init) ?? "ax-\(CFHash(window))"
-                let title = state.title ?? (windowTitle.isEmpty ? "\(sessionAppName) · 未命名窗口" : windowTitle)
-                var evidence = state.evidence
-                if browser {
-                    evidence += "；仅覆盖标题已识别的浏览器窗口，不代表所有后台标签页"
-                }
-                sessions.append(SessionRecord(
-                    id: "window:\(app.id):\(app.pid):\(key)", app_id: sessionAppID,
-                    app_name: sessionAppName, title: title, project: "", status: state.status,
-                    evidence: evidence, updated_at: Date().timeIntervalSince1970,
-                    source: "window", target: "", pid: app.pid, window_id: number
-                ))
-                observed += 1
-            }
-            if browser && observed > 0 && !manuallyAdded { apps.append(app) }
-            if !browser && !probing && observed == 0 {
-                sessions.append(contentsOf: Self.carriedRows(previous: lastWindowRows[app.pid], app: app,
-                                                             note: "窗口读取达到时间限制；显示上一轮窗口读取结果"))
-            }
+            _ = collect(application, extras: extras, probeIDs: Set(probeIDs), trusted: trusted,
+                        deadline: deadline, probesPending: !probes.isEmpty, sessions: &sessions, apps: &apps)
         }
         var grouped: [Int32: [SessionRecord]] = [:]
         for row in sessions {
@@ -227,7 +186,205 @@ final class NativeMonitor {
             grouped[pid, default: []].append(row)
         }
         lastWindowRows = grouped
-        return NativeScan(sessions: sessions, apps: apps, accessibility: trusted)
+        let result = NativeScan(sessions: sessions, apps: apps, accessibility: trusted)
+        rememberFullScan(result)
+        return result
+    }
+
+    /// 只重读给定 PID 的窗口，并与上一次快照合并。调用线程必须与 scan 相同，且两者不能并发。
+    /// 不推进未知应用发现，不改识别规则。没有基线、权限变化、PID 过多、局部次数或基线年龄超限时改走 scan。
+    func scanPartial(pids: [Int32], extraBundleIDs: [String] = [], limits: PartialRefreshLimits = .standard) -> PartialWindowScan {
+        let requested = Self.uniquePIDs(pids)
+        let trusted = AXIsProcessTrusted()
+        let sinceFull = deliveredScan == nil ? TimeInterval.greatestFiniteMagnitude : ProcessInfo.processInfo.systemUptime - lastFullUptime
+        let decision = Self.partialRefreshDisposition(
+            hasBaseline: deliveredScan != nil, partialsSinceFull: partialsSinceFull, secondsSinceFull: sinceFull,
+            requestedCount: requested.count, trusted: trusted, baselineTrusted: deliveredScan?.accessibility ?? false, limits: limits)
+        switch decision {
+        case .unchanged:
+            return PartialWindowScan(scan: deliveredScan!, disposition: .unchanged, refreshedPIDs: [], removedPIDs: [])
+        case .full(let reason):
+            return PartialWindowScan(scan: scan(extraBundleIDs: extraBundleIDs), disposition: .escalatedToFull(reason),
+                                      refreshedPIDs: [], removedPIDs: [])
+        case .partial:
+            break
+        }
+        guard let baseline = deliveredScan, AXIsProcessTrusted() else {
+            return PartialWindowScan(scan: scan(extraBundleIDs: extraBundleIDs), disposition: .escalatedToFull(.accessibilityChanged),
+                                      refreshedPIDs: [], removedPIDs: [])
+        }
+        let extras = Set(extraBundleIDs.map { $0.lowercased() })
+        let deadline = Budget(end: ProcessInfo.processInfo.systemUptime + max(0.2, limits.partialBudget))
+        var byPID: [Int32: NSRunningApplication] = [:]
+        for application in NSWorkspace.shared.runningApplications where !application.isTerminated
+            && application.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+            byPID[application.processIdentifier] = application
+        }
+        var freshSessions: [SessionRecord] = []
+        var freshApps: [AppRecord] = []
+        var refreshed: [Int32] = []
+        var removed: [Int32] = []
+        for pid in requested.prefix(max(1, limits.maxPIDs)) {
+            guard let application = byPID[pid] else { removed.append(pid); continue }
+            if collect(application, extras: extras, probeIDs: [], trusted: true, deadline: deadline,
+                       probesPending: false, sessions: &freshSessions, apps: &freshApps) == .visited {
+                refreshed.append(pid)
+            }
+        }
+        let merged = Self.mergePartialSnapshot(baseline: baseline, freshSessions: freshSessions, freshApps: freshApps,
+                                                refreshedPIDs: refreshed, removedPIDs: removed)
+        for pid in refreshed {
+            let rows = freshSessions.filter { $0.pid == pid && $0.source == "window" && $0.id.hasPrefix("window:") }
+            if rows.isEmpty { lastWindowRows.removeValue(forKey: pid) } else { lastWindowRows[pid] = rows }
+        }
+        for pid in removed { lastWindowRows.removeValue(forKey: pid) }
+        deliveredScan = merged
+        partialsSinceFull += 1
+        return PartialWindowScan(scan: merged, disposition: .partial, refreshedPIDs: refreshed, removedPIDs: removed)
+    }
+
+    static func uniquePIDs(_ pids: [Int32]) -> [Int32] {
+        var seen = Set<Int32>()
+        return pids.filter { $0 > 0 && seen.insert($0).inserted }
+    }
+
+    static func partialRefreshDisposition(hasBaseline: Bool, partialsSinceFull: Int, secondsSinceFull: TimeInterval,
+                                           requestedCount: Int, trusted: Bool, baselineTrusted: Bool,
+                                           limits: PartialRefreshLimits = .standard) -> PartialRefreshDisposition {
+        if requestedCount <= 0 { return hasBaseline ? .unchanged : .full(.noBaseline) }
+        if !hasBaseline { return .full(.noBaseline) }
+        if !trusted || !baselineTrusted { return .full(.accessibilityChanged) }
+        if requestedCount > limits.maxPIDs { return .full(.tooManyPIDs) }
+        if partialsSinceFull >= limits.maxPartialsBetweenFull { return .full(.partialBudget) }
+        if secondsSinceFull >= limits.maxBaselineAge { return .full(.baselineStale) }
+        return .partial
+    }
+
+    /// 用本次读到的行替换对应 PID，退出的 PID 删除，其余行保持原顺序。
+    static func mergePartialSnapshot(baseline: NativeScan, freshSessions: [SessionRecord], freshApps: [AppRecord],
+                                      refreshedPIDs: [Int32], removedPIDs: [Int32]) -> NativeScan {
+        let refreshed = Set(refreshedPIDs)
+        let touched = refreshed.union(removedPIDs)
+        let sessionsByPID = Dictionary(grouping: freshSessions.filter { $0.pid != nil }, by: { $0.pid! })
+        let appsByPID = Dictionary(grouping: freshApps, by: \.pid)
+        var sessions: [SessionRecord] = []
+        var seenSessions = Set<Int32>()
+        for row in baseline.sessions {
+            guard let pid = row.pid, touched.contains(pid) else { sessions.append(row); continue }
+            if seenSessions.insert(pid).inserted, refreshed.contains(pid) {
+                sessions.append(contentsOf: sessionsByPID[pid] ?? [])
+            }
+        }
+        for pid in refreshedPIDs where seenSessions.insert(pid).inserted {
+            sessions.append(contentsOf: sessionsByPID[pid] ?? [])
+        }
+        var apps: [AppRecord] = []
+        var seenApps = Set<Int32>()
+        for app in baseline.apps {
+            guard touched.contains(app.pid) else { apps.append(app); continue }
+            if seenApps.insert(app.pid).inserted, refreshed.contains(app.pid) {
+                apps.append(contentsOf: appsByPID[app.pid] ?? [])
+            }
+        }
+        for pid in refreshedPIDs where seenApps.insert(pid).inserted {
+            apps.append(contentsOf: appsByPID[pid] ?? [])
+        }
+        return NativeScan(sessions: sessions, apps: apps, accessibility: baseline.accessibility)
+    }
+
+    private enum ApplicationVisit { case skipped, visited }
+
+    /// 全量扫描里的单应用读取。局部扫描用空的 probeIDs 调用，因此不会发现新软件，也不会改识别结果。
+    private func collect(_ application: NSRunningApplication, extras: Set<String>, probeIDs: Set<String>, trusted: Bool,
+                          deadline: Budget, probesPending: Bool, sessions: inout [SessionRecord], apps: inout [AppRecord]) -> ApplicationVisit {
+        guard let bundleID = application.bundleIdentifier, !bundleID.isEmpty else { return .skipped }
+        let bundleKey = bundleID.lowercased()
+        let nativeDefinition = Self.knownApplication(bundleID: bundleKey, name: application.localizedName ?? "")
+        let browser = Self.browserIDs.contains(bundleKey)
+        let manuallyAdded = extras.contains(bundleKey)
+        let probing = probeIDs.contains(bundleKey)
+        // Helpers are not registered as separate AI applications unless explicitly added.
+        guard application.activationPolicy != .prohibited || manuallyAdded else { return .skipped }
+
+        let definition = nativeDefinition.map { Definition(id: $0.id, name: $0.name) } ?? Definition(
+            id: browser ? "browser-\(bundleKey)" : "custom-\(bundleKey)",
+            name: application.localizedName ?? bundleID
+        )
+        let app = AppRecord(id: definition.id, name: definition.name, bundleID: bundleID,
+                            pid: application.processIdentifier, path: application.bundleURL?.path ?? "")
+        if (!browser || manuallyAdded) && !probing { apps.append(app) }
+
+        guard trusted else {
+            if !browser || manuallyAdded {
+                sessions.append(placeholder(app, evidence: "已发现应用；授予辅助功能权限后可读取窗口，会话状态待确认"))
+            }
+            return .visited
+        }
+        let windowDeadline = probing ? deadline.end : deadline.end - (probesPending ? 0.6 : 0)
+        guard ProcessInfo.processInfo.systemUptime < windowDeadline else {
+            if (!browser || manuallyAdded) && !probing {
+                sessions.append(contentsOf: Self.carriedRows(previous: lastWindowRows[app.pid], app: app,
+                                                             note: "本轮读取时间已用尽；显示上一轮窗口读取结果"))
+            }
+            return .visited
+        }
+
+        let axApplication = AXUIElementCreateApplication(app.pid)
+        AXUIElementSetMessagingTimeout(axApplication, 0.06)
+        let appBudget = Budget(end: min(windowDeadline, ProcessInfo.processInfo.systemUptime + (probing ? 0.25 : 0.45)))
+        let windows = elements(attribute(axApplication, kAXWindowsAttribute as String))
+        if windows.isEmpty {
+            if (!browser || manuallyAdded) && !probing {
+                sessions.append(placeholder(app, evidence: "已发现应用；没有可读取的窗口，不能确认会话状态"))
+            }
+            return .visited
+        }
+
+        var observed = 0
+        for window in windows.prefix(10) {
+            guard appBudget.available else { break }
+            let windowTitle = string(attribute(window, kAXTitleAttribute as String))
+            let webService = browser ? Self.browserService(windowTitle) : nil
+            guard !browser || webService != nil || manuallyAdded else { continue }
+            let sessionAppID = webService.map { "web-\($0.id)" } ?? app.id
+            let sessionAppName = webService.map { "\($0.name) · \(app.name)" } ?? app.name
+            let state = readStatus(window, appID: sessionAppID, budget: appBudget)
+            // Generic send/stop buttons and arbitrary window text do not
+            // qualify a previously unknown program as an AI application.
+            guard !probing || state.status == "running" else { continue }
+            if probing && discoveredBundles.insert(bundleKey).inserted {
+                UserDefaults.standard.set(discoveredBundles.sorted(), forKey: "autoDiscoveredAIBundles.v1")
+                apps.append(app)
+            }
+            let number = (attribute(window, "AXWindowNumber") as? NSNumber)?.intValue
+            // AXUIElement's CF identity remains stable when a window title changes.
+            // A window identity represents the exposed window, not unseen tabs or chats.
+            let key = number.map(String.init) ?? "ax-\(CFHash(window))"
+            let title = state.title ?? (windowTitle.isEmpty ? "\(sessionAppName) · 未命名窗口" : windowTitle)
+            var evidence = state.evidence
+            if browser {
+                evidence += "；仅覆盖标题已识别的浏览器窗口，不代表所有后台标签页"
+            }
+            sessions.append(SessionRecord(
+                id: "window:\(app.id):\(app.pid):\(key)", app_id: sessionAppID,
+                app_name: sessionAppName, title: title, project: "", status: state.status,
+                evidence: evidence, updated_at: Date().timeIntervalSince1970,
+                source: "window", target: "", pid: app.pid, window_id: number
+            ))
+            observed += 1
+        }
+        if browser && observed > 0 && !manuallyAdded { apps.append(app) }
+        if !browser && !probing && observed == 0 {
+            sessions.append(contentsOf: Self.carriedRows(previous: lastWindowRows[app.pid], app: app,
+                                                         note: "窗口读取达到时间限制；显示上一轮窗口读取结果"))
+        }
+        return .visited
+    }
+
+    private func rememberFullScan(_ scan: NativeScan) {
+        deliveredScan = scan
+        partialsSinceFull = 0
+        lastFullUptime = ProcessInfo.processInfo.systemUptime
     }
 
     /// Called only in response to the user clicking a session. It never types or sends messages.

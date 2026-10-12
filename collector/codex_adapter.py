@@ -2,6 +2,8 @@
 
 Only metadata and event kinds are retained. Authentication/config files are never
 opened. SQLite connections use mode=ro; no hooks are installed into either app.
+Claude can also read this app's own lifecycle file after the user explicitly
+installs the reviewed hook command. That file is not Claude's settings.
 """
 from __future__ import annotations
 
@@ -20,6 +22,10 @@ try:
     from .failure_reasons import failure_reason
 except ImportError:
     from failure_reasons import failure_reason
+try:
+    from . import hook_events
+except ImportError:
+    import hook_events
 
 MAX_SESSIONS = 50
 TAIL_BYTES = 262_144
@@ -342,15 +348,17 @@ class TailCache:
                         title = event.get("customTitle") or event.get("summary")
                         if title:
                             state["title"] = _text(title)
+                    # Turn id is a structural field. Message text is never retained.
+                    turn = hook_events.turn_id_of(event)
                     message = event.get("message")
                     stop = message.get("stop_reason") if isinstance(message, dict) else None
                     if kind == "assistant" and stop == "end_turn":
-                        state.update(status="completed", state_at=stamp, event="end_turn")
+                        _claude_note(state, "completed", stamp, "end_turn", turn)
                     elif kind == "system" and event.get("subtype") == "turn_duration":
-                        state.update(status="completed", state_at=stamp, event="turn_duration")
+                        _claude_note(state, "completed", stamp, "turn_duration", turn)
                     elif kind == "user" or (kind == "assistant" and stop == "tool_use"):
                         # A user message alone is not evidence of a live model run.
-                        state.update(status="unknown", state_at=stamp, event=kind)
+                        _claude_note(state, "unknown", stamp, str(kind or ""), turn)
             if app == "codex":
                 if not state.get("lifecycle_scan_incomplete"):
                     self.backfills.pop(key, None)
@@ -432,6 +440,148 @@ def _codex_status(history: dict, tail: dict, pid: int | None) -> tuple[str, str]
     return "unknown", origin
 
 
+def _claude_note(state: dict, status: str, stamp: float, event_name: str, turn: str | None):
+    """Record one Claude transcript fact. A record without a turn id must not keep an older one."""
+    state.update(status=status, state_at=stamp, event=event_name)
+    state.pop("user_stopped", None)
+    if turn:
+        state["turn_id"] = turn
+    else:
+        state.pop("turn_id", None)
+
+
+def _when(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return None
+    return float(value)
+
+
+def _turn_relation(left: str | None, right: str | None) -> str:
+    if left and right:
+        return "same" if left == right else "different"
+    return "unknown"
+
+
+def _claude_unknown(evidence: str) -> dict:
+    return {"status": "unknown", "evidence": evidence, "user_stopped": False}
+
+
+def _claude_from_descriptor(descriptor: dict) -> dict:
+    raw = descriptor.get("raw") or descriptor.get("status") or ""
+    return {"status": descriptor["status"],
+            "evidence": "CLI 会话状态 " + str(raw) + "；PID 与启动时间匹配",
+            "user_stopped": False}
+
+
+def _claude_from_log(tail: dict) -> dict:
+    event_name = str(tail.get("event") or "end_turn")
+    status = tail.get("status") or "unknown"
+    if status == "interrupted" and tail.get("user_stopped"):
+        evidence = "日志记录用户主动停止"
+    elif status == "interrupted":
+        evidence = "日志 " + event_name + "；本轮已中断"
+    else:
+        evidence = "日志 " + event_name + "；本轮已结束"
+    result = {"status": status, "evidence": evidence, "user_stopped": bool(tail.get("user_stopped"))}
+    ended = _when(tail.get("state_at"))
+    if ended and status in {"completed", "interrupted"}:
+        result["ended_at"] = ended
+    return result
+
+
+def _claude_from_hook(hook: dict) -> dict:
+    evidence = {
+        "turn_started": "生命周期事件记录本轮已提交",
+        "turn_completed": "生命周期事件记录本轮正常结束",
+        "turn_failed": "生命周期事件记录本轮失败结束",
+        "user_stopped": "生命周期事件记录用户主动停止",
+        "permission_wait": "生命周期事件记录正在等待权限",
+    }.get(hook.get("event"), "生命周期事件无法对应已知状态")
+    result = {"status": hook.get("status") or "unknown", "evidence": evidence,
+              "user_stopped": bool(hook.get("user_stopped"))}
+    started, ended = _when(hook.get("started_at")), _when(hook.get("ended_at"))
+    if started:
+        result["started_at"] = started
+    if ended:
+        result["ended_at"] = ended
+    return result
+
+
+def _claude_descriptor_time(data: dict) -> float | None:
+    """Explicit descriptor clocks only. File mtime is not a status time."""
+    for key in ("updatedAt", "updated_at", "timestamp"):
+        if key in data:
+            stamp = _timestamp(data.get(key))
+            if stamp > 0:
+                return stamp
+    return None
+
+
+def _claude_resolve(descriptor: dict | None, tail: dict | None, hook: dict | None) -> dict:
+    """A newer explicit end beats an older busy descriptor only for the same turn.
+
+    If the turn cannot be verified, the result is unknown. Busy is not left in
+    place, and the end is not treated as confirmed. No age threshold is an
+    interruption: a busy descriptor without a newer terminal stays running.
+    """
+    desc = descriptor or {}
+    log = tail or {}
+    desc_status = desc.get("status")
+    desc_at = _when(desc.get("at"))
+    desc_turn = desc.get("turn_id") or None
+    log_status = log.get("status")
+    log_at = _when(log.get("state_at"))
+    log_turn = log.get("turn_id") or None
+    log_terminal = log_status in {"completed", "interrupted"}
+    desc_live = desc_status in {"running", "waiting"}
+    chosen = hook
+    if chosen:
+        hook_turn = chosen.get("turn_id") or None
+        hook_at = _when(chosen.get("timestamp"))
+        hook_status = chosen.get("status")
+        desc_rel = _turn_relation(desc_turn, hook_turn)
+        if desc_rel == "different":
+            if hook_at and desc_at and hook_at > desc_at:
+                pass
+            elif desc_at and hook_at and desc_at > hook_at:
+                chosen = None
+            else:
+                return _claude_unknown("生命周期事件与 CLI 描述符不是同一轮，当前状态待确认")
+        if chosen and log_terminal and _turn_relation(log_turn, hook_turn) == "different":
+            if log_at and hook_at and log_at > hook_at:
+                return _claude_unknown("日志结束事件与生命周期事件不是同一轮，当前状态待确认")
+            log_terminal = False
+        if (chosen and desc_live and desc_rel == "unknown" and desc_at and hook_at and desc_at > hook_at):
+            return _claude_unknown("CLI 描述符晚于生命周期事件且没有轮次，不能确认同一轮")
+        if (chosen and log_terminal and log_turn and _turn_relation(log_turn, hook_turn) == "same"
+                and log_at and hook_at and log_at > hook_at and hook_status in {"running", "waiting"}):
+            if desc_live and desc_at and desc_at > log_at and desc_rel == "same":
+                return _claude_from_descriptor(desc)
+            if desc_live and desc_rel == "unknown" and desc_at and desc_at > log_at:
+                return _claude_unknown("结束事件与较晚的 CLI 描述符无法确认同一轮")
+            return _claude_from_log(log)
+        if chosen:
+            return _claude_from_hook(chosen)
+    if desc_live and log_terminal:
+        relation = _turn_relation(desc_turn, log_turn)
+        if relation == "unknown":
+            return _claude_unknown("较新结束事件与 busy 描述符无法确认同一轮，不能沿用运行状态")
+        if relation == "different":
+            if desc_at and log_at and log_at < desc_at:
+                return _claude_from_descriptor(desc)
+            return _claude_unknown("结束事件属于另一轮，不能确认当前轮")
+        if desc_at and log_at and log_at > desc_at:
+            return _claude_from_log(log)
+        if desc_at and log_at and desc_at > log_at:
+            return _claude_from_descriptor(desc)
+        return _claude_unknown("同一轮结束事件与描述符缺少可比时间，不能沿用运行状态")
+    if desc_status:
+        return _claude_from_descriptor(desc)
+    if log_terminal:
+        return _claude_from_log(log)
+    return _claude_unknown("缺少可核验的 CLI 运行状态")
+
+
 def _codex_state_databases(root: Path) -> list[Path]:
     """state_N numbering is a migration counter; sort numerically so state_10
     outranks state_9, and never let an unreadable name ordering pick a stale one."""
@@ -442,9 +592,11 @@ def _codex_state_databases(root: Path) -> list[Path]:
 
 
 class SessionCollector:
-    def __init__(self, codex_home: Path | None = None, claude_home: Path | None = None):
+    def __init__(self, codex_home: Path | None = None, claude_home: Path | None = None,
+                 lifecycle_path: Path | None = None):
         self.codex_home = codex_home or Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
         self.claude_home = claude_home or Path.home() / ".claude"
+        self.lifecycle_path = lifecycle_path or hook_events.default_path()
         self.tails = TailCache()
         self.codex_rows: list[dict] = []
         self.last_errors: list[str] = []
@@ -724,29 +876,47 @@ class SessionCollector:
             if re.fullmatch(r"[a-zA-Z0-9-]+", sid) and candidate.is_file():
                 recent[sid] = candidate
         ordered = list(records) + [sid for sid in recent if sid not in records]
+        try:
+            hooks = hook_events.load(self.lifecycle_path)
+        except OSError:
+            hooks = {}
         result = []
         for sid in ordered[:MAX_SESSIONS]:
             data = records.get(sid, {})
             tail = self.tails.read(recent[sid], "claude") if sid in recent else {}
-            raw_status = str(data.get("status", ""))
-            status = {"idle": "idle", "busy": "running", "working": "running",
+            raw_status = str(data.get("status", "")) if data else ""
+            mapped = {"idle": "idle", "busy": "running", "working": "running",
                       "running": "running", "thinking": "running", "waiting": "waiting",
                       "waiting_for_input": "waiting", "waiting_for_permission": "waiting",
                       "needs_attention": "waiting"}.get(raw_status)
-            if data and status:
-                evidence = "CLI 会话状态 " + raw_status + "；PID 与启动时间匹配"
-            elif tail.get("status") == "completed":
-                status, evidence = "completed", "日志 " + tail.get("event", "end_turn") + "；本轮已结束"
-            else:
-                status, evidence = "unknown", "缺少可核验的 CLI 运行状态"
+            descriptor = None
+            if data and mapped:
+                descriptor = {"status": mapped, "at": _claude_descriptor_time(data),
+                              "turn_id": hook_events.turn_id_of(data), "raw": raw_status}
+            hook = hook_events.session_state(hooks, sid)
+            decision = _claude_resolve(descriptor, tail, hook)
+            status, evidence = decision["status"], decision["evidence"]
             project = data.get("cwd") or tail.get("project") or ""
+            if not project and hook:
+                project = hook.get("cwd") or ""
             title = tail.get("title") or data.get("name") or (Path(project).name if project else "Claude 会话")
+            updated = [_timestamp(data.get("updatedAt")) if data else 0, tail.get("updated_at", 0) or 0]
+            if hook and hook.get("timestamp"):
+                updated.append(hook["timestamp"])
             item = dict(id="claude:" + sid, app_id="claude-code", app_name="Claude Code", title=_text(title),
                         project=project, status=status, evidence=evidence,
-                        updated_at=max(_timestamp(data.get("updatedAt")), tail.get("updated_at", 0)),
-                        source="local-session", target="")
+                        updated_at=max(updated), source="local-session", target="")
             item["status_reason"] = evidence
-            item["timing_reason"] = "CLI 进程开始时间不等于本轮开始时间；当前状态数据未提供本轮起点"
+            if decision.get("started_at"):
+                item["started_at"] = decision["started_at"]
+                item["timing_basis"] = "turn"
+                item["timing_reason"] = "按 Claude 生命周期事件的本轮提交时间计算"
+            else:
+                item["timing_reason"] = "CLI 进程开始时间不等于本轮开始时间；当前状态数据未提供本轮起点"
+            if decision.get("ended_at"):
+                item["ended_at"] = decision["ended_at"]
+            if decision.get("user_stopped"):
+                item["user_stopped"] = True
             if data:
                 item["pid"] = data["pid"]
             result.append(item)

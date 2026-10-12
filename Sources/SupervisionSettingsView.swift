@@ -31,6 +31,7 @@ struct SupervisionSettingsView: View {
                         Text("监督 \(app.name) 的全部对话").font(.system(size: 10, weight: .semibold))
                         Text("当前无可核验的可读会话；软件监督选择保留。")
                             .font(.system(size: 9)).foregroundStyle(.secondary)
+                        authorizedPromptNote(appID: app.id)
                     }
                 }
                 .toggleStyle(.checkbox).radarHoverHighlight()
@@ -171,6 +172,7 @@ struct SupervisionSettingsView: View {
                     .accessibilityLabel(group.name + "：监督全部对话")
                     .help("覆盖此软件当前及今后发现的可核验对话；已完成的旧轮次仍需手动启动。")
             }
+            authorizedPromptNote(appID: group.id)
             if group.hiddenCompletedCount > 0 {
                 Text("\(group.hiddenCompletedCount) 条已完成会话已隐藏")
                     .font(.system(size: 9)).foregroundStyle(.secondary)
@@ -227,6 +229,26 @@ struct SupervisionSettingsView: View {
         .toggleStyle(.checkbox).radarHoverHighlight()
         .disabled(store.isAppSupervised(appID))
         .accessibilityLabel(row.app_name + "：" + row.primaryDisplayName + "，对话：" + row.title + "，持续监督")
+    }
+
+    /// 已保存规则的下一次文字。不参与搜索，也不改监督选择或提示词。
+    private func authorizedPromptNote(appID: String) -> some View {
+        let continuation = store.promptRules.continuationEffect(forApp: appID)
+        let recovery = store.promptRules.recoveryEffect(forApp: appID)
+        let name = PromptRules.appDisplayNames[appID] ?? appID
+        return VStack(alignment: .leading, spacing: 2) {
+            Text("\(name) 当前续接（\(continuation.sourceLabel)）")
+                .font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
+            Text(continuation.text.isEmpty ? "（空）" : continuation.text)
+                .font(.system(size: 9)).foregroundStyle(.secondary).lineLimit(3)
+            Text("\(name) 当前恢复（\(recovery.sourceLabel)）")
+                .font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
+            Text(recovery.text.isEmpty ? "（空）" : recovery.text)
+                .font(.system(size: 9)).foregroundStyle(.secondary).lineLimit(3)
+        }
+        .help(name + "续接（" + continuation.sourceLabel + "）\n" + continuation.text
+              + "\n" + name + "恢复（" + recovery.sourceLabel + "）\n" + recovery.text)
+        .accessibilityLabel(name + "当前续接来源" + continuation.sourceLabel + "，恢复来源" + recovery.sourceLabel)
     }
 
     private func isExpanded(_ appID: String) -> Bool {

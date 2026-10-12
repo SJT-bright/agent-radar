@@ -15,6 +15,10 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
+try:
+    import operation_receipts as receipts
+except ImportError:
+    from supervisor import operation_receipts as receipts
 
 MESSAGE = '刚才中断了，请继续'
 MAX_TEXT = 2000
@@ -24,7 +28,7 @@ CONTROL_CHARS = re.compile(r'[\x00-\x08\x0b-\x1f\x7f]')
 BUNDLES = {'autoclaw': 'com.zhipuai.autoclaw', 'codex': 'com.openai.codex',
            'workbuddy': 'com.tencent.workbuddy.mac', 'workbuddy-ai': 'com.workbuddy.workbuddy-ai',
            'zcode': 'dev.zcode.app', 'grok': 'com.grokapp.desktop',
-           'qoder-cn': 'com.qodercn.app', 'qoder': 'com.qoder.app'}
+           'qoder-cn': 'com.qodercn.app', 'qoder': 'com.qoder.app', 'openclaw': 'ai.openclaw.mac'}
 SEND_NAMES = {'发送', '发送消息', '发送提示', 'send', 'send message', 'send prompt', 'submit', '提交'}
 STOP_NAMES = {'停止', '停止生成', '停止回复', 'stop', 'stop generating', 'stop response', '停止任务'}
 GROK_SIDEBAR_PREFIX = '未读 — 后台回合已完成 '
@@ -255,6 +259,7 @@ def perform(request, backend, journal):
     backend.guard(fresh=True)
     snapshot = backend.snapshot()
     validate_snapshot(snapshot, None if request.get('overwrite_draft') is True else '')
+    checkpoint(request, backend, 'identity', 'verified', False)
     # Codex replaces its empty composer's send control with Resume/voice.
     # Only the known, empty primary editor may defer this check until paste.
     deferred = request.get('app_id') == 'codex' and snapshot.get('send_deferred')
@@ -272,9 +277,11 @@ def perform(request, backend, journal):
     snapshot = backend.snapshot()
     # Readback must be compared against the exact text this round wrote.
     validate_snapshot(snapshot, text)
+    checkpoint(request, backend, 'readback', 'verified', True)
     if not snapshot.get('send_enabled'):
         raise Blocked('send_unavailable')
     sent_at = time.time()
+    checkpoint(request, backend, 'send', 'send_started', True)
     backend.send()  # At most one press. No blind Enter or retry after ambiguity.
     return {'code': 'sent_pending_confirmation', 'attempted': True, 'sent_at': sent_at}
 
@@ -438,6 +445,7 @@ class MacBackend:
         self.ax, self.inject, self.winops = ax, inject, winops
         self.AppKit, self.Quartz = AppKit, Quartz
         self.request = request
+        self.records_receipts = True
         self.bundle = BUNDLES[request['app_id']]
         self.title = request.get('navigation_title') or request['title']
         self.window = self.root = self.box = self.send_button = None
@@ -696,11 +704,25 @@ class MacBackend:
             code = 'ready' if current.get('send_exists') or current.get('send_deferred') else 'send_unavailable'
         except Blocked as error:
             code = str(error)
-        return dict(code=code, attempted=False, identity=current['identity'],
+        result = dict(code=code, attempted=False, identity=current['identity'],
                     input_count=current['input_count'], busy=current['busy'],
                     send_exists=current['send_exists'], send_enabled=current['send_enabled'],
                     send_deferred=bool(current.get('send_deferred')),
-                    empty_composer=current['value'] == '')
+                    empty_composer=current['value'] == '', window_count=1,
+                    send_count=current.get('send_count'),
+                    identity_hits=1 if current['identity'] else None)
+        try:
+            from control_contract import from_bridge_inspect
+        except ImportError:
+            from supervisor.control_contract import from_bridge_inspect
+        info = {}
+        try:
+            app_url = self.AppKit.NSWorkspace.sharedWorkspace().URLForApplicationWithBundleIdentifier_(self.bundle)
+            info = dict(self.AppKit.NSBundle.bundleWithURL_(app_url).infoDictionary() or {}) if app_url else {}
+        except (AttributeError, TypeError):
+            pass  # Missing appInfo leaves the diagnostic version unknown.
+        result['contract'] = from_bridge_inspect(self.request['app_id'], result, info)
+        return result
 
     def route(self):
         ax = self.ax
@@ -1135,6 +1157,7 @@ class MacBackend:
         deferred = bool(codex_primary and value == '' and not buttons)
         return dict(identity=self.current_identity(nodes), input_count=len(boxes), value=value,
                     busy=busy, send_exists=self.send_button is not None,
+                    send_count=len(buttons),
                     send_deferred=deferred,
                     send_enabled=self.send_button is not None and ax.enabled(self.send_button))
 
@@ -1152,13 +1175,37 @@ class MacBackend:
                 return True
         return False
 
+    def dom_classes(self, node, attempts=2, delay=0.05):
+        # Chromium serves DOM class lists only while the enhanced web tree is
+        # up, and a cold or busy renderer can drop them for a beat. Retry once
+        # and report None when the attribute stays unreadable so callers can
+        # fall back to structural proof. A successful but empty or malformed
+        # list stays readable: it must fail the strict class checks.
+        for attempt in range(attempts):
+            err, value = self.ax.get(node, 'AXDOMClassList')
+            if err == 0 and isinstance(value, list):
+                return list(value)
+            if err == 0 and value is not None:
+                return []
+            if attempt + 1 < attempts:
+                time.sleep(delay)
+        return None
+
     def codex_exported_placeholder(self, node, value):
         # Codex's empty ProseMirror exports its placeholder text plus a newline
         # as AXValue, without AXPlaceholderValue. Require the observed empty
         # child tree so a real draft containing the same words stays a draft.
-        hint = str(self.ax.get_attr(node, 'AXDescription', '') or '').strip()
-        if hint not in CODEX_COMPOSER_HINTS or canonical_text(value) not in (hint, hint + '\n'):
-            return False
+        # Codex 26.10 rotates the declared wording between states ("与 Codex
+        # 协作", "随心输入", "询问 ChatGPT"), so any declared hint may carry it.
+        for raw in self.composer_hints(node):
+            hint = str(raw or '').strip()
+            if not hint or canonical_text(value) not in (hint, hint + '\n'):
+                continue
+            if self.codex_empty_placeholder_shape(node, hint):
+                return True
+        return False
+
+    def codex_empty_placeholder_shape(self, node, hint):
         children = self.ax.get_attr(node, 'AXChildren', []) or []
         for depth, role in enumerate(('AXGroup', 'AXGroup', 'AXStaticText')):
             if len(children) != 1:
@@ -1167,8 +1214,10 @@ class MacBackend:
             if self.ax.role(child) != role:
                 return False
             if depth == 0:
-                classes = self.ax.get_attr(child, 'AXDOMClassList', []) or []
-                if isinstance(classes, str) or 'placeholder' not in classes:
+                classes = self.dom_classes(child)
+                # Unreadable classes stay admissible; a readable list without
+                # the placeholder class is a different widget.
+                if classes is not None and 'placeholder' not in classes:
                     return False
             if depth == 2:
                 return (self.ax.get_attr(child, 'AXValue') == hint
@@ -1179,25 +1228,42 @@ class MacBackend:
     def codex_primary_composer(self, node):
         # Observed native AX signature, bounded to the editor's direct layout
         # parent. Never use a search/comment editor or an arbitrary empty field.
+        # Class names and the specific wording are anchors, not gates: Codex
+        # rotates placeholder text and can transiently omit DOM class lists,
+        # so a readable list must match while an unreadable one only passes
+        # with the exact exported-placeholder shape as structural proof.
         ax = self.ax
-        classes = ax.get_attr(node, 'AXDOMClassList', []) or []
-        if (ax.role(node) != 'AXTextArea' or isinstance(classes, str)
-                or 'ProseMirror' not in classes
-                or not CODEX_COMPOSER_HINTS.intersection(self.composer_hints(node))):
+        if ax.role(node) != 'AXTextArea':
+            return False
+        hints = [str(raw or '').strip() for raw in self.composer_hints(node)]
+        hints = [hint for hint in hints if hint]
+        if not hints:
+            return False
+        classes = self.dom_classes(node)
+        if classes is not None and 'ProseMirror' not in classes:
             return False
         parent = ax.get_attr(node, 'AXParent')
         if parent is None or ax.role(parent) != 'AXGroup':
             return False
-        parent_classes = ax.get_attr(parent, 'AXDOMClassList', []) or []
+        parent_classes = self.dom_classes(parent)
+        in_layout = (parent_classes is not None
+                     and any(str(c).startswith('_ComposerLayoutBody_') for c in parent_classes))
+        if parent_classes is not None and not in_layout:
+            # A readable parent that is not the composer layout is a different
+            # widget, no matter what the editor reported.
+            return False
         editor_rect, parent_rect = ax.rect_of(node), ax.rect_of(parent)
         left, top, right, bottom = self.window.rect
-        return (not isinstance(parent_classes, str)
-                and any(str(c).startswith('_ComposerLayoutBody_') for c in parent_classes)
-                and editor_rect is not None and parent_rect is not None
+        if not (editor_rect is not None and parent_rect is not None
                 and left <= parent_rect[0] < parent_rect[2] <= right
                 and top <= parent_rect[1] < parent_rect[3] <= bottom
                 and parent_rect[0] <= editor_rect[0] < editor_rect[2] <= parent_rect[2]
-                and parent_rect[1] <= editor_rect[1] < editor_rect[3] <= parent_rect[3])
+                and parent_rect[1] <= editor_rect[1] < editor_rect[3] <= parent_rect[3]):
+            return False
+        if in_layout:
+            return True
+        value = ax.text_value(node)
+        return any(self.codex_empty_placeholder_shape(node, hint) for hint in hints)
 
     def autoclaw_composer(self, node):
         # Goal review forms can expose many editable textareas. Only the actual
@@ -1296,6 +1362,83 @@ class MacBackend:
         # queue in arrival order, including any newly exposed insert control.
 
 
+def _hash_optional(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return digest(value)
+    except Exception:
+        return None
+
+
+def checkpoint(request, backend, stage, code, attempted):
+    """Metadata checkpoints only for the production sender, never inspect/tests."""
+    operation_id = receipts.canonical_operation_id(request.get('operation_id'))
+    if request.get('mode') != 'send' or not operation_id or not getattr(backend, 'records_receipts', False):
+        return
+    try:
+        receipts.record(receipts.support_directory(), operation_id=operation_id,
+            session_hash=digest(request['id']), key_hash=digest(request['key']), app_id=request['app_id'],
+            stage=stage, code=code, attempted=attempted, time=time.time(), elapsed_ms=0)
+    except Exception:
+        pass
+
+
+def _persist_receipts(request, result, backend, began):
+    """Append the whitelist operation trace and refresh the latest snapshot.
+
+    Inspect never reaches here. The trace is what remains after the next app
+    overwrites last-recovery.json. Neither write may change the result code.
+    """
+    if not isinstance(request, dict) or not isinstance(result, dict):
+        return None
+    directory = receipts.support_directory()
+    stage = getattr(backend, 'stage', 'preflight')
+    legacy_stage = stage if isinstance(stage, str) and stage else 'preflight'
+    safe_stage = legacy_stage if legacy_stage in receipts.STAGES else 'preflight'
+    elapsed_ms = round((time.monotonic() - began) * 1000)
+    if type(elapsed_ms) is not int or elapsed_ms < 0:
+        elapsed_ms = 0
+    now = time.time()
+    supplied = receipts.canonical_operation_id(request.get('operation_id'))
+    operation_id = supplied or receipts.new_operation_id()
+    code = result.get('code')
+    if not isinstance(code, str) or receipts.CODE.fullmatch(code) is None:
+        code = 'bridge_error'
+    attempted = result.get('attempted') if type(result.get('attempted')) is bool else False
+    fields = {
+        'operation_id': operation_id, 'stage': safe_stage, 'code': code,
+        'attempted': attempted, 'time': now, 'elapsed_ms': elapsed_ms,
+    }
+    session_hash = _hash_optional(request.get('id'))
+    key_hash = _hash_optional(request.get('key'))
+    if session_hash:
+        fields['session_hash'] = session_hash
+    if key_hash:
+        fields['key_hash'] = key_hash
+    if request.get('app_id') in receipts.APP_IDS:
+        fields['app_id'] = request['app_id']
+    # Latest-file readers still see the historical result fields, including
+    # sent_at, retry_after and the code-location triple. No request body.
+    legacy = dict(result, time=now, stage=safe_stage, elapsed_ms=elapsed_ms)
+    legacy['app_id'] = request.get('app_id', '') if request.get('app_id') in receipts.APP_IDS else ''
+    if key_hash:
+        legacy['key_hash'] = key_hash
+    legacy['operation_id'] = operation_id
+    logged = legacy_ok = False
+    try:
+        receipts.record(directory, **fields)
+        logged = True
+    except Exception:
+        logged = False
+    try:
+        receipts.write_legacy(directory, legacy)
+        legacy_ok = True
+    except Exception:
+        legacy_ok = False
+    return operation_id if logged or legacy_ok else None
+
+
 def main():
     began = time.monotonic()
     backend = None
@@ -1323,8 +1466,13 @@ def main():
             raise Blocked('unsupported')
         if not all(isinstance(request.get(k), str) and request[k] for k in ('key', 'id', 'title')):
             raise Blocked('invalid_request')
-        backend = MacBackend(request)
-        result = backend.inspect() if request.get('mode') == 'inspect' else perform(request, backend, Journal())
+        if request['app_id'] == 'openclaw':
+            from openclaw_transport import OpenClawTransport
+            backend = OpenClawTransport(request, Blocked)
+            result = backend.inspect() if request.get('mode') == 'inspect' else backend.perform(Journal(), resolve_text)
+        else:
+            backend = MacBackend(request)
+            result = backend.inspect() if request.get('mode') == 'inspect' else perform(request, backend, Journal())
     except Blocked as e:
         result = {'code': str(e), 'attempted': bool(backend and backend.did_write)}
         if e.retry_after is not None:
@@ -1340,22 +1488,19 @@ def main():
                   'error_function': trace.tb_frame.f_code.co_name if trace else '',
                   'error_line': trace.tb_lineno if trace else 0}
     if isinstance(locals().get('request'), dict) and request.get('mode') == 'inspect':
+        if isinstance(result.get('contract'), dict):
+            result['diagnostic_summary'] = result.pop('contract').get('summary', '')
         print(json.dumps(result))
         return
-    # Bounded local receipt contains no titles, drafts, paths or conversation text.
-    try:
-        directory = Path.home() / 'Library/Application Support/AgentRadar'
-        directory.mkdir(parents=True, exist_ok=True)
-        receipt = dict(result, time=time.time(), stage=getattr(backend, 'stage', 'preflight'),
-                       elapsed_ms=round((time.monotonic() - began) * 1000))
-        receipt['app_id'] = request.get('app_id', '')
-        if isinstance(request.get('key'), str):
-            receipt['key_hash'] = digest(request['key'])
-        path = directory / 'last-recovery.json'
-        path.write_text(json.dumps(receipt))
-        path.chmod(0o600)
-    except Exception:
-        pass
+    operation_id = None
+    if isinstance(locals().get('request'), dict):
+        try:
+            operation_id = _persist_receipts(request, result, backend, began)
+        except Exception:
+            operation_id = None
+    if operation_id and isinstance(result, dict):
+        result = dict(result)
+        result['operation_id'] = operation_id
     print(json.dumps(result))
 
 

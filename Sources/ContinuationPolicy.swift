@@ -17,6 +17,7 @@ struct ContinuationEvent {
     var recoveryDelayReported = false
     var routeRetries = 0
     var waitMessage = ""
+    var operationID = UUID().uuidString.lowercased().replacingOccurrences(of: "-", with: "")
 }
 
 /// Only explicit lifecycle evidence arms automatic work. Historical rows are inert.
@@ -62,7 +63,10 @@ struct ContinuationPolicy {
         if row.app_id == "autoclaw" && (row.navigation_key == nil || row.navigation_title == nil) {
             return "未找到唯一的 AutoClaw 会话映射，暂不能自动定位"
         }
-        if !["codex", "workbuddy", "workbuddy-ai", "zcode", "autoclaw", "grok", "qoder-cn", "qoder"].contains(row.app_id) {
+        if row.app_id == "openclaw" && (row.navigation_key == nil || row.source != "local-db") {
+            return "未核验本地 OpenClaw 原会话键，暂不能恢复"
+        }
+        if !["codex", "workbuddy", "workbuddy-ai", "zcode", "autoclaw", "grok", "qoder-cn", "qoder", "openclaw"].contains(row.app_id) {
             return "此应用尚未适配可靠的输入与发送定位"
         }
         return nil
@@ -102,7 +106,7 @@ struct ContinuationPolicy {
     /// An explicit click may arm historical completions; startup never calls this.
     mutating func startCompleted(_ rows: [SessionRecord], now: Double, prompt: String, supervisedIDs: Set<String> = []) -> [ContinuationEvent] {
         rows.compactMap { row in
-            guard supervisedIDs.contains(row.id), row.status == "completed", Self.followupRestriction(row) == nil,
+            guard supervisedIDs.contains(row.id), row.manual_only != true, row.status == "completed", Self.followupRestriction(row) == nil,
                   claim(row, kind: "explicit-start") else { return nil }
             return ContinuationEvent(session: row, key: Self.key(row), detectedAt: now, canContinue: true,
                 explanation: "已排定本轮持续优化", kind: "followup", text: "", automationMode: "rage")
@@ -146,7 +150,7 @@ struct ContinuationPolicy {
                 let restriction = Self.followupRestriction(row)
                 let marked = supervisedIDs.contains(row.id)
                 events.append(ContinuationEvent(session: row, key: Self.key(row), detectedAt: now,
-                    canContinue: rage && marked && restriction == nil,
+                    canContinue: rage && marked && row.manual_only != true && restriction == nil,
                     explanation: rage ? (marked ? (restriction ?? "本轮已结束，继续持续优化") : "本轮已完成；未标记监督，仅提醒") : "这个项目已完结，请验收",
                     kind: rage && marked ? "followup" : "completion", text: "",
                     automationMode: rage ? "rage" : "collaboration"))
@@ -171,8 +175,9 @@ struct ContinuationPolicy {
             // Rate limits retain their configured wait; speeding up cannot clear them.
             let delay = rate ? min(10, max(1, rateLimitDelay.isFinite ? rateLimitDelay : 10)) : (rage ? 1 : 5)
             events.append(ContinuationEvent(session: row, key: Self.key(row), detectedAt: now,
-                canContinue: restriction == nil && !cooldown && (!rage || supervisedIDs.contains(row.id)),
-                explanation: (rage && !supervisedIDs.contains(row.id) ? "会话未标记监督，本轮只提醒" : nil) ?? restriction ?? (cooldown ? "本会话已触发恢复冷却，先检查连续失败原因" : "检测到本轮意外中断，即将返回原会话继续"),
+                canContinue: row.manual_only != true && restriction == nil && !cooldown && (!rage || supervisedIDs.contains(row.id)),
+                explanation: (row.manual_only == true ? "这是后台子任务；仅支持手动恢复该条原会话" : nil) ??
+                    (rage && !supervisedIDs.contains(row.id) ? "会话未标记监督，本轮只提醒" : nil) ?? restriction ?? (cooldown ? "本会话已触发恢复冷却，先检查连续失败原因" : "检测到本轮意外中断，即将返回原会话继续"),
                 text: rage ? Self.resumeText(forApp: row.app_id, overrides: appResumeTexts, global: rageResumeText)
                     : (rate ? rateLimitText : interruptText), delay: delay,
                 patience: max(600, delay + 600), bypassRestriction: rate,

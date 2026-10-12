@@ -97,6 +97,16 @@ import Foundation
         row.status_reason = "触发者待确认"
         row.user_stopped = true
         check(ContinuationPolicy.restriction(row, manual: true) != nil, "manual keeps user stop boundary")
+        row.user_stopped = false; row.status_reason = "OpenClaw 明确记录本轮执行超时"
+        check(transition("interrupted", mode: "rage") {
+            $0.app_id = "openclaw"; $0.source = "local-db"; $0.navigation_key = "agent:main:desktop"
+        }.first?.canContinue == true, "OpenClaw verified interruption can recover")
+        check(transition("interrupted", mode: "rage") {
+            $0.app_id = "openclaw"; $0.source = "local-db"; $0.navigation_key = nil
+        }.first?.canContinue == false, "OpenClaw missing original key cannot recover")
+        check(transition("interrupted", mode: "rage") {
+            $0.app_id = "openclaw"; $0.source = "local-db"; $0.navigation_key = "agent:main:desktop"; $0.user_stopped = true
+        }.isEmpty, "OpenClaw intentional stop remains stopped")
         print("Continuation policy: \(count) checks passed")
     }
 }

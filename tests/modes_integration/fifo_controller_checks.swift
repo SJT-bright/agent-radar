@@ -3,6 +3,7 @@ import Foundation
 private final class FIFOSender: ContinuationSending {
     var isRunning = false
     var sentAt: Double?
+    var sentRunID: String?
     var requests: [[String: Any]] = []
     var callback: ((String, Bool, Double?) -> Void)?
     func cancel() { isRunning = false; callback = nil }
@@ -121,6 +122,37 @@ private final class FIFOSender: ContinuationSending {
         x.started_at = 2005.1; fast.observe([x, y], fresh: true)
         check(fastSender.ids == [x.id, y.id] && messages.contains(where: { $0.contains("发送已确认") }), "subsecond turn after actual send confirms even before callback arrival")
         fast.stop()
+        // Protocol-based OpenClaw recovery shares the same FIFO and must wait
+        // for a causally newer turn, rather than releasing on a gateway ACK.
+        now = 3000
+        let rpcSender = FIFOSender()
+        let rpc = ContinuationController(bridge: rpcSender, clock: { now }, inputIdle: { 1000 }, countDefaults: defaults)
+        rpc.rulesProvider = { rules }; rpc.configure(enabled: true, paused: false)
+        var oc = row("oc"), next = row("after-openclaw")
+        oc.id = "openclaw:main:11111111-1111-4111-8111-111111111111"
+        oc.app_id = "openclaw"; oc.source = "local-db"; oc.navigation_key = "agent:main:desktop"
+        oc.lifecycle_revision = "revision-original"
+        rpc.setSupervisedIDs([oc.id, next.id])
+        rpc.observe([oc, next], fresh: true)
+        oc.status = "interrupted"; oc.status_reason = "OpenClaw 明确记录本轮执行超时"
+        rpc.observe([oc, next], fresh: true)
+        next.status = "completed"; rpc.observe([oc, next], fresh: true)
+        now += 1; rpc.observe([oc, next], fresh: true)
+        check(rpcSender.ids == [oc.id], "OpenClaw interruption is the first FIFO item")
+        check(rpcSender.requests[0]["navigation_key"] as? String == "agent:main:desktop", "OpenClaw request binds original session key")
+        check(rpcSender.requests[0]["lifecycle_revision"] as? String == "revision-original", "OpenClaw carries original lifecycle revision")
+        rpcSender.sentAt = now + 0.8
+        rpcSender.sentRunID = "11111111-2222-4333-8444-555555555555"
+        rpcSender.finish("sent_pending_confirmation", attempted: true)
+        now += 1; oc.status = "running"; oc.started_at = now - 0.9
+        rpc.observe([oc, next], fresh: true)
+        now += 5; rpc.observe([oc, next], fresh: true)
+        check(rpcSender.ids == [oc.id], "OpenClaw pre-send turn and gateway ACK cannot release FIFO")
+        oc.started_at = 3001.9; rpc.observe([oc, next], fresh: true)
+        check(rpcSender.ids == [oc.id], "different OpenClaw run cannot confirm our request")
+        oc.run_id = rpcSender.sentRunID; rpc.observe([oc, next], fresh: true)
+        check(rpcSender.ids == [oc.id, next.id], "new OpenClaw turn after actual send releases next item")
+        rpc.stop()
         print("FIFO desktop queue: \(checks) checks passed")
     }
 }

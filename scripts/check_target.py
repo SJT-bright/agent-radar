@@ -18,7 +18,9 @@ def main():
     parser.add_argument('app', choices=sorted(BUNDLES))
     parser.add_argument('session_id', help='Exact collector row ID, including the application prefix')
     args = parser.parse_args()
-    if args.app == 'autoclaw':
+    if args.app == 'openclaw':
+        from collector.openclaw_adapter import collect
+    elif args.app == 'autoclaw':
         from collector.autoclaw_adapter import collect
     elif args.app == 'codex':
         from collector.codex_adapter import collect_session
@@ -31,7 +33,11 @@ def main():
     try:
         if len(rows) != 1:
             raise Blocked('target_unverified')
-        result = MacBackend(dict(rows[0], mode='inspect')).inspect()
+        if args.app == 'openclaw':
+            from supervisor.openclaw_transport import OpenClawTransport
+            result = OpenClawTransport(dict(rows[0], mode='inspect'), Blocked).inspect()
+        else:
+            result = MacBackend(dict(rows[0], mode='inspect')).inspect()
     except Blocked as error:
         result = dict(code=str(error), attempted=False)
     result.update(app_id=args.app, session_hash=hashlib.sha256(args.session_id.encode()).hexdigest())
