@@ -59,6 +59,33 @@ class PortableTests(unittest.TestCase):
         backend.snapshot=lambda:dict(identity=True,input_count=1,value='hello',busy=False)
         backend._invoke=lambda _:dict(code='sent',focused=True,attempted=True)
         backend.send();self.assertEqual(calls,['guard']);self.assertEqual(backend.stage,'send')
+    def test_full_native_protocol_uses_fresh_title_proof_and_one_send(self):
+        import hashlib,time
+        from supervisor.bridge import Journal,perform
+        with tempfile.TemporaryDirectory() as tmp:
+            helper=Path(tmp)/'helper.exe';helper.write_bytes(b'fixture; never executed')
+            now=time.time();sid='codex:11111111-1111-4111-8111-111111111111'
+            row=dict(id=sid,app_id='codex',title='Fixture',project='C:\\Fixture',source='local-session',target='codex://threads/11111111-1111-4111-8111-111111111111',status='interrupted',started_at=now-20,title_unique=True)
+            request={**row,'key':sid+':'+str(int((now-20)*1000)),'mode':'send','text':'hello','overwrite_draft':True}
+            value=[''];stages=[]
+            def runner(argv,data,timeout):
+                payload=json.loads(data);stages.append(payload['stage']);self.assertTrue(payload['supervisor_verified']);self.assertTrue(payload['title_unique'])
+                if payload['stage']=='write':value[0]=payload['text']
+                if payload['stage']=='send':row['status']='running';row['started_at']=now+1
+                code='sent' if payload['stage']=='send' else 'written' if payload['stage']=='write' else 'ready'
+                result=dict(code=code,identity=True,stable_id=sid,busy=False,input_count=1,send_available=True,send_enabled=True,empty=not value[0],digest=hashlib.sha256(value[0].encode()).hexdigest(),focused=True,attempted=payload['stage'] in ('write','send'))
+                return 0,json.dumps(result).encode()
+            backend=win.WindowsBackend(request,helper=helper,reader=lambda _:dict(row),identity=lambda _:None,idle=lambda:10,locked=lambda:False,runner=runner)
+            result=perform(request,backend,Journal(Path(tmp)/'journal'))
+            self.assertEqual(result['code'],'sent_pending_confirmation');self.assertEqual(stages.count('write'),1);self.assertEqual(stages.count('send'),1)
+    def test_window_title_uniqueness_cannot_be_supplied_by_request(self):
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            helper=Path(tmp)/'helper.exe';helper.write_bytes(b'fixture')
+            request=dict(id='codex:fixture',app_id='codex',title='Fixture',project='C:\\Fixture',source='local-session',target='codex://threads/fixture',status='interrupted',started_at=time.time()-20,key='fixture',title_unique=True)
+            row={**request,'title_unique':False}
+            backend=win.WindowsBackend(request,helper=helper,reader=lambda _:dict(row),identity=lambda _:None,idle=lambda:10,locked=lambda:False)
+            backend.guard(fresh=True);self.assertFalse(backend._title_unique)
     def test_script_startup_does_not_depend_on_checkout_cwd(self):
         import subprocess,sys
         with tempfile.TemporaryDirectory() as tmp:

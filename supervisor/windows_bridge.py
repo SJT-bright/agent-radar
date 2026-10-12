@@ -127,6 +127,7 @@ class WindowsBackend:
         self.title = request.get("navigation_title") or request.get("title")
         self._written = None
         self._original = None
+        self._title_unique = False
         self._identity_value = None
         self._seen_identity = False
         if helper is None:
@@ -155,6 +156,7 @@ class WindowsBackend:
         except Exception:
             raise Blocked("state_unverified")
         self._require_row(row)
+        self._title_unique = bool(row.get("title_unique") is True and row.get("title")==self.title and row.get("target")==self.request.get("target"))
         frozen = tuple(row.get(key) for key in _STABLE)
         if self._original is None:
             self._original = frozen
@@ -324,7 +326,7 @@ class WindowsBackend:
             raise Blocked("helper_unavailable")
         payload = _payload(self.request, stage, text)
         payload["supervisor_verified"]=True
-        payload["title_unique"]=bool(self.request.get("app_id")=="codex" and self._original and self._original.get("title_unique") is True and self._original.get("title")==self.request.get("title"))
+        payload["title_unique"]=bool(self.request.get("app_id")=="codex" and self._title_unique)
         data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if len(data) > 8192:
             raise Blocked("invalid_request")
