@@ -69,6 +69,7 @@ class NativeWindows:
             proc.stdout.close()
 
 def main():
+    if hasattr(sys.stdout,"reconfigure"):sys.stdout.reconfigure(encoding="utf-8")
     if '--self-test' in sys.argv:
         index=sys.argv.index('--self-test');return self_test(sys.argv[index+1])
     if '--bridge' in sys.argv:

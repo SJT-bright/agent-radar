@@ -64,7 +64,7 @@ class PortableTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(__file__).resolve().parents[1]
             env={**os.environ,'HOME':tmp,'USERPROFILE':tmp,'APPDATA':str(Path(tmp)/'AppData/Roaming'),'LOCALAPPDATA':str(Path(tmp)/'AppData/Local')}
-            result=subprocess.run([sys.executable,'-B',str(root/'collector/main.py')],cwd=tmp,env=env,capture_output=True,text=True,timeout=20)
+            result=subprocess.run([sys.executable,'-B',str(root/'collector/main.py')],cwd=tmp,env=env,capture_output=True,text=True,encoding="utf-8",timeout=20)
             self.assertEqual(result.returncode,0,result.stderr[-500:]);self.assertIsInstance(json.loads(result.stdout)['sessions'],list)
     def test_frozen_worker_uses_only_isolated_fixture(self):
         import importlib.util
