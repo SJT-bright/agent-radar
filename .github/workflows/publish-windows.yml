@@ -1,0 +1,91 @@
+name: Publish verified Windows assets
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        required: true
+        default: '1.9.1'
+      run_id:
+        required: true
+        default: '38688840548'
+      expected_head_sha:
+        required: true
+        default: '7ead9b74c741f2b71f307d1af4bb9c47fa2bd51c'
+      expected_digest:
+        required: true
+        default: '55ed2e1e2109d22368082b4c798726e54e88cf4bed519180eff4751b87e9f60e'
+permissions:
+  contents: write
+  actions: read
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PUBLISH_VERSION: ${{ inputs.version }}
+      VERIFIED_RUN_ID: ${{ inputs.run_id }}
+      VERIFIED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+      VERIFIED_DIGEST: ${{ inputs.expected_digest }}
+    steps:
+      - name: Verify artifact and upload to existing draft
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,re,subprocess,zipfile
+          from pathlib import Path
+          repo=os.environ['GH_REPO'];version=os.environ['PUBLISH_VERSION']
+          run_id=os.environ['VERIFIED_RUN_ID'];head=os.environ['VERIFIED_HEAD_SHA'];digest=os.environ['VERIFIED_DIGEST']
+          assert re.fullmatch(r'\d+\.\d+\.\d+',version)
+          assert re.fullmatch(r'\d+',run_id) and re.fullmatch(r'[0-9a-f]{40}',head)
+          assert re.fullmatch(r'[0-9a-f]{64}',digest)
+          def api(path):
+              return json.loads(subprocess.check_output(['gh','api',f'repos/{repo}/{path}']))
+          tag='v'+version
+          releases=api('releases?per_page=100')
+          release=next(r for r in releases if r['tag_name']==tag)
+          assert release['draft'] and not release['prerelease'],'Only an existing draft may receive assets'
+          run=api(f'actions/runs/{run_id}')
+          assert run['conclusion']=='success' and run['head_sha']==head
+          assert run['path']=='.github/workflows/windows.yml'
+          candidates=api(f'actions/runs/{run_id}/artifacts')['artifacts']
+          artifact=next(a for a in candidates if a['name']=='windows-build-and-evidence')
+          assert not artifact['expired'] and artifact['digest']=='sha256:'+digest
+          folder=Path('verified-upload');folder.mkdir()
+          archive=folder/'windows-ci.zip'
+          with archive.open('wb') as output:
+              subprocess.run(['gh','api',f'repos/{repo}/actions/artifacts/{artifact["id"]}/zip'],stdout=output,check=True)
+          assert hashlib.sha256(archive.read_bytes()).hexdigest()==digest
+          names=[f'AgentRadar-{version}-Windows-x64-Setup.exe',f'AgentRadar-{version}-Windows-x64-Portable.zip']
+          with zipfile.ZipFile(archive) as z:
+              assert z.testzip() is None
+              for name in names+['SHA256SUMS-Windows']:
+                  matches=[i for i in z.infolist() if Path(i.filename).name==name]
+                  assert len(matches)==1
+                  (folder/name).write_bytes(z.read(matches[0]))
+          expected={line.split(None,1)[1].strip():line.split(None,1)[0] for line in (folder/'SHA256SUMS-Windows').read_text(encoding='utf-8-sig').splitlines()}
+          verified={}
+          for name in names:
+              path=folder/name;sha=hashlib.sha256(path.read_bytes()).hexdigest()
+              assert expected[name]==sha
+              existing=next((a for a in release['assets'] if a['name']==name),None)
+              if existing and existing['state']=='uploaded':
+                  assert existing['digest']=='sha256:'+sha
+              else:
+                  if existing:
+                      assert existing['state']=='starter'
+                      subprocess.run(['gh','api','--method','DELETE',f'repos/{repo}/releases/assets/{existing["id"]}'],check=True)
+                  subprocess.run(['gh','release','upload',tag,str(path),'--repo',repo],check=True)
+              verified[name]=sha
+          latest=api(f'releases/{release["id"]}')
+          for name,sha in verified.items():
+              asset=next(a for a in latest['assets'] if a['name']==name)
+              assert asset['state']=='uploaded' and asset['digest']=='sha256:'+sha
+          Path('upload-verification.json').write_text(json.dumps({'all_passed':True,'run_id':run_id,'artifact_id':artifact['id'],'artifact_digest':digest,'release_id':release['id'],'assets':verified},indent=2))
+          print('Verified Windows assets uploaded; server SHA-256 matches both files')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-upload-verification
+          path: upload-verification.json
