@@ -39,8 +39,10 @@ final class MonitorStore: ObservableObject {
     let autoQueueInsertionEnabled = false
     @Published private(set) var reminderPopupEnabled: Bool
     @Published private(set) var reminderSoundEnabled: Bool
+    @Published private(set) var reminderApps: ReminderAppSelection
     static let reminderPopupDefaultsKey = "reminderPopupEnabled.v1"
     static let reminderSoundDefaultsKey = "reminderSoundEnabled.v1"
+    static let reminderAppsDefaultsKey = "reminderAppSelection.v1"
     var onReminderPreferencesChanged: (() -> Void)?
     var onPreviewReminderSound: (() -> Void)?
     @Published private(set) var keepAwakeEnabled: Bool
@@ -127,6 +129,13 @@ final class MonitorStore: ObservableObject {
         defaults.set(false, forKey: "autoQueueInsertion.v1")
         reminderPopupEnabled = defaults.object(forKey: Self.reminderPopupDefaultsKey) as? Bool ?? true
         reminderSoundEnabled = defaults.object(forKey: Self.reminderSoundDefaultsKey) as? Bool ?? true
+        if defaults.object(forKey: Self.reminderAppsDefaultsKey) == nil {
+            reminderApps = ReminderAppSelection()
+        } else {
+            reminderApps = defaults.data(forKey: Self.reminderAppsDefaultsKey)
+                .flatMap { try? JSONDecoder().decode(ReminderAppSelection.self, from: $0) }?.normalized
+                ?? ReminderAppSelection(allApps: false)
+        }
         keepAwakeEnabled = defaults.bool(forKey: "keepAwakeEnabled.v1")
         promptRules = PromptRules.load(from: defaults)
         supervisedSessionIDs = Set((defaults.stringArray(forKey: Self.supervisionDefaultsKey) ?? []).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
@@ -422,7 +431,8 @@ final class MonitorStore: ObservableObject {
     func showWorkspaceConflict(_ conflict: WorkspaceConflict) {
         onRecoveryNotice?(ContinuationNotice(title: "同目录工作提醒", conversation: "",
             message: conflict.appNames.joined(separator: "、") + " 正在同一文件夹中工作，可能修改相同文件。请检查是否需要暂停其中一个。",
-            sessionID: "workspace-conflict:" + conflict.id, project: conflict.id, isWorkspaceConflict: true))
+            sessionID: "workspace-conflict:" + conflict.id, project: conflict.id, isWorkspaceConflict: true,
+            relatedAppIDs: Set(conflict.sessions.map(\.app_id))))
     }
 
     func showWorkspaceConflicts() {
@@ -884,21 +894,48 @@ final class MonitorStore: ObservableObject {
         writeDiagnostic()
     }
 
-    /// 提醒偏好独立保存；只修改弹窗或音效不会取消已授权的恢复任务。
+    /// 提醒偏好独立保存；修改弹窗、音效或应用范围不会取消已授权的恢复任务。
     func applySettingsDraft(_ draft: PromptSettingsDraft) {
         let rules = draft.applying(to: promptRules)
         if rules != promptRules { applyRules(rules) }
+        let selection = draft.reminderApps.normalized
+        let selectionChanged = reminderApps != selection
         guard reminderPopupEnabled != draft.reminderPopupEnabled ||
-                reminderSoundEnabled != draft.reminderSoundEnabled else { return }
+                reminderSoundEnabled != draft.reminderSoundEnabled || selectionChanged else { return }
         reminderPopupEnabled = draft.reminderPopupEnabled
         reminderSoundEnabled = draft.reminderSoundEnabled
+        reminderApps = selection
         removalDefaults.set(reminderPopupEnabled, forKey: Self.reminderPopupDefaultsKey)
         removalDefaults.set(reminderSoundEnabled, forKey: Self.reminderSoundDefaultsKey)
+        if selectionChanged, let data = try? JSONEncoder().encode(selection) {
+            removalDefaults.set(data, forKey: Self.reminderAppsDefaultsKey)
+        }
         onReminderPreferencesChanged?()
         writeDiagnostic()
     }
 
     func previewReminderSound() { onPreviewReminderSound?() }
+
+    var reminderAppOptions: [ReminderAppOption] {
+        var names = NativeMonitor.reminderApplicationNames
+        for app in apps { names[app.id] = app.name }
+        for row in sessions { names[row.app_id] = row.app_name }
+        for id in reminderApps.selectedAppIDs where names[id] == nil { names[id] = id }
+        return names.filter { !$0.key.isEmpty }.map { ReminderAppOption(id: $0.key, name: $0.value) }
+            .sorted { $0.name == $1.name ? $0.id < $1.id : $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    func shouldRemind(_ notice: ContinuationNotice) -> Bool {
+        if !notice.relatedAppIDs.isEmpty { return notice.relatedAppIDs.contains { reminderApps.allows($0) } }
+        if let appID = notice.appID { return reminderApps.allows(appID) }
+        if let id = notice.sessionID {
+            let rows = sessions.filter { $0.id == id }
+            if rows.count == 1, let row = rows.first { return reminderApps.allows(row.app_id) }
+            return reminderApps.allApps
+        }
+        // Explicit previews and general application messages have no session owner.
+        return true
+    }
 
     func isSupervised(_ session: SessionRecord) -> Bool {
         supervisedSessionIDs.contains(session.id) || supervisedAppIDs.contains(session.app_id) || openClawCareIDs.contains(session.id)
@@ -1205,6 +1242,8 @@ final class MonitorStore: ObservableObject {
                                   "desktop_queue_policy": "fifo",
                                   "reminder_popup_enabled": reminderPopupEnabled,
                                   "reminder_sound_enabled": reminderSoundEnabled,
+                                  "reminder_all_apps": reminderApps.allApps,
+                                  "reminder_selected_apps": reminderApps.selectedAppIDs.sorted(),
                                   "collector_restarts": collectorRestarts,
                                   "native_full_scans": nativeFullScans,
                                   "native_partial_scans": nativePartialScans,

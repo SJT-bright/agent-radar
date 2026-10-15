@@ -69,3 +69,11 @@ build/window-activity-observer-checks
 /usr/bin/xcrun swiftc -swift-version 5 Sources/Models.swift Sources/ContinuationPolicy.swift Sources/OpenClawCareRegistry.swift tests/openclaw_care_checks.swift -o build/openclaw-care-checks
 build/openclaw-care-checks
 rm build/openclaw-care-checks
+
+REMINDER_CHECK_SOURCES=()
+for source in Sources/*.swift; do
+  if [[ "$source" != "Sources/main.swift" ]]; then REMINDER_CHECK_SOURCES+=("$source"); fi
+done
+/usr/bin/xcrun swiftc -swift-version 5 "${REMINDER_CHECK_SOURCES[@]}" tests/reminder_app_checks.swift -o build/reminder-app-checks
+build/reminder-app-checks
+rm build/reminder-app-checks

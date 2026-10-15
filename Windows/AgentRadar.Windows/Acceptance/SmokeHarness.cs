@@ -51,6 +51,23 @@ public static class SmokeHarness {
    var reopenedHandle=new WindowInteropHelper(reopened).Handle;
    await Task.Run(()=>InvokeName(reopenedHandle,"提示词"));await Task.Delay(200);
    Check(await Task.Run(()=>ReadText(reopenedHandle,"意外中断提示词"))=="CI isolated recovery text","saved text survives close/reopen");
+   await Task.Run(()=>InvokeName(reopenedHandle,"提醒"));await Task.Delay(200);
+   await Task.Run(()=>InvokeName(reopenedHandle,"全不选"));await Task.Delay(200);
+   await Task.Run(()=>ToggleName(reopenedHandle,"Codex 的提醒"));await Task.Delay(200);
+   await Task.Run(()=>InvokeName(reopenedHandle,"保存"));await Task.Delay(200);
+   var reminderSettings=repository.Load();
+   Check(!reminderSettings.AllReminderApps&&reminderSettings.ReminderAppIds.SetEquals(new[]{"codex"}),"actual app reminder checkboxes persist selected-only scope");
+   Check(await Task.Run(()=>ToggleValue(reopenedHandle,"Codex 的提醒"))==ToggleState.On&&await Task.Run(()=>ToggleValue(reopenedHandle,"Grok 的提醒"))==ToggleState.Off,"selected and unselected app controls read back correctly");
+   Capture(reopened,Path.Combine(output,"08-reminder-apps.png"));
+   await Task.Run(()=>SetText(reopenedHandle,"搜索提醒应用","grok"));await Task.Delay(200);
+   Check(await Task.Run(()=>FindName(reopenedHandle,"Grok 的提醒")!=null&&FindName(reopenedHandle,"Codex 的提醒")==null),"reminder search filters actual app checkboxes");
+   await Task.Run(()=>SetText(reopenedHandle,"搜索提醒应用",""));await Task.Delay(200);
+   await Task.Run(()=>InvokeName(reopenedHandle,"完成"));await Task.Delay(200);
+   main.OpenSettings();await Task.Delay(300);
+   reopened=main.CurrentSettingsWindow ?? throw new InvalidOperationException("reminder reopen missing");
+   reopenedHandle=new WindowInteropHelper(reopened).Handle;
+   await Task.Run(()=>InvokeName(reopenedHandle,"提醒"));await Task.Delay(200);
+   Check(await Task.Run(()=>ToggleValue(reopenedHandle,"Codex 的提醒"))==ToggleState.On&&await Task.Run(()=>ToggleValue(reopenedHandle,"Grok 的提醒"))==ToggleState.Off,"reminder app selections survive settings close/reopen");
    await Task.Run(()=>InvokeName(reopenedHandle,"监督"));await Task.Delay(200);
    Check(await Task.Run(()=>FindName(reopenedHandle,"搜索会话、软件或工作区")!=null),"supervision search accessible");
    Capture(reopened,Path.Combine(output,"06-supervision.png"));
@@ -71,6 +88,8 @@ public static class SmokeHarness {
  }
  static AutomationElement? FindName(IntPtr hwnd,string name){var root=AutomationElement.FromHandle(hwnd);return root.FindFirst(TreeScope.Descendants,new PropertyCondition(AutomationElement.NameProperty,name));}
  static void InvokeName(IntPtr hwnd,string name){var e=FindName(hwnd,name)??throw new InvalidOperationException("control not found: "+name);if(e.TryGetCurrentPattern(InvokePattern.Pattern,out var p)){((InvokePattern)p).Invoke();return;}if(e.TryGetCurrentPattern(SelectionItemPattern.Pattern,out var s)){((SelectionItemPattern)s).Select();return;}throw new InvalidOperationException("no invoke pattern: "+name);}
+ static void ToggleName(IntPtr hwnd,string name){var e=FindName(hwnd,name)??throw new InvalidOperationException("checkbox not found: "+name);((TogglePattern)e.GetCurrentPattern(TogglePattern.Pattern)).Toggle();}
+ static ToggleState ToggleValue(IntPtr hwnd,string name){var e=FindName(hwnd,name)??throw new InvalidOperationException("checkbox not found: "+name);return ((TogglePattern)e.GetCurrentPattern(TogglePattern.Pattern)).Current.ToggleState;}
  static AutomationElement? FindInput(IntPtr hwnd,string name){return AutomationElement.FromHandle(hwnd).FindFirst(TreeScope.Descendants,new AndCondition(new PropertyCondition(AutomationElement.NameProperty,name),new PropertyCondition(AutomationElement.ControlTypeProperty,ControlType.Edit)));}
  static void SetText(IntPtr hwnd,string name,string value){var e=FindInput(hwnd,name)??throw new InvalidOperationException("input missing: "+name);((ValuePattern)e.GetCurrentPattern(ValuePattern.Pattern)).SetValue(value);}
  static string ReadText(IntPtr hwnd,string name){var e=FindInput(hwnd,name)??throw new InvalidOperationException("input missing: "+name);return ((ValuePattern)e.GetCurrentPattern(ValuePattern.Pattern)).Current.Value;}

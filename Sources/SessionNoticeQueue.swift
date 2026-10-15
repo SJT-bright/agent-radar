@@ -47,7 +47,11 @@ struct SessionNoticeQueue<Entry: SessionNoticeEntry> {
         pending.removeAll()
     }
 
-    mutating func remove(where shouldRemove: (Entry) -> Bool) {
+    mutating func remove(where shouldRemove: (Entry) -> Bool, acknowledgingCompletions: Bool = false) {
+        if acknowledgingCompletions {
+            if let entry = current, shouldRemove(entry) { acknowledge(entry.sessionKey) }
+            for entry in pending where shouldRemove(entry) { acknowledge(entry.sessionKey) }
+        }
         pending.removeAll(where: shouldRemove)
         if let entry = current, shouldRemove(entry) {
             current = pending.isEmpty ? nil : pending.removeFirst()

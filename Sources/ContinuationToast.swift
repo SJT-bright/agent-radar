@@ -135,6 +135,12 @@ final class ContinuationToast {
     }
     /// New notice first displayed; progress updates and show/hide switches do not notify again.
     var onDidPresentNotice: ((ContinuationNotice) -> Void)?
+    var notices: [ContinuationNotice] { ([current].compactMap { $0 } + queue.pending).map(\.notice) }
+
+    func reconcileReminders(shouldKeep: (ContinuationNotice) -> Bool) {
+        queue.remove(where: { !shouldKeep($0.notice) }, acknowledgingCompletions: true)
+        if current == nil { panel?.orderOut(nil) } else { render() }
+    }
 
     init() {
         screenObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,

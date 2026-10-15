@@ -57,6 +57,8 @@ struct ContinuationNotice {
     var project = ""
     var isWorkspaceConflict = false
     var timing: RecoveryTiming? = nil
+    var appID: String? = nil
+    var relatedAppIDs = Set<String>()
     var primaryDisplayName: String { SessionRecord.folderName(for: project) ?? conversation }
     var secondaryDisplayName: String? {
         guard SessionRecord.folderName(for: project) != nil, !conversation.isEmpty, conversation != primaryDisplayName else { return nil }
@@ -460,7 +462,7 @@ final class ContinuationController {
             conversation: event.session.title, message: message, cancellable: cancellable,
             needsPermission: permission, isCompletion: event.kind == "completion", sessionID: event.session.id,
             recoveryKey: event.key, canRetry: !recovering && retryAllowed(event), isRecovering: recovering,
-            project: event.session.project, timing: timing))
+            project: event.session.project, timing: timing, appID: event.session.app_id))
     }
     private func timing(for event: ContinuationEvent) -> RecoveryTiming? {
         let desktop = event.session.app_id != "openclaw"

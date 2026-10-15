@@ -132,7 +132,7 @@ class DesktopAdapterTests(unittest.TestCase):
         ])
         targets = {row["id"]: row["target"] for row in self.reader.collect()}
         self.assertEqual(targets["zcode:" + hashlib.sha256(b"cn").hexdigest()[:12] + ":cn"],
-                         "zcode://workspace/open?path=%2FUsers%2Fsijunting%2F"
+                         "zcode://workspace/open?path=%2FUsers%2Fexample%2F"
                          "%E9%AB%98%E4%B8%89%E7%94%9F%E5%BA%95%E5%B1%82%E8%B0%83%E7%A0%94")
         self.assertEqual(targets["zcode:" + hashlib.sha256(b"relative").hexdigest()[:12] + ":rel"], "")
         self.assertEqual(targets["zcode:" + hashlib.sha256(b"traversal").hexdigest()[:12] + ":trav"], "")

@@ -30,7 +30,7 @@ private final class ReminderPreviewDelegate: NSObject, NSApplicationDelegate {
     private var currentNotice: ContinuationNotice?
     private var hoverCaptureTimer: Timer?
     private var capturedHover = false
-    private let receipt = FileManager.default.temporaryDirectory.appendingPathComponent("agentradar-reminder-preview-events.jsonl")
+    private let receipt = URL(fileURLWithPath: ProcessInfo.processInfo.environment["AGENT_RADAR_REMINDER_PREVIEW_RECEIPT"] ?? FileManager.default.temporaryDirectory.appendingPathComponent("agentradar-reminder-preview-events.jsonl").path)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -43,7 +43,7 @@ private final class ReminderPreviewDelegate: NSObject, NSApplicationDelegate {
         store = MonitorStore(defaults: defaults, writeHealthDiagnostics: false, continuation: continuation)
         store.expanded = true
         let now = Date().timeIntervalSince1970
-        store.sessions = [fixture(start: now - 8, status: "running")]
+        store.sessions = ["codex", "grok", "openclaw"].map { fixture(start: now - 8, status: "running", app: $0) }
         radar = PreviewRadarPanel(contentRect: NSRect(x: 1160, y: 290, width: 238, height: 440),
                         styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         radar.title = "任务雷达 · 隔离验收"
@@ -89,8 +89,8 @@ private final class ReminderPreviewDelegate: NSObject, NSApplicationDelegate {
         log("ready")
     }
 
-    private func fixture(start: Double, status: String) -> SessionRecord {
-        SessionRecord(id: "preview:completion", app_id: "codex", app_name: "Codex", title: "增加开机自启动开关",
+    private func fixture(start: Double, status: String, app: String = "codex") -> SessionRecord {
+        SessionRecord(id: "preview:completion:" + app, app_id: app, app_name: PromptRules.appDisplayNames[app] ?? app, title: "提醒应用选择 · " + app,
                       project: "/tmp/个人资料库", status: status, evidence: "isolated lifecycle fixture",
                       updated_at: Date().timeIntervalSince1970, source: "local-session", target: "preview://task",
                       started_at: start, ended_at: status == "completed" ? Date().timeIntervalSince1970 : nil,
@@ -98,7 +98,7 @@ private final class ReminderPreviewDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func makeControls() {
-        controls = NSWindow(contentRect: NSRect(x: 410, y: 360, width: 540, height: 250),
+        controls = NSWindow(contentRect: NSRect(x: 410, y: 360, width: 610, height: 290),
                             styleMask: [.titled, .closable], backing: .buffered, defer: false)
         controls.title = "提醒功能 · 隔离验收"
         controls.isReleasedWhenClosed = false
@@ -109,6 +109,7 @@ private final class ReminderPreviewDelegate: NSObject, NSApplicationDelegate {
         let note = NSTextField(wrappingLabelWithString: "使用产品组件和隔离偏好；未启动监控，不会操作任何真实 AI 对话。")
         stack.addArrangedSubview(note)
         for buttons in [[("模拟任务完成", #selector(completion)), ("打开设置", #selector(settings))],
+                        [("模拟 Grok 完成", #selector(grokCompletion)), ("模拟 OpenClaw 完成", #selector(openClawCompletion))],
                         [("刷新同一提醒", #selector(refreshNotice)), ("下一条提醒", #selector(nextNotice)), ("清除全部提醒", #selector(clearNotices))],
                         [("提醒位置回执", #selector(recordFrame)), ("关闭预览", #selector(quit))]] {
             let row = NSStackView(); row.orientation = .horizontal; row.spacing = 10
@@ -128,20 +129,23 @@ private final class ReminderPreviewDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    @objc private func completion() {
+    @objc private func completion() { complete(app: "codex") }
+    @objc private func grokCompletion() { complete(app: "grok") }
+    @objc private func openClawCompletion() { complete(app: "openclaw") }
+    private func complete(app: String) {
         round += 1
         let started = Date().timeIntervalSince1970 - 0.05
-        store.onSessionsObserved?([fixture(start: started, status: "running")], true)
-        let completed = fixture(start: started, status: "completed")
+        store.onSessionsObserved?([fixture(start: started, status: "running", app: app)], true)
+        let completed = fixture(start: started, status: "completed", app: app)
         store.onSessionsObserved?([completed], true)
-        store.sessions = [completed]
-        let notice = ContinuationNotice(title: "Codex · 完成待验收", conversation: completed.title,
+        store.sessions.removeAll { $0.app_id == app }; store.sessions.append(completed)
+        let notice = ContinuationNotice(title: completed.app_name + " · 完成待验收", conversation: completed.title,
                                         message: "这个项目已完结，请验收", isCompletion: true,
                                         sessionID: completed.id, recoveryKey: ContinuationPolicy.key(completed),
-                                        project: completed.project)
+                                        project: completed.project, appID: completed.app_id)
         currentNotice = notice
         store.onRecoveryNotice?(notice)
-        log("completion_\(round)")
+        log("completion_\(app)_\(round)")
         updateStatus()
     }
     @objc private func refreshNotice() {
@@ -172,7 +176,9 @@ private final class ReminderPreviewDelegate: NSObject, NSApplicationDelegate {
         let panel = NSApp.windows.first { $0.title == "AI 监督提醒" }
         var value: [String: Any] = ["event": event, "time": Date().timeIntervalSince1970,
                                   "audio_started": playbackCount, "popup_enabled": store.reminderPopupEnabled,
-                                  "sound_enabled": store.reminderSoundEnabled, "popup_visible": panel?.isVisible ?? false]
+                                  "sound_enabled": store.reminderSoundEnabled, "popup_visible": panel?.isVisible ?? false,
+                                  "all_apps": store.reminderApps.allApps, "selected_apps": store.reminderApps.selectedAppIDs.sorted(),
+                                  "queued_notice_apps": toast.notices.compactMap(\.appID), "suite": suiteName]
         if let frame = panel?.frame { value["frame"] = [frame.minX, frame.minY, frame.width, frame.height] }
         if let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]) {
             if !FileManager.default.fileExists(atPath: receipt.path) { FileManager.default.createFile(atPath: receipt.path, contents: nil) }

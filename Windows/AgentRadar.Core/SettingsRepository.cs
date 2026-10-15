@@ -114,6 +114,8 @@ public sealed class SettingsRepository {
             Mode = source.Mode,
             Popup = source.Popup,
             Sound = source.Sound,
+            AllReminderApps = source.AllReminderApps,
+            ReminderAppIds = new HashSet<string>(source.ReminderAppIds, StringComparer.Ordinal),
             KeepAwake = source.KeepAwake,
             StartWithWindows = source.StartWithWindows,
             Expanded = source.Expanded,
@@ -151,6 +153,8 @@ public sealed class SettingsRepository {
         target.Mode = source.Mode;
         target.Popup = source.Popup;
         target.Sound = source.Sound;
+        target.AllReminderApps = source.AllReminderApps;
+        target.ReminderAppIds = source.ReminderAppIds;
         target.KeepAwake = source.KeepAwake;
         target.StartWithWindows = source.StartWithWindows;
         target.Expanded = source.Expanded;
@@ -192,6 +196,7 @@ public sealed class SettingsRepository {
         if (!StagePolicy.LocalPath(settings.OpenClawHome, allowWslUnc: true, settings.WslDistribution)) settings.OpenClawHome = "";
         if (!StagePolicy.LocalPath(settings.WslExecutable, allowWslUnc: false, null)) settings.WslExecutable = "/usr/local/bin/openclaw";
         settings.CareIds = ValidIds(settings.CareIds);
+        settings.ReminderAppIds.RemoveWhere(string.IsNullOrWhiteSpace);
         return settings;
     }
 
@@ -202,6 +207,8 @@ public sealed class SettingsRepository {
         settings.Mode = Text(root, "Mode", "collaboration");
         settings.Popup = Bool(root, "Popup", true);
         settings.Sound = Bool(root, "Sound", true);
+        settings.AllReminderApps = Bool(root, "AllReminderApps", !root.TryGetProperty("AllReminderApps", out _));
+        settings.ReminderAppIds = Set(root, "ReminderAppIds");
         settings.KeepAwake = Bool(root, "KeepAwake", false);
         settings.StartWithWindows = Bool(root, "StartWithWindows", false);
         settings.Expanded = Bool(root, "Expanded", false);
@@ -240,6 +247,8 @@ public sealed class SettingsRepository {
         writer.WriteString("Mode", settings.Mode);
         writer.WriteBoolean("Popup", settings.Popup);
         writer.WriteBoolean("Sound", settings.Sound);
+        writer.WriteBoolean("AllReminderApps", settings.AllReminderApps);
+        WriteArray(writer, "ReminderAppIds", settings.ReminderAppIds.Order(StringComparer.Ordinal));
         writer.WriteBoolean("KeepAwake", settings.KeepAwake);
         writer.WriteBoolean("StartWithWindows", settings.StartWithWindows);
         writer.WriteBoolean("Expanded", settings.Expanded);

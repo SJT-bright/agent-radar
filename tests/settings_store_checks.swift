@@ -147,6 +147,13 @@ private final class SettingsStoreHarness {
             savedDomain.removeValue(forKey: MonitorStore.reminderSoundDefaultsKey)
             check(NSDictionary(dictionary: savedDomain).isEqual(to: originalDomain),
                   "reminder-only save preserves all other persisted defaults including unknown keys")
+            var appDraft = draft
+            appDraft.reminderApps = ReminderAppSelection(allApps: false, selectedAppIDs: ["codex"])
+            h.store.onReminderPreferencesChanged = nil
+            h.store.applySettingsDraft(appDraft)
+            check(h.controller.pendingSessionIDs.contains(interrupted.id) && h.bridge.cancelled == originalCancels &&
+                  h.store.supervisedSessionIDs == originalScope && h.store.autoContinueEnabled,
+                  "muting this app's reminders preserves its authorized recovery queue and scope")
             h.now += 5; h.observe([interrupted])
             check(h.bridge.requests.count == 1 &&
                   h.bridge.requests.first?["text"] as? String == "original interruption",

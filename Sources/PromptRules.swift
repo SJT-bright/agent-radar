@@ -272,7 +272,7 @@ private final class PromptEditorState: ObservableObject {
         self.store = store
         self.session = session
         draft = PromptSettingsDraft(rules: store.promptRules, reminderPopupEnabled: store.reminderPopupEnabled,
-                                    reminderSoundEnabled: store.reminderSoundEnabled)
+                                    reminderSoundEnabled: store.reminderSoundEnabled, reminderApps: store.reminderApps)
         followUpText = session.flatMap { store.promptRules.followUps[$0.id] } ?? ""
     }
 
@@ -281,7 +281,7 @@ private final class PromptEditorState: ObservableObject {
             return followUpText != (store.promptRules.followUps[session.id] ?? "")
         }
         return draft.hasChanges(comparedTo: store.promptRules, reminderPopupEnabled: store.reminderPopupEnabled,
-                                reminderSoundEnabled: store.reminderSoundEnabled)
+                                reminderSoundEnabled: store.reminderSoundEnabled, reminderApps: store.reminderApps)
     }
 
     var validationMessages: [String] {
@@ -314,7 +314,7 @@ private final class PromptEditorState: ObservableObject {
 
     func reload() {
         draft = PromptSettingsDraft(rules: store.promptRules, reminderPopupEnabled: store.reminderPopupEnabled,
-                                    reminderSoundEnabled: store.reminderSoundEnabled)
+                                    reminderSoundEnabled: store.reminderSoundEnabled, reminderApps: store.reminderApps)
         followUpText = session.flatMap { store.promptRules.followUps[$0.id] } ?? ""
         savedMessage = ""
     }
@@ -451,7 +451,7 @@ private struct CapsuleButton: View {
 }
 
 private enum SettingsPage: String, CaseIterable, Identifiable {
-    case operation = "运行", supervision = "监督", prompts = "提示词", rateLimit = "限流"
+    case operation = "运行", reminders = "提醒", supervision = "监督", prompts = "提示词", rateLimit = "限流"
     var id: String { rawValue }
 }
 
@@ -459,6 +459,7 @@ private struct PromptEditorView: View {
     @ObservedObject var store: MonitorStore
     @ObservedObject var editor: PromptEditorState
     @State private var page: SettingsPage = .operation
+    @State private var reminderSearch = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -484,6 +485,7 @@ private struct PromptEditorView: View {
                     } else {
                         switch page {
                         case .operation: operationPage
+                        case .reminders: remindersPage
                         case .supervision:
                             SupervisionSettingsView(store: store)
                             if isRage { historicalStart }
@@ -498,9 +500,77 @@ private struct PromptEditorView: View {
         }
     }
 
+    private var remindersPage: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            sectionTitle("提醒", detail: "修改后点击底部保存；弹窗和音效可分别设置。")
+            Toggle("显示提醒弹窗", isOn: $editor.draft.reminderPopupEnabled)
+                .radarHoverHighlight()
+                .accessibilityIdentifier("settings.reminderPopupEnabled")
+            Toggle("任务提醒音效", isOn: $editor.draft.reminderSoundEnabled)
+                .radarHoverHighlight()
+                .accessibilityIdentifier("settings.reminderSoundEnabled")
+            Text("勾选应用的新一轮任务完成或提醒出现时可播放音效。弹窗和音效分别控制；暂停监控期间不触发提醒。")
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+            HStack {
+                Button("试听音效") { store.previewReminderSound() }
+                    .buttonStyle(RadarButtonStyle()).font(.system(size: 11))
+                    .help("播放当前任务提醒音效，不修改设置")
+                    .accessibilityIdentifier("settings.previewReminderSound")
+                Text("试听会直接播放，无需保存。")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+            Divider()
+            sectionTitle("接收哪些应用的提醒", detail: "勾选需要提醒的应用，点击底部保存后立即生效；选择会在重启后保留。")
+            Toggle("提醒所有应用（包含以后新增的应用）", isOn: $editor.draft.reminderApps.allApps)
+                .radarHoverHighlight()
+                .accessibilityIdentifier("settings.reminderAllApps")
+            HStack(spacing: 10) {
+                Button("全选") { editor.draft.reminderApps.allApps = true }
+                    .buttonStyle(RadarButtonStyle()).accessibilityIdentifier("settings.reminderSelectAll")
+                Button("全不选") {
+                    editor.draft.reminderApps = ReminderAppSelection(allApps: false)
+                }.buttonStyle(RadarButtonStyle()).accessibilityIdentifier("settings.reminderSelectNone")
+                Spacer()
+                Text(editor.draft.reminderApps.allApps ? "所有应用" : "已勾选 \(editor.draft.reminderApps.selectedAppIDs.count) 个应用")
+                    .foregroundStyle(.secondary)
+            }.font(.system(size: 11))
+            if !editor.draft.reminderApps.allApps && editor.draft.reminderApps.selectedAppIDs.isEmpty {
+                Text("当前未选择应用，保存后将关闭所有应用的任务提醒。")
+                    .font(.system(size: 11)).foregroundStyle(.orange)
+            }
+            TextField("搜索提醒应用", text: $reminderSearch)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityIdentifier("settings.reminderAppSearch")
+            LazyVGrid(columns: [GridItem(.flexible(), alignment: .leading), GridItem(.flexible(), alignment: .leading)], alignment: .leading, spacing: 10) {
+                ForEach(reminderOptions.filter { reminderSearch.isEmpty || $0.name.localizedCaseInsensitiveContains(reminderSearch) || $0.id.localizedCaseInsensitiveContains(reminderSearch) }) { app in
+                    Toggle(app.name, isOn: Binding(get: { editor.draft.reminderApps.allows(app.id) }, set: { enabled in
+                        if editor.draft.reminderApps.allApps {
+                            editor.draft.reminderApps.selectedAppIDs = Set(reminderOptions.map(\.id))
+                            editor.draft.reminderApps.allApps = false
+                        }
+                        if enabled { editor.draft.reminderApps.selectedAppIDs.insert(app.id) }
+                        else { editor.draft.reminderApps.selectedAppIDs.remove(app.id) }
+                    }))
+                    .toggleStyle(.checkbox).font(.system(size: 12)).radarHoverHighlight()
+                    .accessibilityLabel(app.name + " 的提醒")
+                    .accessibilityIdentifier("settings.reminderApp." + app.id)
+                }
+            }
+            Text("仅勾选应用时，之后新增的应用默认不提醒。提醒范围控制弹窗与音效，监督和自动发送在相应设置中管理。")
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+        }
+    }
+
+    private var reminderOptions: [ReminderAppOption] {
+        var names = Dictionary(uniqueKeysWithValues: store.reminderAppOptions.map { ($0.id, $0.name) })
+        for id in editor.draft.reminderApps.selectedAppIDs where names[id] == nil { names[id] = id }
+        return names.map { ReminderAppOption(id: $0.key, name: $0.value) }
+            .sorted { $0.name == $1.name ? $0.id < $1.id : $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
     private var operationPage: some View {
         VStack(alignment: .leading, spacing: 14) {
-            sectionTitle("运行模式", detail: "模式、自动发送和常用功能立即生效；提醒设置点击底部保存后生效。")
+            sectionTitle("运行模式", detail: "模式、自动发送和常用功能立即生效；提醒设置在「提醒」页管理。")
             HStack(spacing: 8) {
                 modeButton("协作模式", mode: "collaboration", color: .blue)
                 modeButton("狂暴模式", mode: "rage", color: .red)
@@ -522,24 +592,6 @@ private struct PromptEditorView: View {
                     Text("尚未选择监督范围；开启总开关也不会自动选择会话。")
                         .font(.system(size: 10)).foregroundStyle(.orange)
                 }
-            }
-            Divider()
-            sectionTitle("提醒", detail: "修改后点击底部保存；弹窗和音效可分别设置。")
-            Toggle("显示提醒弹窗", isOn: $editor.draft.reminderPopupEnabled)
-                .radarHoverHighlight()
-                .accessibilityIdentifier("settings.reminderPopupEnabled")
-            Toggle("任务提醒音效", isOn: $editor.draft.reminderSoundEnabled)
-                .radarHoverHighlight()
-                .accessibilityIdentifier("settings.reminderSoundEnabled")
-            Text("开启音效后，提醒出现或桌面对话的新一轮任务完成时会发声。关闭弹窗后，任务完成仍会发声；暂停监控期间不触发提醒。")
-                .font(.system(size: 10)).foregroundStyle(.secondary)
-            HStack {
-                Button("试听音效") { store.previewReminderSound() }
-                    .buttonStyle(RadarButtonStyle()).font(.system(size: 11))
-                    .help("播放当前任务提醒音效，不修改设置")
-                    .accessibilityIdentifier("settings.previewReminderSound")
-                Text("试听会直接播放，无需保存。")
-                    .font(.system(size: 10)).foregroundStyle(.secondary)
             }
             Divider()
             sectionTitle("常用功能", detail: "按入队顺序逐条处理对话，暂停监控时停止自动操作。")

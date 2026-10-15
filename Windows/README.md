@@ -1,8 +1,10 @@
 # 任务雷达 Windows
 
-Windows 原生 WPF 版本，版本 1.9.0。与 macOS 共用本机会话适配器、轮次判断和恢复协议；悬浮窗、胶囊、提醒、设置、监督和顺序队列保持相同使用方式。
+Windows 原生 WPF 版本，当前版本 1.9.1。与 macOS 共用本机会话适配器、轮次判断和恢复协议；悬浮窗、胶囊、提醒、设置、监督和顺序队列保持相同使用方式。
 
-[下载 Windows 安装包与便携包](https://github.com/SJT-bright/agent-radar/releases/tag/v1.9.0) · [项目开源代码](https://github.com/SJT-bright/agent-radar) · [macOS 版本](../README.md)
+1.9.1 新增「设置 → 提醒」应用勾选列表、搜索、全选和全不选，点击保存后控制应用的弹窗及音效，选择持久保存。监督与自动发送授权独立管理。测试范围与实际控件验收见 [验收记录](../docs/reminder-apps-1.9.1.md)。
+
+[下载 Windows 安装包与便携包](https://github.com/SJT-bright/agent-radar/releases/tag/v1.9.1) · [项目开源代码](https://github.com/SJT-bright/agent-radar) · [macOS 版本](../README.md)
 
 ## 安装
 

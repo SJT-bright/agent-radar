@@ -1,4 +1,4 @@
-param([string]$Version="1.9.0",[switch]$SkipInstaller)
+param([string]$Version="1.9.1",[switch]$SkipInstaller)
 $ErrorActionPreference="Stop"
 $root=Split-Path $PSScriptRoot -Parent
 $dest=Join-Path $root 'build/windows'

@@ -17,21 +17,31 @@ final class ReminderCoordinator {
         store.onWorkspaceConflictsChanged = { [weak toast] paths in toast?.reconcileWorkspaceConflicts(paths) }
         store.onReminderPreferencesChanged = { [weak self] in
             guard let self = self, let store = self.store else { return }
+            if !store.reminderPopupEnabled { self.toast.popupEnabled = false }
+            self.toast.reconcileReminders(shouldKeep: store.shouldRemind)
             self.toast.popupEnabled = store.reminderPopupEnabled
         }
         store.onPreviewReminderSound = { [weak soundPlayer] in _ = soundPlayer?.play() }
         store.onSessionsObserved = { [weak self] rows, fresh in
-            guard let self = self else { return }
+            guard let self = self, let store = self.store else { return }
             for event in self.completionSounds.observe(rows, fresh: fresh, now: Date().timeIntervalSince1970) {
-                self.play(key: ReminderSoundGate.roundKey(sessionID: event.session.id, recoveryKey: event.key))
+                self.play(key: ReminderSoundGate.roundKey(sessionID: event.session.id, recoveryKey: event.key),
+                          allowed: store.reminderApps.allows(event.session.app_id))
             }
         }
         toast.onDidPresentNotice = { [weak self] notice in
-            self?.play(key: ReminderSoundGate.roundKey(sessionID: notice.sessionID ?? notice.conversation,
-                                                       recoveryKey: notice.recoveryKey ?? notice.title))
+            guard let self = self, let store = self.store else { return }
+            self.play(key: ReminderSoundGate.roundKey(sessionID: notice.sessionID ?? notice.conversation,
+                                                       recoveryKey: notice.recoveryKey ?? notice.title), allowed: store.shouldRemind(notice))
         }
-        store.onRecoveryNotice = { [weak toast, weak store] notice in
-            toast?.show(notice, anchor: anchor(),
+        store.onRecoveryNotice = { [weak self, weak store] notice in
+            guard let self = self, let store = store else { return }
+            guard store.shouldRemind(notice) else {
+                self.play(key: ReminderSoundGate.roundKey(sessionID: notice.sessionID ?? notice.conversation,
+                                                         recoveryKey: notice.recoveryKey ?? notice.title), allowed: false)
+                return
+            }
+            self.toast.show(notice, anchor: anchor(),
                         cancel: { [weak store] in store?.cancelContinuation() },
                         permission: { [weak store] in store?.requestPermission() },
                         retry: { [weak store] sessionID, key in store?.retryContinuation(sessionID: sessionID, key: key) },
@@ -44,8 +54,8 @@ final class ReminderCoordinator {
         }
     }
 
-    private func play(key: String) {
-        guard let store = store, soundGate.shouldPlay(key: key, enabled: store.reminderSoundEnabled) else { return }
+    private func play(key: String, allowed: Bool = true) {
+        guard let store = store, soundGate.shouldPlay(key: key, enabled: store.reminderSoundEnabled && allowed) else { return }
         soundPlayer.play()
     }
 }

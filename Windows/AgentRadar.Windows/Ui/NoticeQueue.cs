@@ -40,6 +40,14 @@ internal sealed class NoticeQueue
         _pending.Clear();
     }
 
+    public void RemoveWhere(Predicate<NoticeRecord> remove)
+    {
+        if (Current != null && remove(Current)) { Acknowledge(Current); Current = null; }
+        foreach (var notice in _pending) if (remove(notice)) Acknowledge(notice);
+        _pending.RemoveAll(remove);
+        if (Current == null && _pending.Count > 0) Current = Take();
+    }
+
     public static string SessionKey(NoticeRecord notice) =>
         string.IsNullOrEmpty(notice.SessionId) ? "notice:" + notice.Id : notice.SessionId;
 

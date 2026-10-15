@@ -1,9 +1,29 @@
 import Foundation
 
+/// An explicit allowlist remains stable when applications disappear or new ones arrive.
+struct ReminderAppSelection: Codable, Equatable {
+    var allApps = true
+    var selectedAppIDs = Set<String>()
+
+    func allows(_ appID: String) -> Bool { allApps || selectedAppIDs.contains(appID) }
+
+    var normalized: Self {
+        var result = self
+        result.selectedAppIDs = Set(selectedAppIDs.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
+        return result
+    }
+}
+
+struct ReminderAppOption: Identifiable {
+    let id: String
+    let name: String
+}
+
 /// 全局设置页的待保存字段；即时生效的模式、会话规则由 MonitorStore 持有。
 struct PromptSettingsDraft: Equatable {
     var reminderPopupEnabled: Bool
     var reminderSoundEnabled: Bool
+    var reminderApps: ReminderAppSelection
     var interruptText: String
     var rateLimitWakeEnabled: Bool
     var rateLimitWaitSeconds: Int
@@ -14,9 +34,11 @@ struct PromptSettingsDraft: Equatable {
     var rageAlternateEvery: Int
     var rageAlternatePrompt: String
 
-    init(rules: PromptRules, reminderPopupEnabled: Bool = true, reminderSoundEnabled: Bool = true) {
+    init(rules: PromptRules, reminderPopupEnabled: Bool = true, reminderSoundEnabled: Bool = true,
+         reminderApps: ReminderAppSelection = ReminderAppSelection()) {
         self.reminderPopupEnabled = reminderPopupEnabled
         self.reminderSoundEnabled = reminderSoundEnabled
+        self.reminderApps = reminderApps
         interruptText = rules.interruptText
         rateLimitWakeEnabled = rules.rateLimitWakeEnabled
         rateLimitWaitSeconds = rules.rateLimitWaitSeconds
@@ -31,8 +53,9 @@ struct PromptSettingsDraft: Equatable {
     }
 
     func hasChanges(comparedTo rules: PromptRules, reminderPopupEnabled: Bool = true,
-                    reminderSoundEnabled: Bool = true) -> Bool {
-        if self.reminderPopupEnabled != reminderPopupEnabled || self.reminderSoundEnabled != reminderSoundEnabled {
+                    reminderSoundEnabled: Bool = true, reminderApps: ReminderAppSelection = ReminderAppSelection()) -> Bool {
+        if self.reminderPopupEnabled != reminderPopupEnabled || self.reminderSoundEnabled != reminderSoundEnabled ||
+            self.reminderApps != reminderApps {
             return true
         }
         // 标量字段比较编辑值（空白/控制字符等未保存修改保持可见）；

@@ -18,6 +18,8 @@ internal sealed class PromptDraft
 
     public bool Popup = true;
     public bool Sound = true;
+    public bool AllReminderApps = true;
+    public HashSet<string> ReminderAppIds = new(StringComparer.Ordinal);
     public string ResumeText = "";
     public string InterruptText = "";
     public string ContinueText = "";
@@ -40,6 +42,8 @@ internal sealed class PromptDraft
         {
             Popup = settings.Popup,
             Sound = settings.Sound,
+            AllReminderApps = settings.AllReminderApps,
+            ReminderAppIds = new HashSet<string>(settings.ReminderAppIds, StringComparer.Ordinal),
             ResumeText = settings.ResumeText,
             InterruptText = settings.InterruptText ?? "",
             ContinueText = settings.ContinueText ?? "",
@@ -62,6 +66,7 @@ internal sealed class PromptDraft
     {
         if(ResumeText!=settings.ResumeText)return true;
         if (Popup != settings.Popup || Sound != settings.Sound) return true;
+        if (AllReminderApps != settings.AllReminderApps || !ReminderAppIds.SetEquals(settings.ReminderAppIds)) return true;
         if (InterruptText != (settings.InterruptText ?? "") || ContinueText != (settings.ContinueText ?? "")) return true;
         if (AlternateText != (settings.AlternateText ?? "") || RateLimitText != (settings.RateLimitText ?? "")) return true;
         if (RateLimitWake != settings.RateLimitWake) return true;
@@ -116,6 +121,8 @@ internal sealed class PromptDraft
         settings.RateLimitWake = RateLimitWake;
         settings.Popup = Popup;
         settings.Sound = Sound;
+        settings.AllReminderApps = AllReminderApps;
+        settings.ReminderAppIds = new HashSet<string>(ReminderAppIds, StringComparer.Ordinal);
         settings.AlternateEvery = int.Parse(AlternateEveryText.Trim(), CultureInfo.InvariantCulture);
         settings.RateLimitSeconds = int.Parse(RateLimitSecondsText.Trim(), CultureInfo.InvariantCulture);
         settings.OpenClawGateway = Gateway.Trim();
@@ -193,6 +200,8 @@ internal sealed class PromptDraft
             Mode = source.Mode,
             Popup = source.Popup,
             Sound = source.Sound,
+            AllReminderApps = source.AllReminderApps,
+            ReminderAppIds = new HashSet<string>(source.ReminderAppIds, StringComparer.Ordinal),
             KeepAwake = source.KeepAwake,
             StartWithWindows = source.StartWithWindows,
             Expanded = source.Expanded,

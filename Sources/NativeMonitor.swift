@@ -97,6 +97,12 @@ final class NativeMonitor {
         "ai.lmstudio.app": .init(id: "lmstudio", name: "LM Studio")
     ]
 
+    static var reminderApplicationNames: [String: String] {
+        var names: [String: String] = ["claude-code": "Claude Code", "trae-solo": "TRAE SOLO"]
+        for definition in definitions.values { names[definition.id] = definition.name }
+        return names
+    }
+
     private static let knownNames: [String: Definition] = {
         var result: [String: Definition] = [:]
         for definition in definitions.values {

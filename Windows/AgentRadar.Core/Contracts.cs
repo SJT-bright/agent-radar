@@ -48,6 +48,7 @@ public sealed class RadarSettings {
  public bool AutoSend {get;set;}=false; public bool Paused {get;set;}=false;
  public string Mode {get;set;}="collaboration";
  public bool Popup {get;set;}=true; public bool Sound {get;set;}=true;
+ public bool AllReminderApps {get;set;}=true; public HashSet<string> ReminderAppIds {get;set;}=[];
  public bool KeepAwake {get;set;}=false; public bool StartWithWindows {get;set;}=false;
  public bool Expanded {get;set;}=false; public double X {get;set;}=double.NaN; public double Y {get;set;}=double.NaN;
  public double Transparency {get;set;}=.75; public string Frost {get;set;}="适中";
@@ -66,7 +67,7 @@ public sealed class RadarSettings {
  public string OpenClawHome {get;set;}=""; public string WslDistribution {get;set;}="";
  public string WslExecutable {get;set;}="/usr/local/bin/openclaw";
 }
-public sealed record NoticeRecord(string Id,string SessionId,string Title,string Conversation,string Message,string Kind,bool CanRecover,bool Recovering=false,int? RemainingSeconds=null);
+public sealed record NoticeRecord(string Id,string SessionId,string Title,string Conversation,string Message,string Kind,bool CanRecover,bool Recovering=false,int? RemainingSeconds=null,string AppId="",IReadOnlyList<string>? RelatedAppIds=null);
 public sealed record NavigationResult(bool OpenedConversation,string Message);
 public interface IWorkerClient : IDisposable {
  event Action<CollectorSnapshot>? Snapshot; event Action<string>? Fault;

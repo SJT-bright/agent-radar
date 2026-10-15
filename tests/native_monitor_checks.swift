@@ -57,8 +57,8 @@ struct NativeMonitorChecks {
         assert(monitor.safeDeepLink("workbuddy://chat/session-123", appID: "workbuddy-ai") == nil)
         assert(monitor.safeDeepLink("workbuddy://chat/foo%2Fbar", appID: "workbuddy") == nil)
         assert(monitor.safeDeepLink("workbuddy://chat/..", appID: "workbuddy") == nil)
-        assert(monitor.safeDeepLink("zcode://workspace/open?path=%2FUsers%2Fsijunting%2FDownloads", appID: "zcode") != nil)
-        let zcodeWorkspace = "zcode://workspace/open?path=%2FUsers%2Fsijunting%2F%E9%AB%98%E4%B8%89%E7%94%9F%E5%BA%95%E5%B1%82%E8%B0%83%E7%A0%94"
+        assert(monitor.safeDeepLink("zcode://workspace/open?path=%2FUsers%2Fexample%2FDownloads", appID: "zcode") != nil)
+        let zcodeWorkspace = "zcode://workspace/open?path=%2FUsers%2Fexample%2F%E9%AB%98%E4%B8%89%E7%94%9F%E5%BA%95%E5%B1%82%E8%B0%83%E7%A0%94"
         assert(monitor.safeDeepLink(zcodeWorkspace, appID: "zcode") != nil)
         assert(monitor.safeDeepLink(zcodeWorkspace, appID: "zcode").flatMap { URLComponents(string: $0.absoluteString)?.queryItems?.first?.value } == "/Users/example/高三生底层调研")
         assert(monitor.safeDeepLink("zcode://workspace/open?path=Users%2Fx", appID: "zcode") == nil)
@@ -68,7 +68,7 @@ struct NativeMonitorChecks {
         assert(monitor.safeDeepLink("zcode://workspace/open?path=%2Fa&force=1", appID: "zcode") == nil)
         assert(monitor.safeDeepLink("zcode://workspace/open", appID: "zcode") == nil)
         assert(monitor.safeDeepLink("zcode://other/open?path=%2Fa", appID: "zcode") == nil)
-        assert(monitor.safeDeepLink("zcode://workspace/open?path=%2FUsers%2Fsijunting%2FDownloads", appID: "workbuddy") == nil)
+        assert(monitor.safeDeepLink("zcode://workspace/open?path=%2FUsers%2Fexample%2FDownloads", appID: "workbuddy") == nil)
         assert(monitor.safeDeepLink("zcode://workspace/open?path=%2Fa%0Ab", appID: "zcode") == nil)
         let overlongWorkspace = "%2F" + String(repeating: "a", count: 512)
         assert(monitor.safeDeepLink("zcode://workspace/open?path=" + overlongWorkspace, appID: "zcode") == nil)
