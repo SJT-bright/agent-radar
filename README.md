@@ -51,7 +51,12 @@ Windows 使用 WPF、原生 UI Automation 和冻结的 Python 采集组件，支
 ## 构建
 
 ```sh
-./scripts/build.sh
+cd vendor/watchdog
+/usr/bin/python3 -m venv .venv-mac
+.venv-mac/bin/python -m pip install -r requirements-mac.txt
+cd ../..
+# 开发构建显式使用 ad-hoc 签名；不要覆盖已有正式安装版。
+AGENT_RADAR_ALLOW_ADHOC=1 ./scripts/build.sh
 ./scripts/test.sh
 ```
 
